@@ -696,8 +696,11 @@ catch(e){document.getElementById('pob-status').textContent='Error';wrap.style.di
 function onPolySel(){var sel=document.getElementById('poly-sel');var tid=sel.value;
 if(!tid){stopPolyOb();_polyResolvedToken='';return;}
 _polyResolvedToken=tid;
-// Store YES/NO from select options (first=YES, second=NO)
-var opts=sel.options;if(opts.length>=3){_polyYesToken=opts[1].value;_polyNoToken=opts[2].value;}
+// Store YES/NO pair based on selected outcome
+var selText=sel.options[sel.selectedIndex].textContent;
+var baseQ=selText.replace(/ - (Yes|No)$/i,'').trim();
+_polyYesToken='';_polyNoToken='';
+for(var oi=1;oi<sel.options.length;oi++){var oText=sel.options[oi].textContent;var oBase=oText.replace(/ - (Yes|No)$/i,'').trim();if(oBase===baseQ){if(/ - Yes$/i.test(oText)){_polyYesToken=sel.options[oi].value;}else if(/ - No$/i.test(oText)){_polyNoToken=sel.options[oi].value;}}}
 startPolyOb(tid);}
 
 
