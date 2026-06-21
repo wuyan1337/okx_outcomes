@@ -1,0 +1,738 @@
+"""Poly Sniper — cross-market latency arbitrage.
+
+Monitors Polymarket YES and NO tokens simultaneously via WS.
+When either token's best bid jumps by >= threshold in a single tick,
+instantly buys on OKX (ioc) and sells at the new Poly price (gtc).
+
+States: IDLE → MONITORING → TRIGGERED → HOLDING → back to MONITORING or STOP
+"""
+import asyncio
+import logging
+import time
+from typing import Optional, Dict
+from dataclasses import dataclass, field
+
+import aiohttp
+
+logger = logging.getLogger(__name__)
+
+POLY_CLOB_BOOK = "https://clob.polymarket.com/book?token_id={token_id}"
+POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+
+@dataclass
+class SniperConfig:
+    threshold_cents: int = 40       # Jump threshold in cents
+    ask_levels: int = 1             # How many ask levels to eat
+    position_pct: int = 100         # Balance percentage to use
+    timeout_secs: int = 120         # Seconds before forced exit
+    settle_ms: int = 1000           # Ms to wait for price to stabilize after jump
+
+
+@dataclass
+class SniperState:
+    status: str = "idle"            # idle, monitoring, holding, stopped
+    # Token info
+    yes_token_id: str = ""          # Poly YES token
+    no_token_id: str = ""           # Poly NO token
+    yes_asset_id: str = ""          # OKX YES asset
+    no_asset_id: str = ""           # OKX NO asset
+    market_id: str = ""
+    # Monitoring
+    last_yes_bid: float = 0.0
+    last_no_bid: float = 0.0
+    # Settling state (waiting for price stabilization)
+    settling: bool = False
+    settle_side: str = ""           # which side triggered
+    settle_price: float = 0.0       # latest price during settle
+    settle_initial: float = 0.0     # price before the jump
+    settle_last_update: float = 0.0 # time.time() of last price change
+    # OKX snapshot at trigger time (before market catches up)
+    okx_snapshot_price: float = 0.0 # OKX best ask at moment of trigger
+    okx_snapshot_asks: list = field(default_factory=list)  # Full ask levels snapshot
+    # Holding state
+    holding_side: str = ""          # "yes" or "no" - which token we bought
+    buy_price: float = 0.0          # Price we bought at
+    buy_size: float = 0.0           # How many we bought
+    sell_target: float = 0.0        # Target sell price (Poly jump price)
+    sell_order_id: str = ""         # OKX sell order ID
+    hold_start: float = 0.0        # When we entered holding
+    # Logs
+    logs: list = field(default_factory=list)
+
+
+class PolySniper:
+    """Cross-market latency arbitrage between Poly and OKX."""
+
+    def __init__(self, client, account_id: str = "default"):
+        self.client = client
+        self.account_id = account_id
+        self.account_name = ""
+        self.config = SniperConfig()
+        self.state = SniperState()
+        self.notifier = None
+        self._task: Optional[asyncio.Task] = None
+        self._hold_task: Optional[asyncio.Task] = None
+        self._running = False
+        self._ws_calibrated = {"yes": False, "no": False}
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def log(self, msg: str):
+        from datetime import datetime
+        entry = f"[{datetime.now().strftime('%I:%M:%S %p')}] {msg}"
+        self.state.logs.append(entry)
+        if len(self.state.logs) > 100:
+            self.state.logs = self.state.logs[-100:]
+        logger.info(f"[Sniper:{self.account_id}] {msg}")
+
+    async def start(self, yes_token_id: str, no_token_id: str,
+                    yes_asset_id: str, no_asset_id: str, market_id: str,
+                    threshold_cents: int = 40, ask_levels: int = 1,
+                    position_pct: int = 100, timeout_secs: int = 120,
+                    settle_ms: int = 1000):
+        """Start sniper monitoring."""
+        if self._running:
+            return {"ok": False, "error": "Already running"}
+
+        self.config.threshold_cents = threshold_cents
+        self.config.ask_levels = ask_levels
+        self.config.position_pct = position_pct
+        self.config.timeout_secs = timeout_secs
+        self.config.settle_ms = settle_ms
+
+        self.state = SniperState(
+            status="monitoring",
+            yes_token_id=yes_token_id,
+            no_token_id=no_token_id,
+            yes_asset_id=yes_asset_id,
+            no_asset_id=no_asset_id,
+            market_id=market_id,
+        )
+
+        # Get initial Poly prices
+        yes_bid = await self._get_poly_bid(yes_token_id)
+        no_bid = await self._get_poly_bid(no_token_id)
+        if yes_bid is not None:
+            self.state.last_yes_bid = yes_bid
+        if no_bid is not None:
+            self.state.last_no_bid = no_bid
+
+        self._running = True
+        self._task = asyncio.create_task(self._monitor_loop())
+        self.log(f"Started: threshold={threshold_cents}¢, levels={ask_levels}, pct={position_pct}%, settle={settle_ms}ms")
+        return {"ok": True}
+
+    async def stop(self):
+        """Stop sniper."""
+        self._running = False
+        self.state.status = "stopped"
+        self.state.settling = False
+        # Cancel open sell order if holding
+        if self.state.sell_order_id and self.state.holding_side:
+            asset_id = self.state.yes_asset_id if self.state.holding_side == "yes" else self.state.no_asset_id
+            try:
+                await self.client.cancel_order(asset_id=asset_id, order_id=self.state.sell_order_id)
+                self.log(f"Cancelled sell order {self.state.sell_order_id}")
+            except Exception as e:
+                self.log(f"Cancel sell on stop failed: {e}")
+        if self._hold_task:
+            self._hold_task.cancel()
+            try:
+                await self._hold_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self.log("Stopped")
+
+    # ─── Monitoring ───
+
+    async def _monitor_loop(self):
+        """Main loop: WS primary, REST fallback."""
+        try:
+            while self._running:
+                try:
+                    await self._ws_monitor()
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    logger.debug(f"[Sniper] WS error: {e}")
+                if self._running:
+                    await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+
+    async def _ws_monitor(self):
+        """Connect to Poly WS and watch for jumps."""
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(POLY_WS_URL, heartbeat=15) as ws:
+                # Subscribe to both tokens in one message
+                import json
+                await ws.send_str(json.dumps({
+                    "type": "market",
+                    "assets_ids": [self.state.yes_token_id, self.state.no_token_id]
+                }))
+                self._ws_calibrated = {"yes": False, "no": False}
+                self.log("WS connected, monitoring YES + NO")
+
+                async for msg in ws:
+                    if not self._running:
+                        break
+                    if self.state.status != "monitoring" and not self.state.settling:
+                        # In holding mode, just keep connection alive
+                        continue
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            raw = json.loads(msg.data)
+                            # Response can be array (snapshot) or single object (update)
+                            items = raw if isinstance(raw, list) else [raw]
+                            for data in items:
+                                if data.get("event_type") == "book":
+                                    await self._process_book_update(data)
+                        except Exception:
+                            pass
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+
+    async def _process_book_update(self, data: dict):
+        """Check if a jump occurred. Uses settle window to capture full move."""
+        asset_id = data.get("asset_id", "")
+        bids = data.get("bids", [])
+        if not bids:
+            return
+
+        # Get best bid
+        bids_sorted = sorted(bids, key=lambda x: float(x.get("price", 0)), reverse=True)
+        current_bid = float(bids_sorted[0].get("price", 0))
+
+        # Determine which token
+        if asset_id == self.state.yes_token_id:
+            prev_bid = self.state.last_yes_bid
+            self.state.last_yes_bid = current_bid
+            side = "yes"
+        elif asset_id == self.state.no_token_id:
+            prev_bid = self.state.last_no_bid
+            self.state.last_no_bid = current_bid
+            side = "no"
+        else:
+            return
+
+        # If currently settling, update settle price to latest value
+        if self.state.settling and side == self.state.settle_side:
+            if current_bid != self.state.settle_price:
+                self.state.settle_price = current_bid
+                self.state.settle_last_update = time.time()
+                self.log(f"Settle update: {side.upper()} now {current_bid:.3f}")
+            return
+
+        # Ignore updates during settling for the other side
+        if self.state.settling:
+            return
+
+        if prev_bid <= 0:
+            return
+
+        # Skip first WS update per side (calibration — avoids false trigger from stale REST data)
+        if not self._ws_calibrated.get(side, False):
+            self._ws_calibrated[side] = True
+            return
+
+        # Check jump
+        jump_cents = round((current_bid - prev_bid) * 100)
+        if jump_cents >= self.config.threshold_cents:
+            self.log(f"JUMP detected: {side.upper()} {prev_bid:.3f} → {current_bid:.3f} (+{jump_cents}¢), snapshotting OKX...")
+            # IMMEDIATELY snapshot OKX orderbook before it catches up
+            okx_asset = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
+            snapshot_asks = await self._snapshot_okx_asks(okx_asset)
+            if not snapshot_asks:
+                self.log("OKX snapshot failed — no asks, skipping")
+                return
+            snapshot_best_ask = float(snapshot_asks[0][0])
+            # Sanity: if OKX already caught up (best ask >= poly new price), no arb
+            if snapshot_best_ask >= current_bid:
+                self.log(f"OKX already caught up: ask={snapshot_best_ask:.2f} >= poly={current_bid:.3f}, skipping")
+                return
+            self.log(f"OKX snapshot: best ask={snapshot_best_ask:.2f} (poly={current_bid:.3f}, spread={round((current_bid - snapshot_best_ask)*100)}¢)")
+            # Enter settling state with OKX snapshot locked in
+            self.state.settling = True
+            self.state.settle_side = side
+            self.state.settle_price = current_bid
+            self.state.settle_initial = prev_bid
+            self.state.settle_last_update = time.time()
+            self.state.okx_snapshot_price = snapshot_best_ask
+            self.state.okx_snapshot_asks = snapshot_asks
+            # Start settle timer task
+            asyncio.create_task(self._settle_wait())
+
+    async def _settle_wait(self):
+        """Wait until price stabilizes (no update for settle_ms), then execute."""
+        settle_sec = self.config.settle_ms / 1000.0
+        while self._running and self.state.settling:
+            elapsed = time.time() - self.state.settle_last_update
+            if elapsed >= settle_sec:
+                # Price stable — check if jump still valid
+                side = self.state.settle_side
+                final_price = self.state.settle_price
+                initial_price = self.state.settle_initial
+                total_jump = round((final_price - initial_price) * 100)
+                if total_jump < self.config.threshold_cents:
+                    # Price reverted — false signal
+                    self.log(f"Settle aborted: {side.upper()} reverted to {final_price:.3f} (+{total_jump}¢ < {self.config.threshold_cents}¢)")
+                    self.state.settling = False
+                    return
+                self.log(f"Settled: {side.upper()} {initial_price:.3f} → {final_price:.3f} (+{total_jump}¢)")
+                self.state.settling = False
+                await self._execute_buy(side, final_price, initial_price=initial_price)
+                return
+            # Check every 50ms
+            await asyncio.sleep(0.05)
+        # If stopped during settling
+        self.state.settling = False
+
+    async def _snapshot_okx_asks(self, asset_id: str) -> list:
+        """Instantly grab OKX asks at trigger moment."""
+        try:
+            book = await self.client.get_orderbook(asset_id, depth=10)
+            if str(book.get("code", "")) != "0":
+                return []
+            asks = book.get("data", [{}])[0].get("asks", [])
+            return asks  # [[price, size], ...]
+        except Exception as e:
+            self.log(f"OKX snapshot error: {e}")
+            return []
+
+    # ─── Execution ───
+
+    async def _execute_buy(self, side: str, poly_new_price: float, initial_price: float = 0.0):
+        """Buy on OKX immediately."""
+        self.state.status = "holding"
+        asset_id = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
+
+        # Notify trigger
+        label = "YES" if side == "yes" else "NO"
+        prev = initial_price if initial_price > 0 else (self.state.last_yes_bid if side == "yes" else self.state.last_no_bid)
+        jump_c = round((poly_new_price - prev) * 100)
+        await self._notify(
+            f"⚡ {label} 跳价: {prev:.3f}→{poly_new_price:.3f} (+{jump_c}¢)"
+        )
+
+        # Use OKX snapshot from trigger moment (NOT live orderbook)
+        snapshot_asks = self.state.okx_snapshot_asks
+        if not snapshot_asks:
+            # Fallback: try live (shouldn't happen normally)
+            self.log("No snapshot available, trying live orderbook")
+            try:
+                book = await self.client.get_orderbook(asset_id, depth=10)
+                if str(book.get("code", "")) != "0":
+                    self.log(f"Orderbook error: {book.get('msg','')}")
+                    await self._notify(f"❌ 买入失败: OKX orderbook error")
+                    self.state.status = "monitoring"
+                    return
+                snapshot_asks = book.get("data", [{}])[0].get("asks", [])
+            except Exception as e:
+                self.log(f"Orderbook fetch error: {e}")
+                await self._notify(f"❌ 买入失败: {e}")
+                self.state.status = "monitoring"
+                return
+
+        if not snapshot_asks:
+            self.log("No asks available")
+            await self._notify(f"❌ 买入失败: 无深度")
+            self.state.status = "monitoring"
+            return
+
+        # Take N levels from SNAPSHOT (pre-jump prices)
+        levels = snapshot_asks[:self.config.ask_levels]
+        # Max price = highest ask level from snapshot
+        max_price = float(levels[-1][0])
+        # Total available size across snapshot levels
+        total_ask_size = sum(float(lvl[1]) for lvl in levels)
+
+        # Final check: if OKX has already moved past our snapshot price,
+        # the IOC will simply get 0 fill (which we handle below).
+        # Log the spread for visibility.
+        spread_cents = round((poly_new_price - max_price) * 100)
+        self.log(f"Executing: buy @<={max_price:.2f} (snapshot), sell target={poly_new_price:.3f}, spread={spread_cents}¢")
+
+        # Calculate buy size
+        try:
+            bal_resp = await self.client.get_balance()
+            available = 0.0
+            if str(bal_resp.get("code", "")) == "0":
+                for entry in bal_resp.get("data", []):
+                    if entry.get("oddsType") == "points":
+                        available = float(entry.get("available", "0"))
+                        break
+
+            budget = available * (self.config.position_pct / 100.0)
+            max_units = int(budget / max_price)
+            buy_size = min(max_units, int(total_ask_size))
+
+            if buy_size < 1:
+                self.log(f"Insufficient balance or size too small: avail={available}, budget={budget}")
+                await self._notify(f"❌ 买入失败: 余额不足")
+                self.state.status = "monitoring"
+                return
+
+        except Exception as e:
+            self.log(f"Balance error: {e}")
+            await self._notify(f"❌ 买入失败: {e}")
+            self.state.status = "monitoring"
+            return
+
+        # Place IOC buy order (place_order returns txHash, track via orders list)
+        price_str = f"{max_price:.2f}"
+        try:
+            resp = await self.client.place_order(
+                asset_id=asset_id,
+                side="buy",
+                price=price_str,
+                size=str(buy_size),
+                tif="ioc",
+            )
+            if str(resp.get("code", "")) != "0":
+                msg = resp.get("message", resp.get("msg", ""))
+                self.log(f"Buy order failed: {msg}")
+                await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: {msg}")
+                self.state.status = "monitoring"
+                return
+
+        except Exception as e:
+            self.log(f"Buy order exception: {e}")
+            await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: {e}")
+            self.state.status = "monitoring"
+            return
+
+        # Check fill - poll closed orders (IOC settles on-chain, may take 1-3s)
+        filled_size = 0.0
+        fill_price = max_price
+        for _attempt in range(4):
+            await asyncio.sleep(1)
+            try:
+                orders = await self.client.get_orders(status="closed")
+                if str(orders.get("code", "")) == "0":
+                    for o in orders.get("data", {}).get("list", []):
+                        if (o.get("assetId") == asset_id and
+                            o.get("side", "").upper() == "BUY" and
+                            float(o.get("filledSize", "0") or "0") > 0):
+                            filled_size = float(o.get("filledSize", "0") or "0")
+                            filled_amt = float(o.get("filledAmount", "0") or "0")
+                            fill_price = filled_amt / filled_size if filled_amt > 0 else max_price
+                            break
+                if filled_size > 0:
+                    break
+            except Exception as e:
+                self.log(f"Fill check error: {e}")
+
+        if filled_size < 1:
+            self.log("IOC order got 0 fill — OKX already moved or no liquidity")
+            await self._notify(f"❌ 买入失败: 无深度")
+            self.state.status = "monitoring"
+            return
+
+        # Buy success
+        self.state.holding_side = side
+        self.state.buy_price = fill_price
+        self.state.buy_size = filled_size
+        # Post sell at Poly new price (ensure above cost)
+        # Price tick: 0.01 for 0.04-0.96, 0.001 outside that range
+        tick = 0.001 if (poly_new_price < 0.04 or poly_new_price > 0.96) else 0.01
+        decimals = 3 if tick == 0.001 else 2
+        sell_price_raw = round(poly_new_price, decimals)
+        if sell_price_raw <= fill_price:
+            sell_price_raw = round(fill_price + tick, decimals)
+
+        self.state.sell_target = sell_price_raw
+        self.state.hold_start = time.time()
+
+        self.log(f"Bought {label} @{fill_price:.2f} x{filled_size:.0f}")
+        await self._notify(f"✅ 已买入 {label} @{fill_price:.2f} x{int(filled_size)}")
+
+        sell_price_str = f"{sell_price_raw:.{decimals}f}"
+        sell_size_str = f"{filled_size:.10f}".rstrip("0").rstrip(".")
+        try:
+            sell_resp = await self.client.place_order(
+                asset_id=asset_id,
+                side="sell",
+                price=sell_price_str,
+                size=sell_size_str,
+                tif="gtc",
+            )
+            if str(sell_resp.get("code", "")) == "0":
+                self.state.sell_order_id = sell_resp.get("data", {}).get("oid", "") or sell_resp.get("data", {}).get("orderId", "")
+                self.log(f"Posted sell @{sell_price_str} x{sell_size_str}")
+                await self._notify(f"📤 已挂 Sell {label} @{sell_price_str} x{int(filled_size)}")
+            else:
+                msg = sell_resp.get("message", sell_resp.get("msg", ""))
+                self.log(f"Sell post failed: {msg}")
+                await self._notify(f"⚠️ 挂卖失败: {msg}")
+        except Exception as e:
+            self.log(f"Sell order exception: {e}")
+            await self._notify(f"⚠️ 挂卖异常: {e}")
+
+        # Start holding monitor
+        self._hold_task = asyncio.create_task(self._holding_loop())
+
+    # ─── Holding ───
+
+    async def _holding_loop(self):
+        """Monitor sell order until filled or timeout."""
+        try:
+            asset_id = self.state.yes_asset_id if self.state.holding_side == "yes" else self.state.no_asset_id
+            label = "YES" if self.state.holding_side == "yes" else "NO"
+
+            while self._running and self.state.status == "holding":
+                await asyncio.sleep(5)
+
+                # Check sell order fill status
+                # API doesn't return oid from place_order, so poll orders if no oid
+                try:
+                    sell_filled = 0.0
+                    if self.state.sell_order_id:
+                        resp = await self.client.get_order(self.state.sell_order_id)
+                        if str(resp.get("code", "")) == "0":
+                            od = resp.get("data", {})
+                            sell_filled = float(od.get("filledSize", "0") or "0")
+                            status = od.get("status", "").upper()
+                            if status == "CANCELLED" and sell_filled < 1:
+                                self.log("Sell order cancelled externally")
+                                self.state.sell_order_id = ""
+                                await self._handle_timeout(asset_id, label)
+                                return
+                    else:
+                        # No oid — scan SELL orders for this asset since hold_start
+                        hold_start_ms = int(self.state.hold_start * 1000)
+                        for status_filter in ("open", "closed"):
+                            orders_resp = await self.client.get_orders(status=status_filter)
+                            if str(orders_resp.get("code", "")) == "0":
+                                for o in orders_resp.get("data", {}).get("list", []):
+                                    if (o.get("assetId") == asset_id and
+                                        o.get("side", "").upper() == "SELL" and
+                                        int(o.get("createdAt", "0") or "0") >= hold_start_ms):
+                                        sell_filled += float(o.get("filledSize", "0") or "0")
+                                        found_oid = o.get("id", o.get("oid", ""))
+                                        if found_oid:
+                                            self.state.sell_order_id = found_oid
+
+                    if sell_filled >= self.state.buy_size * 0.95:
+                        profit = sell_filled * (self.state.sell_target - self.state.buy_price)
+                        self.log(f"Sell filled @{self.state.sell_target:.2f} x{sell_filled:.0f} | +{profit:.2f} xp")
+                        await self._notify(
+                            f"💰 Sell {label} 成交 @{self.state.sell_target:.2f} "
+                            f"x{int(sell_filled)} | +{profit:.2f} xp"
+                        )
+                        self._reset_to_monitoring()
+                        return
+                except Exception as e:
+                    self.log(f"Sell check error: {e}")
+
+                # Check timeout
+                elapsed = time.time() - self.state.hold_start
+                if elapsed >= self.config.timeout_secs:
+                    await self._handle_timeout(asset_id, label)
+                    return
+
+        except asyncio.CancelledError:
+            pass
+
+    async def _handle_timeout(self, asset_id: str, label: str):
+        """Timeout: try to exit at best available price."""
+        self.log(f"Timeout ({self.config.timeout_secs}s) — attempting exit")
+
+        # Cancel sell order
+        if self.state.sell_order_id:
+            try:
+                await self.client.cancel_order(asset_id=asset_id, order_id=self.state.sell_order_id)
+            except Exception:
+                pass
+
+        # Check OKX best bid
+        try:
+            book = await self.client.get_orderbook(asset_id, depth=5)
+            if str(book.get("code", "")) != "0":
+                await self._notify(f"🚨 超时+无法获取orderbook, 已停止")
+                self.state.status = "stopped"
+                self._running = False
+                return
+
+            bids = book.get("data", [{}])[0].get("bids", [])
+            if not bids:
+                await self._notify(f"🚨 超时+OKX无bid, 已停止")
+                self.state.status = "stopped"
+                self._running = False
+                return
+
+            best_bid = float(bids[0][0])
+
+            if best_bid >= self.state.buy_price:
+                # Check how much of sell order already filled (partial fills)
+                remaining = self.state.buy_size
+                if self.state.sell_order_id:
+                    try:
+                        so = await self.client.get_order(self.state.sell_order_id)
+                        if str(so.get("code", "")) == "0":
+                            already_sold = float(so.get("data", {}).get("filledSize", "0") or "0")
+                            if already_sold > 0:
+                                remaining = self.state.buy_size - already_sold
+                                self.log(f"Sell partially filled: {already_sold:.0f} sold, {remaining:.0f} remaining")
+                    except Exception:
+                        pass
+                if remaining < 1:
+                    # Already fully sold via partial fills before cancel took effect
+                    profit = self.state.buy_size * (self.state.sell_target - self.state.buy_price)
+                    self.log(f"Already sold via partial fills | +{profit:.2f} xp")
+                    await self._notify(f"💰 Sell {label} 成交 (partial) | +{profit:.2f} xp")
+                    self._reset_to_monitoring()
+                    return
+                # Try up to 5 times to exit remaining at best bid
+                size_str = f"{remaining:.10f}".rstrip("0").rstrip(".")
+                for attempt in range(5):
+                    # Re-scan orderbook for fresh best bid (except first attempt)
+                    if attempt > 0:
+                        await asyncio.sleep(1)
+                        try:
+                            book2 = await self.client.get_orderbook(asset_id, depth=5)
+                            if str(book2.get("code", "")) == "0":
+                                bids2 = book2.get("data", [{}])[0].get("bids", [])
+                                if bids2:
+                                    best_bid = float(bids2[0][0])
+                                    if best_bid < self.state.buy_price:
+                                        self.log(f"Retry {attempt+1}/5: bid={best_bid:.2f} < cost, cannot exit")
+                                        await self._notify(f"🚨 bid={best_bid:.2f} < 成本{self.state.buy_price:.2f}, 已停止")
+                                        self.state.status = "stopped"
+                                        self._running = False
+                                        return
+                        except Exception:
+                            pass
+                        self.log(f"Retry {attempt+1}/5: trying @{best_bid:.2f}")
+
+                    exit_resp = await self.client.place_order(
+                        asset_id=asset_id,
+                        side="sell",
+                        price=f"{best_bid:.2f}",
+                        size=size_str,
+                        tif="ioc",
+                    )
+                    if str(exit_resp.get("code", "")) != "0":
+                        msg = exit_resp.get("message", exit_resp.get("msg", ""))
+                        self.log(f"Timeout exit order failed (attempt {attempt+1}): {msg}")
+                        continue
+
+                    # Verify fill
+                    exit_oid = exit_resp.get("data", {}).get("oid", "") or exit_resp.get("data", {}).get("orderId", "")
+                    await asyncio.sleep(0.5)
+                    exit_filled = 0.0
+                    try:
+                        eo = await self.client.get_order(exit_oid)
+                        if str(eo.get("code", "")) == "0":
+                            exit_filled = float(eo.get("data", {}).get("filledSize", "0") or "0")
+                    except Exception:
+                        pass
+
+                    if exit_filled >= 1:
+                        profit = exit_filled * (best_bid - self.state.buy_price)
+                        self.log(f"Timeout exit @{best_bid:.2f} x{exit_filled:.0f} | +{profit:.2f} xp")
+                        await self._notify(
+                            f"⏰ 超时出 @{best_bid:.2f} x{int(exit_filled)} | +{profit:.2f} xp"
+                        )
+                        self._reset_to_monitoring()
+                        return
+                    self.log(f"Attempt {attempt+1}/5: 0 fill")
+
+                # All 5 attempts failed
+                self.log("Timeout: 5 attempts all 0 fill")
+                await self._notify("🚨 超时卖出5次均无成交, 已停止")
+                self.state.status = "stopped"
+                self._running = False
+            else:
+                # Cannot breakeven
+                self.log(f"Cannot breakeven: bid={best_bid:.2f} < cost={self.state.buy_price:.2f}")
+                await self._notify(
+                    f"🚨 bid={best_bid:.2f} < 成本{self.state.buy_price:.2f}, 已停止"
+                )
+                self.state.status = "stopped"
+                self._running = False
+
+        except Exception as e:
+            self.log(f"Timeout handling error: {e}")
+            await self._notify(f"🚨 超时处理异常: {e}, 已停止")
+            self.state.status = "stopped"
+            self._running = False
+
+    def _reset_to_monitoring(self):
+        """Reset state back to monitoring."""
+        self.state.status = "monitoring"
+        self.state.holding_side = ""
+        self.state.buy_price = 0.0
+        self.state.buy_size = 0.0
+        self.state.sell_target = 0.0
+        self.state.sell_order_id = ""
+        self.state.hold_start = 0.0
+        self.log("Resumed monitoring")
+
+    # ─── Helpers ───
+
+    async def _get_poly_bid(self, token_id: str) -> Optional[float]:
+        """Fetch current Poly best bid."""
+        try:
+            async with aiohttp.ClientSession() as sess:
+                url = POLY_CLOB_BOOK.format(token_id=token_id)
+                async with sess.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        bids = data.get("bids", [])
+                        if bids:
+                            bids = sorted(bids, key=lambda x: float(x.get("price", 0)), reverse=True)
+                            return float(bids[0].get("price", 0))
+        except Exception as e:
+            logger.debug(f"[Sniper] Poly bid fetch error: {e}")
+        return None
+
+    async def _notify(self, msg: str):
+        """Send TG notification."""
+        full = f"[{self.account_name or self.account_id}] {msg}"
+        if self.notifier:
+            try:
+                await self.notifier.send(full)
+            except Exception as e:
+                logger.warning(f"[Sniper] Notify failed: {e}")
+
+    def get_state(self) -> dict:
+        # Report settling as a sub-status
+        effective_status = self.state.status
+        if self.state.settling:
+            effective_status = "settling"
+        return {
+            "running": self._running,
+            "status": effective_status,
+            "settling": {
+                "side": self.state.settle_side,
+                "initial": self.state.settle_initial,
+                "current": self.state.settle_price,
+                "elapsed_ms": int((time.time() - self.state.settle_last_update) * 1000) if self.state.settle_last_update else 0,
+            } if self.state.settling else None,
+            "config": {
+                "threshold_cents": self.config.threshold_cents,
+                "ask_levels": self.config.ask_levels,
+                "position_pct": self.config.position_pct,
+                "timeout_secs": self.config.timeout_secs,
+                "settle_ms": self.config.settle_ms,
+            },
+            "holding": {
+                "side": self.state.holding_side,
+                "buy_price": self.state.buy_price,
+                "buy_size": self.state.buy_size,
+                "sell_target": self.state.sell_target,
+                "elapsed": int(time.time() - self.state.hold_start) if self.state.hold_start else 0,
+            } if self.state.status == "holding" else None,
+            "last_yes_bid": self.state.last_yes_bid,
+            "last_no_bid": self.state.last_no_bid,
+            "logs": self.state.logs[-20:],
+        }

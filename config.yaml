@@ -1,0 +1,10 @@
+server:
+  host: 127.0.0.1
+  password: woshishabi123
+  port: 8899
+  username: shinori
+telegram:
+  bot_token: 8831160438:AAEVGgEodISwxoR5wgbPUy4gS7hUhYUb6UQ
+  chat_ids:
+  - '5704353082'
+  - '7056424250'
