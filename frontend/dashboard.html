@@ -167,6 +167,14 @@ td{padding:6px 8px;border-bottom:1px solid var(--surface2);font-family:var(--mon
 .sn-timer-text{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--muted)}
 select.cinput{-webkit-appearance:none;-moz-appearance:none;appearance:none;background:var(--bg);color:#fff;border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:13px;width:100%;cursor:pointer;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%23888' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;}
 select.cinput option{background:var(--bg);color:#fff;}
+
+.btn-group{display:flex;gap:0;}
+.btn-toggle{padding:4px 12px;border:1px solid var(--border);background:var(--card);color:var(--muted);cursor:pointer;font-size:12px;}
+.btn-toggle:first-child{border-radius:4px 0 0 4px;}
+.btn-toggle:last-child{border-radius:0 4px 4px 0;}
+.btn-toggle.active{background:var(--accent);color:#fff;border-color:var(--accent);}
+#mt-sell-modal{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:999;}
+#mt-sell-modal .modal-box{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:20px;min-width:300px;}
 </style>
 </head>
 <body>
@@ -221,6 +229,7 @@ select.cinput option{background:var(--bg);color:#fff;}
 <div class="tab active" data-tab="0" onclick="stab(0)">Manual-D</div>
 <div class="tab" data-tab="1" onclick="stab(1)">Manual-S</div>
 <div class="tab" data-tab="2" onclick="stab(2)">Poly</div>
+<div class="tab" data-tab="3" onclick="stab(3)">Manual</div>
 </div>
 </div>
 <!-- Manual-D -->
@@ -286,6 +295,57 @@ select.cinput option{background:var(--bg);color:#fff;}
 <div id="sn-hold-info" style="display:none"></div>
 <button class="btn-go" id="pb" onclick="tgSniper()">Start Sniper</button>
 </div>
+<!-- Manual Trading -->
+<div class="tc" id="t3">
+<div class="fg"><label>Market</label>
+<div class="sdrop" id="sdrop-tmkt"><button type="button" class="sdrop-btn" id="tmkt-btn">-- Select market --</button><div class="sdrop-panel"><div class="sdrop-search"><input type="text" id="tmkt-q" placeholder="Search markets..." autocomplete="off"></div><div class="sdrop-list" id="tmkt-list"></div></div></div>
+<input type="hidden" id="tmkt">
+</div>
+<div class="fg"><label>Side</label>
+<div class="btn-group" id="mt-side-grp">
+<button type="button" class="btn-toggle active" id="mt-side-yes" onclick="mtSide('YES')">YES</button>
+<button type="button" class="btn-toggle" id="mt-side-no" onclick="mtSide('NO')">NO</button>
+</div></div>
+<div class="fg"><label>Mode</label>
+<div class="btn-group" id="mt-mode-grp">
+<button type="button" class="btn-toggle active" id="mt-mode-mkt" onclick="mtMode('market')">Market</button>
+<button type="button" class="btn-toggle" id="mt-mode-lmt" onclick="mtMode('limit')">Limit</button>
+</div></div>
+<div id="mt-market-sec">
+<div class="fg"><label>Best Ask</label><span id="mt-ask" style="color:var(--green)">--</span></div>
+<div class="fg"><label>Size</label><input type="number" id="mt-mkt-size" autocomplete="off" step="1" min="1" placeholder="Quantity"></div>
+<button class="btn-go" id="mt-mkt-buy" onclick="mtBuyMarket()">Buy @ --</button>
+</div>
+<div id="mt-limit-sec" style="display:none">
+<div class="fg"><label>Price (¢)</label><input type="number" id="mt-lmt-price" autocomplete="off" step="1" min="4" max="96" placeholder="e.g. 12"></div>
+<div class="fg"><label>Size</label><input type="number" id="mt-lmt-size" autocomplete="off" step="1" min="1" placeholder="Quantity"></div>
+<button class="btn-go" onclick="mtBuyLimit()">Place Buy</button>
+</div>
+
+<div class="ph" style="margin-top:16px"><span class="pt">Positions</span><span class="badge" id="mt-pos-ct">0</span></div>
+<div class="tbl-wrap">
+<table class="tbl"><thead><tr><th>Market</th><th>Side</th><th>Qty</th><th>Avg</th><th>Value</th><th>Status</th><th>Action</th></tr></thead>
+<tbody id="mt-pos-tb"><tr><td colspan="7" style="color:var(--muted)">No positions</td></tr></tbody></table>
+</div>
+
+<div class="ph" style="margin-top:16px"><span class="pt">Trade History</span></div>
+<div class="tbl-wrap" style="max-height:200px;overflow-y:auto">
+<table class="tbl"><thead><tr><th>Time</th><th>Market</th><th>Side</th><th>Token</th><th>Price</th><th>Qty</th><th>Total</th></tr></thead>
+<tbody id="mt-hist-tb"><tr><td colspan="7" style="color:var(--muted)">No trades</td></tr></tbody></table>
+</div>
+
+<div id="mt-sell-modal">
+<div class="modal-box">
+<div class="ph"><span class="pt">List Sell Order</span></div>
+<div class="fg"><label>Price (¢)</label><input type="number" id="mt-sell-price" step="1" min="4" max="96"></div>
+<div class="fg"><label>Size</label><input type="number" id="mt-sell-size" step="1" min="1" readonly></div>
+<div style="display:flex;gap:8px;margin-top:12px">
+<button class="btn-go" onclick="mtSellConfirm()">Place Sell</button>
+<button class="btn-cx" onclick="mtSellCancel()">Cancel</button>
+</div>
+</div></div>
+</div>
+
 <!-- Monitor (independent) -->
 
 </div>
@@ -440,12 +500,13 @@ async function confirmDeleteAcct(){if(!confirm('Delete this account? This will f
 
 
 // Tabs
-function stab(n){document.querySelectorAll('#view-acct .tab').forEach(function(t){t.className=parseInt(t.getAttribute('data-tab'))===n?'tab active':'tab';});for(var i=0;i<3;i++){document.getElementById('t'+i).className=i===n?'tc active':'tc';}
+function stab(n){_activeTab=n;document.querySelectorAll('#view-acct .tab').forEach(function(t){t.className=parseInt(t.getAttribute('data-tab'))===n?'tab active':'tab';});for(var i=0;i<4;i++){document.getElementById('t'+i).className=i===n?'tc active':'tc';}
 _activeTab=n;
 /* Clear non-running tabs' selections */
 if(n!==0&&!MR&&!MSR&&!PR){document.getElementById('mkt').value='';document.getElementById('mkt-btn').textContent='-- Select market --';document.getElementById('mp').value='';document.getElementById('cn').textContent='NO price = 99 - a = --';resetMonitor('md-mon-');}
 if(n!==1&&!MSR&&!MR&&!PR){document.getElementById('smkt').value='';document.getElementById('smkt-btn').textContent='-- Select market --';document.getElementById('ms-price').value='';resetMonitor('ms-mon-');}
 if(n!==2&&!PR){document.getElementById('pmkt').value='';document.getElementById('pmkt-btn').textContent='-- Select market --';document.getElementById('pi').value='';clearPolyOb();var wrap=document.getElementById('poly-sel-wrap');if(wrap)wrap.style.display='none';var sel=document.getElementById('poly-sel');if(sel)sel.innerHTML='<option value="">-- Select outcome --</option>';_polyResolvedToken='';}
+if(n===3&&!_mtPoll){mtStartPoll();}if(n!==3){mtStopPoll();}
 /* Orderbook: if target tab has a running strategy, render from cache.
    Otherwise disconnect WS completely — no lingering data from previous tab. */
 var thisRunning=(n===0&&MR)||(n===1&&MSR)||(n===2&&PR);
@@ -464,6 +525,42 @@ async function tgMS(){var btn=document.getElementById('msb');if(btn.disabled)ret
 // Cancel
 async function cxAll(){if(!confirm('Cancel all orders? This will also stop any running strategy.'))return;if(MR||MSR||PR){await api('/api/strategy/stop',{method:'POST'});}var r=await api('/api/cancel_all',{method:'POST'});var d=await r.json();if(d.ok){al('CANCEL','All cancelled'+(MR||MSR||PR?' + strategy stopped':''));MR=false;MSR=false;PR=false;setTimeout(poll,1500);}else{al('ERROR','Cancel failed: '+(d.error||JSON.stringify(d)));}}
 async function cx(id,aid){var r=await api('/api/cancel_order',{method:'POST',body:JSON.stringify({order_id:id,asset_id:aid})});var d=await r.json();if(d.ok){al('CANCEL','Cancelled '+id);setTimeout(poll,1500);}else{al('ERROR','Cancel failed: '+(d.error||JSON.stringify(d)));}}
+
+// ═══ Manual Trading Tab ═══
+var _mtSide='YES',_mtMode='market',_mtPoll=null,_mtSellAsset='',_mtSellSize=0,_activeTab=0;
+
+function mtSide(s){_mtSide=s;document.getElementById('mt-side-yes').className='btn-toggle'+(s==='YES'?' active':'');document.getElementById('mt-side-no').className='btn-toggle'+(s==='NO'?' active':'');mtFetchTicker();}
+
+function mtMode(m){_mtMode=m;document.getElementById('mt-mode-mkt').className='btn-toggle'+(m==='market'?' active':'');document.getElementById('mt-mode-lmt').className='btn-toggle'+(m==='limit'?' active':'');document.getElementById('mt-market-sec').style.display=m==='market'?'':'none';document.getElementById('mt-limit-sec').style.display=m==='limit'?'':'none';}
+
+function mtGetAssetId(){var base=document.getElementById('tmkt').value;if(!base)return null;if(_mtSide==='YES')return base;var m=_mktMap[base];return m?m.no_asset_id:null;}
+
+async function mtFetchTicker(){var aid=mtGetAssetId();if(!aid){document.getElementById('mt-ask').textContent='--';document.getElementById('mt-mkt-buy').textContent='Buy @ --';return;}try{var r=await api('/api/accounts/'+currentAcctId+'/ticker?asset_id='+aid);if(r.ok){var d=await r.json();var ask=d.best_ask;if(ask){document.getElementById('mt-ask').textContent=ask+'\u00a2';document.getElementById('mt-mkt-buy').textContent='Buy @ '+ask+'\u00a2';}else{document.getElementById('mt-ask').textContent='No asks';document.getElementById('mt-mkt-buy').textContent='Buy @ --';}}}catch(e){}}
+
+async function mtBuyMarket(){var aid=mtGetAssetId();if(!aid){al('ERROR','Select a market first');return;}var size=document.getElementById('mt-mkt-size').value;if(!size||parseInt(size)<1){al('ERROR','Enter size');return;}var askEl=document.getElementById('mt-ask').textContent;var price=parseFloat(askEl);if(!price||isNaN(price)){al('ERROR','No ask price available');return;}var btn=document.getElementById('mt-mkt-buy');btn.disabled=true;try{var r=await api('/api/accounts/'+currentAcctId+'/manual/place',{method:'POST',body:JSON.stringify({asset_id:aid,side:'BUY',price:String(price),size:String(parseInt(size)),tif:'ioc'})});var d=await r.json();if(d.ok){al('INFO','Market buy sent: '+size+' @ '+price+'\u00a2');mtRefresh();}else{al('ERROR',d.error||'Buy failed');}}catch(e){al('ERROR',e.message);}finally{btn.disabled=false;}}
+
+async function mtBuyLimit(){var aid=mtGetAssetId();if(!aid){al('ERROR','Select a market first');return;}var price=document.getElementById('mt-lmt-price').value;var size=document.getElementById('mt-lmt-size').value;if(!price||!size){al('ERROR','Enter price and size');return;}try{var r=await api('/api/accounts/'+currentAcctId+'/manual/place',{method:'POST',body:JSON.stringify({asset_id:aid,side:'BUY',price:String(parseInt(price)),size:String(parseInt(size)),tif:'gtc'})});var d=await r.json();if(d.ok){al('INFO','Limit buy placed: '+size+' @ '+price+'\u00a2');mtRefresh();}else{al('ERROR',d.error||'Buy failed');}}catch(e){al('ERROR',e.message);}}
+
+function mtSellInstant(assetId,size){api('/api/accounts/'+currentAcctId+'/ticker?asset_id='+assetId).then(function(r){return r.json();}).then(function(d){if(!d.best_bid){al('ERROR','No bid available');return;}api('/api/accounts/'+currentAcctId+'/manual/place',{method:'POST',body:JSON.stringify({asset_id:assetId,side:'SELL',price:String(d.best_bid),size:String(size),tif:'ioc'})}).then(function(r){return r.json();}).then(function(rd){if(rd.ok){al('INFO','Instant sell: '+size+' @ '+d.best_bid+'\u00a2');mtRefresh();}else{al('ERROR',rd.error||'Sell failed');});}).catch(function(e){al('ERROR',e.message);});}
+
+function mtSellList(assetId,size){_mtSellAsset=assetId;_mtSellSize=size;document.getElementById('mt-sell-size').value=size;document.getElementById('mt-sell-price').value='';document.getElementById('mt-sell-modal').style.display='flex';}
+
+function mtSellConfirm(){var price=document.getElementById('mt-sell-price').value;if(!price){al('ERROR','Enter sell price');return;}api('/api/accounts/'+currentAcctId+'/manual/place',{method:'POST',body:JSON.stringify({asset_id:_mtSellAsset,side:'SELL',price:String(parseInt(price)),size:String(_mtSellSize),tif:'gtc'})}).then(function(r){return r.json();}).then(function(d){if(d.ok){al('INFO','Sell listed @ '+price+'\u00a2');mtSellCancel();mtRefresh();}else{al('ERROR',d.error||'List failed');}}).catch(function(e){al('ERROR',e.message);});}
+
+function mtSellCancel(){document.getElementById('mt-sell-modal').style.display='none';}
+
+async function mtRefresh(){await mtLoadPositions();await mtLoadHistory();}
+
+async function mtLoadPositions(){try{var [pr,or2]=await Promise.all([api('/api/accounts/'+currentAcctId+'/positions'),api('/api/accounts/'+currentAcctId+'/orders')]);var positions=[];if(pr.ok){var pd=await pr.json();positions=pd.positions||[];}var orders=[];if(or2.ok){var od=await or2.json();orders=od.orders||[];}var sellMap={};orders.forEach(function(o){if(o.side==='SELL'){sellMap[o.asset_id]={order_id:o.order_id,price:o.price};}});document.getElementById('mt-pos-ct').textContent=positions.length;var tb=document.getElementById('mt-pos-tb');if(!positions.length){tb.innerHTML='<tr><td colspan="7" style="color:var(--muted)">No positions</td></tr>';return;}tb.innerHTML=positions.map(function(p){var aid=p.asset_id||'';var mkt=_findMarketName(aid)||p.market_id||'--';var side=p.token_name||'--';var qty=parseFloat(p.size)||0;var avg=parseFloat(p.avg_price)||0;var val=qty*avg;var sell=sellMap[aid];var status,action;if(sell){status='<span style="color:var(--yellow)">Selling@'+parseFloat(sell.price).toFixed(0)+'\u00a2</span>';action='<button class="cbtn" onclick="cx(\''+esc(sell.order_id)+'\',\''+esc(aid)+'\');setTimeout(mtRefresh,1500)">Cancel</button>';}else{status='<span style="color:var(--muted)">Holding</span>';action='<button class="cbtn" onclick="mtSellInstant(\''+esc(aid)+'\','+Math.round(qty)+')">Sell</button> <button class="cbtn" onclick="mtSellList(\''+esc(aid)+'\','+Math.round(qty)+')">List</button>';}return '<tr><td>'+esc(mkt.substring(0,30))+'</td><td>'+side+'</td><td>'+Math.round(qty)+'</td><td>'+avg.toFixed(2)+'\u00a2</td><td>'+val.toFixed(1)+'</td><td>'+status+'</td><td>'+action+'</td></tr>';}).join('');}catch(e){}}
+
+async function mtLoadHistory(){try{var url='/api/accounts/'+currentAcctId+'/trades?limit=30';var filterAsset=document.getElementById('tmkt').value;if(filterAsset)url+='&asset_id='+filterAsset;var r=await api(url);if(!r.ok)return;var d=await r.json();var trades=d.trades||[];var tb=document.getElementById('mt-hist-tb');if(!trades.length){tb.innerHTML='<tr><td colspan="7" style="color:var(--muted)">No trades</td></tr>';return;}tb.innerHTML=trades.map(function(t){var time=t.filled_at?new Date(parseInt(t.filled_at)).toLocaleTimeString():'--';var mkt=_findMarketName(t.asset_id)||t.market_id||'--';var price=parseFloat(t.price)||0;var qty=parseFloat(t.size)||0;var total=(price*qty).toFixed(1);return '<tr><td>'+time+'</td><td>'+esc(mkt.substring(0,25))+'</td><td class="'+(t.side==='BUY'?'buy':'sell')+'">'+t.side+'</td><td>'+t.token+'</td><td>'+price.toFixed(2)+'\u00a2</td><td>'+Math.round(qty)+'</td><td>'+total+'</td></tr>';}).join('');}catch(e){}}
+
+function _findMarketName(assetId){if(!assetId)return '';var m=_mktMap[assetId];if(m)return(m.question||m.event_title||'').substring(0,40);for(var i=0;i<_mkts.length;i++){if(_mkts[i].no_asset_id===assetId)return(_mkts[i].question||_mkts[i].event_title||'').substring(0,40);}return '';}
+
+function mtStartPoll(){if(_mtPoll)return;mtRefresh();mtFetchTicker();_mtPoll=setInterval(function(){mtRefresh();mtFetchTicker();},5000);}
+
+function mtStopPoll(){if(_mtPoll){clearInterval(_mtPoll);_mtPoll=null;}}
+
 
 // Account polling
 async function poll(){var _nav=navId;try{var r=await api('/api/status');if(r.status===401){doLogout();return;}if(_nav!==navId)return;if(r.ok){var s=await r.json();document.getElementById('api-dot').className='dot dot-g';document.getElementById('api-st').textContent='CONNECTED';document.getElementById('ts').textContent=new Date().toLocaleTimeString();var eng=s.running?s.strategy.toUpperCase():'IDLE';document.getElementById('k-eng').textContent=eng;document.getElementById('k-eng').className=s.running?'kpi-v green':'kpi-v';document.getElementById('s-st').textContent=s.strategy||'none';document.getElementById('s-md').textContent=s.running?'RUNNING':'STOPPED';document.getElementById('s-md').className=s.running?'sv on':'sv off';document.getElementById('s-cy').textContent=s.cycles||'0';MR=s.manual_running||false;PR=s.sniper_running||s.poly_running||false;MSR=s.manual_s_running||false;if(MR){document.getElementById('mb').className='btn-stop';document.getElementById('mb').textContent='Stop Engine';document.getElementById('ms').textContent='Running @ '+(s.manual_price||'?');document.getElementById('ms').style.color='var(--green)';if(s.manual_asset_id){document.getElementById('mkt').value=s.manual_asset_id;var _m=_mktMap[s.manual_asset_id];if(_m)document.getElementById('mkt-btn').textContent=(_m.question||_m.event_title).substring(0,55);if(!_okxAsset)sob(s.manual_asset_id);}if(s.manual_price&&document.activeElement!==document.getElementById('mp'))document.getElementById('mp').value=s.manual_price;}else{document.getElementById('mb').className='btn-go';document.getElementById('mb').textContent='Start Engine';document.getElementById('ms').textContent='Idle';document.getElementById('ms').style.color='var(--muted)';}if(MSR){document.getElementById('msb').className='btn-stop';document.getElementById('msb').textContent='Stop Manual-S';document.getElementById('mss').textContent='Running '+(s.manual_s_side||'')+' @ '+(s.manual_s_price||'');document.getElementById('mss').style.color='var(--green)';if(s.manual_s_asset_id){document.getElementById('smkt').value=s.manual_s_asset_id;var _ms=_mktMap[s.manual_s_asset_id];if(_ms)document.getElementById('smkt-btn').textContent=(_ms.question||_ms.event_title).substring(0,55);if(!_okxAsset)sob(s.manual_s_asset_id);}if(s.manual_s_price&&document.activeElement!==document.getElementById('ms-price'))document.getElementById('ms-price').value=s.manual_s_price;}else{document.getElementById('msb').className='btn-go';document.getElementById('msb').textContent='Start Manual-S';document.getElementById('mss').textContent='Idle';document.getElementById('mss').style.color='var(--muted)';}if(PR){document.getElementById('pb').className='btn-stop';document.getElementById('pb').textContent='Stop Sniper';document.getElementById('ps').textContent='Monitoring...';document.getElementById('ps').style.color='var(--green)';if(s.poly_url){document.getElementById('pi').value=s.poly_url;if(s.poly_asset_id){document.getElementById('pmkt').value=s.poly_asset_id;var pm=_mktMap[s.poly_asset_id];if(pm)document.getElementById('pmkt-btn').textContent=(pm.question||pm.event_title).substring(0,55)+' ['+s.poly_asset_id+']';}if(!obConnected||!_polyToken)startPolyOb(s.poly_url);if(s.poly_asset_id&&!_okxAsset)sob(s.poly_asset_id);}}else{document.getElementById('pb').className='btn-go';document.getElementById('pb').textContent='Start Sniper';document.getElementById('ps').textContent='Idle';document.getElementById('ps').style.color='var(--muted)';}}
@@ -674,14 +771,15 @@ function rl(){var el=document.getElementById('lg');if(!el)return;el.innerHTML=lo
 var _mkts=[],_mktMap={};
 function sdInit(wrId,hidId,btnId,listId,qId){var wr=document.getElementById(wrId),btn=document.getElementById(btnId),q=document.getElementById(qId),list=document.getElementById(listId);if(!wr||!btn||!q||!list)return;btn.addEventListener('click',function(e){e.stopPropagation();var open=wr.classList.toggle('open');if(open){q.value='';sdRender(listId,_mkts,hidId,btnId);setTimeout(function(){q.focus();},50);}});q.addEventListener('input',function(){var v=this.value.toLowerCase();var f=_mkts.filter(function(m){return(m.question||m.event_title||'').toLowerCase().indexOf(v)!==-1||String(m.yes_asset_id).indexOf(v)!==-1;});sdRender(listId,f,hidId,btnId);});q.addEventListener('click',function(e){e.stopPropagation();});list.addEventListener('click',function(e){e.stopPropagation();});}
 function sdRender(listId,items,hidId,btnId){var list=document.getElementById(listId),hid=document.getElementById(hidId);if(!list||!hid)return;if(!items.length){list.innerHTML='<div class="sdrop-empty">No markets found</div>';return;}list.innerHTML=items.map(function(m){var t=esc((m.question||m.event_title).substring(0,55))+' ['+esc(String(m.yes_asset_id))+']';var sel=hid.value==m.yes_asset_id?' sel':'';return '<div class="sdrop-item'+sel+'" data-v="'+m.yes_asset_id+'" title="'+t+'">'+t+'</div>';}).join('');list.querySelectorAll('.sdrop-item').forEach(function(el){el.addEventListener('click',function(){sdSelect(hidId,btnId,this.getAttribute('data-v'),this.textContent);});});}
-function sdSelect(hidId,btnId,val,txt){document.getElementById(hidId).value=val;document.getElementById(btnId).textContent=txt;document.querySelectorAll('.sdrop').forEach(function(d){d.classList.remove('open');});if(val){SA=val;sob(val);}}
+function sdSelect(hidId,btnId,val,txt){document.getElementById(hidId).value=val;document.getElementById(btnId).textContent=txt;document.querySelectorAll('.sdrop').forEach(function(d){d.classList.remove('open');});if(val){SA=val;sob(val);if(hidId==='tmkt'){mtFetchTicker();mtLoadHistory();}}}
 document.addEventListener('click',function(){document.querySelectorAll('.sdrop').forEach(function(d){d.classList.remove('open');});});
 
-async function loadMkts(){try{var r=await api('/api/markets');if(!r.ok){al('ERROR','Markets: '+r.status);return;}var d=await r.json();_mkts=d.markets||[];_mktMap={};_mkts.forEach(function(m){_mktMap[m.yes_asset_id]=m;});sdRender('mkt-list',_mkts,'mkt','mkt-btn');sdRender('smkt-list',_mkts,'smkt','smkt-btn');sdRender('pmkt-list',_mkts,'pmkt','pmkt-btn');al('INFO','Loaded '+_mkts.length+' markets');}catch(e){al('ERROR','Failed to load markets');}}
+async function loadMkts(){try{var r=await api('/api/markets');if(!r.ok){al('ERROR','Markets: '+r.status);return;}var d=await r.json();_mkts=d.markets||[];_mktMap={};_mkts.forEach(function(m){_mktMap[m.yes_asset_id]=m;});sdRender('mkt-list',_mkts,'mkt','mkt-btn');sdRender('smkt-list',_mkts,'smkt','smkt-btn');sdRender('pmkt-list',_mkts,'pmkt','pmkt-btn');sdRender('tmkt-list',_mkts,'tmkt','tmkt-btn');al('INFO','Loaded '+_mkts.length+' markets');}catch(e){al('ERROR','Failed to load markets');}}
 
 sdInit('sdrop-mkt','mkt','mkt-btn','mkt-list','mkt-q');
 sdInit('sdrop-smkt','smkt','smkt-btn','smkt-list','smkt-q');
 sdInit('sdrop-pmkt','pmkt','pmkt-btn','pmkt-list','pmkt-q');
+sdInit('sdrop-tmkt','tmkt','tmkt-btn','tmkt-list','tmkt-q');
 
 // Boot
 route();
