@@ -440,12 +440,6 @@ class ManualStrategyS:
 
     async def _deploy_balance(self):
         try:
-            # Check for existing open buy orders to avoid duplicates
-            open_resp = await self.client.get_orders(status="open")
-            if str(open_resp.get("code", "")) == "0":
-                for o in open_resp.get("data", {}).get("list", []):
-                    if o.get("side", "").upper() == "BUY" and o.get("assetId") == self.state.asset_id:
-                        return  # Already have open buy orders, skip deployment
 
             balance = await self.client.get_balance()
             available = self._parse_available(balance)
