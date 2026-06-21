@@ -214,8 +214,13 @@ class PolySniper:
                             # Response can be array (snapshot) or single object (update)
                             items = raw if isinstance(raw, list) else [raw]
                             for data in items:
-                                if data.get("event_type") == "book":
+                                evt = data.get("event_type", "")
+                                if evt == "book":
                                     await self._process_book_update(data)
+                                elif not hasattr(self, '_dbg_logged'):
+                                    # Log first non-book message for debugging
+                                    self._dbg_logged = True
+                                    self.log(f"WS msg event_type={evt}, keys={list(data.keys())[:8]}")
                         except Exception:
                             pass
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
