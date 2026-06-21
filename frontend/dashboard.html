@@ -819,6 +819,7 @@ async function tgSniper(){
       var yesToken=_polyYesToken||'';
       var noToken=_polyNoToken||'';
       if(!yesToken||!noToken){al('ERROR','Poly tokens not resolved. Re-enter URL.');return;}
+      if(_polyResolvedToken&&yesToken!==_polyResolvedToken&&noToken!==_polyResolvedToken){al('ERROR','Token mismatch: orderbook shows different market. Re-enter Poly URL.');return;}
       var mkt=_mktMap[asset]||{};
       var payload={
         yes_token_id:yesToken,
