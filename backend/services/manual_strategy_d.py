@@ -237,7 +237,7 @@ class ManualStrategyD:
             # Pre-seed sell fill tracker
             if not hasattr(self.state, '_sell_fills_tracked'):
                 self.state._sell_fills_tracked = {}
-            for o in (resp.get('data', {}).get('list', []) if resp.get('code') == 0 else []) + (resp2.get('data', {}).get('list', []) if resp2.get('code') == 0 else []):
+            for o in (resp.get('data', {}).get('list', []) if str(resp.get('code', '')) == '0' else []) + (resp2.get('data', {}).get('list', []) if str(resp2.get('code', '')) == '0' else []):
                 oid = o.get('id', o.get('oid', ''))
                 side = o.get('side', '').upper()
                 asset_id = o.get('assetId', '')
