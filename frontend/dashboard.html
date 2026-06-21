@@ -358,7 +358,7 @@ select.cinput option{background:var(--bg);color:#fff;}
 </div>
 </div>
 <!-- OKX Orderbook -->
-<div class="panel">
+<div class="panel" id="okx-ob-panel">
 <div class="ph"><span class="pt">OKX Order Book</span><span style="font-size:12px;color:var(--muted);font-family:var(--mono)" id="ob-id">Select a market</span></div>
 <div class="ob">
 <div class="ob-bid"><h4>Bids</h4><div id="ob-b"><div class="obr" style="color:var(--muted)">--</div></div></div>
@@ -507,6 +507,7 @@ if(n!==0&&!MR&&!MSR&&!PR){document.getElementById('mkt').value='';document.getEl
 if(n!==1&&!MSR&&!MR&&!PR){document.getElementById('smkt').value='';document.getElementById('smkt-btn').textContent='-- Select market --';document.getElementById('ms-price').value='';resetMonitor('ms-mon-');}
 if(n!==2&&!PR){document.getElementById('pmkt').value='';document.getElementById('pmkt-btn').textContent='-- Select market --';document.getElementById('pi').value='';clearPolyOb();var wrap=document.getElementById('poly-sel-wrap');if(wrap)wrap.style.display='none';var sel=document.getElementById('poly-sel');if(sel)sel.innerHTML='<option value="">-- Select outcome --</option>';_polyResolvedToken='';}
 if(n===3&&!_mtPoll){mtStartPoll();}if(n!==3){mtStopPoll();}
+var _obPanels=document.querySelectorAll('#poly-ob-panel,#okx-ob-panel');_obPanels.forEach(function(p){p.style.display=n===3?'none':'';});
 /* Orderbook: if target tab has a running strategy, render from cache.
    Otherwise disconnect WS completely — no lingering data from previous tab. */
 var thisRunning=(n===0&&MR)||(n===1&&MSR)||(n===2&&PR);
