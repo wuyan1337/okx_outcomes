@@ -816,14 +816,26 @@ async function tgSniper(){
       if(!polySel||!polySel.value){al('ERROR','Select Poly outcome first');return;}
       // poly-sel value is the YES token, we need both YES and NO
       // The resolve should have stored both
-      // Re-derive YES/NO tokens from dropdown (fresh, not stale vars)
+      // Derive YES/NO token pair from the selected dropdown option
       var polySel=document.getElementById('poly-sel');
-      var polyOpts=polySel?polySel.options:[];
+      if(!polySel||!polySel.value){al('ERROR','Select a Poly outcome first');return;}
+      var selectedToken=polySel.value;
+      var selectedText=polySel.options[polySel.selectedIndex].textContent;
       var yesToken='',noToken='';
-      if(polyOpts.length>=3){yesToken=polyOpts[1].value;noToken=polyOpts[2].value;}
-      if(!yesToken||!noToken){yesToken=_polyYesToken||'';noToken=_polyNoToken||'';}
-      if(!yesToken||!noToken){al('ERROR','Poly tokens not resolved. Re-enter URL.');return;}
-      _polyYesToken=yesToken;_polyNoToken=noToken;
+      // Find the matching pair: same question, opposite YES/NO
+      // Format: "Question - Yes" / "Question - No"
+      var baseQ=selectedText.replace(/ - (Yes|No)$/i,'').trim();
+      var isYes=/ - Yes$/i.test(selectedText);
+      for(var oi=1;oi<polySel.options.length;oi++){
+        var oText=polySel.options[oi].textContent;
+        var oBase=oText.replace(/ - (Yes|No)$/i,'').trim();
+        if(oBase===baseQ){
+          if(/ - Yes$/i.test(oText)){yesToken=polySel.options[oi].value;}
+          else if(/ - No$/i.test(oText)){noToken=polySel.options[oi].value;}
+        }
+      }
+      if(!yesToken||!noToken){al('ERROR','Cannot find YES/NO pair for selected outcome');return;}
+      _polyYesToken=yesToken;_polyNoToken=noToken;_polyResolvedToken=selectedToken;
       var mkt=_mktMap[asset]||{};
       var payload={
         yes_token_id:yesToken,
