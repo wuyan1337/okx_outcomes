@@ -27,6 +27,7 @@ class SniperConfig:
     position_pct: int = 100         # Balance percentage to use
     timeout_secs: int = 120         # Seconds before forced exit
     settle_ms: int = 1000           # Ms to wait for price to stabilize after jump
+    window_ms: int = 500            # Rolling window for cumulative jump detection
 
 
 @dataclass
@@ -75,6 +76,7 @@ class PolySniper:
         self._hold_task: Optional[asyncio.Task] = None
         self._running = False
         self._ws_calibrated = {"yes": False, "no": False}
+        self._price_window: Dict[str, list] = {"yes": [], "no": []}  # [(timestamp, price), ...]
 
     @property
     def running(self) -> bool:
@@ -269,10 +271,20 @@ class PolySniper:
             self._ws_calibrated[side] = True
             return
 
-        # Check jump
-        jump_cents = round((current_bid - prev_bid) * 100)
+        # Rolling window jump detection: check if price moved >= threshold within window_ms
+        now = time.monotonic()
+        window = self._price_window[side]
+        window.append((now, current_bid))
+        # Trim entries older than window_ms
+        cutoff = now - (self.config.window_ms / 1000.0)
+        while window and window[0][0] < cutoff:
+            window.pop(0)
+        # Calculate cumulative jump: current price vs lowest price in window
+        window_low = min(p for _, p in window)
+        jump_cents = round((current_bid - window_low) * 100)
         if jump_cents >= self.config.threshold_cents:
-            self.log(f"JUMP detected: {side.upper()} {prev_bid:.3f} → {current_bid:.3f} (+{jump_cents}¢), buying immediately...")
+            self._price_window[side] = []  # Reset window after trigger
+            self.log(f"JUMP detected: {side.upper()} {window_low:.3f} → {current_bid:.3f} (+{jump_cents}¢) within {self.config.window_ms}ms, buying immediately...")
             # IMMEDIATELY snapshot OKX orderbook and BUY before it catches up
             okx_asset = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
             snapshot_asks = await self._snapshot_okx_asks(okx_asset)
