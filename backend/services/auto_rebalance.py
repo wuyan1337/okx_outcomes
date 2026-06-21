@@ -288,7 +288,7 @@ class AutoRebalance:
         except Exception as e:
             logger.warning(f"[Rebalance] reconcile_with_position error: {e}")
 
-        async def _wait_for_stable_price(self, poly_token_id: str) -> Optional[float]:
+    async def _wait_for_stable_price(self, poly_token_id: str) -> Optional[float]:
         """Poll Poly every 5s. Need 12 consecutive readings at same price (within tolerance).
         Returns stable price as decimal, or None if not stabilized within max attempts."""
         import aiohttp
