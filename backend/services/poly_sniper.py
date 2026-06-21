@@ -120,6 +120,23 @@ class PolySniper:
         if no_bid is not None:
             self.state.last_no_bid = no_bid
 
+        # Cross-validate: compare Poly bid with OKX ask to ensure correct token pairing
+        try:
+            okx_book = await self.client.get_orderbook(yes_asset_id, depth=1)
+            okx_ask = None
+            if str(okx_book.get("code", "")) == "0":
+                asks = okx_book.get("data", [{}])[0].get("asks", [])
+                if asks:
+                    okx_ask = float(asks[0][0])
+            if okx_ask and yes_bid:
+                diff = abs(yes_bid - okx_ask)
+                if diff > 0.15:
+                    self.log(f"⚠️ WARNING: Poly YES bid ({yes_bid:.3f}) and OKX ask ({okx_ask:.3f}) differ by {diff:.3f} — possible token mismatch!")
+                else:
+                    self.log(f"✓ Poly YES={yes_bid:.3f}, OKX ask={okx_ask:.3f} (diff={diff:.3f})")
+        except Exception:
+            pass
+
         self._running = True
         self._task = asyncio.create_task(self._monitor_loop())
         self.log(f"Started: threshold={threshold_cents}¢, levels={ask_levels}, pct={position_pct}%, settle={settle_ms}ms")
