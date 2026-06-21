@@ -155,6 +155,10 @@ class AutoRebalance:
             # Step 0: Record any partially filled buys from the cancelled orders
             await self._capture_partial_fills(old_price_cents)
 
+            # Step 0b: Reconcile with actual OKX position (handles orphaned positions
+            # where sells were cancelled but the underlying position still exists)
+            await self._reconcile_with_position(old_price_cents)
+
             # Step 1: Notify start
             await self._notify(f"🔄 Auto-Rebalance 开始观察 (5s)\nTrigger: {trigger_reason}")
 
