@@ -299,7 +299,7 @@ class PolySniper:
             self.log(f"OKX snapshot: best ask={snapshot_best_ask:.2f} (poly={current_bid:.3f}, spread={round((current_bid - snapshot_best_ask)*100)}¢)")
 
             # BUY FIRST — execute immediately at snapshot prices
-            bought = await self._execute_buy_immediate(side, okx_asset, snapshot_asks, prev_bid, current_bid)
+            bought = await self._execute_buy_immediate(side, okx_asset, snapshot_asks, window_low, current_bid)
             if not bought:
                 return
 
