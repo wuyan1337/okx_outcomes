@@ -923,6 +923,7 @@ class PolySniper:
                 "position_pct": self.config.position_pct,
                 "timeout_secs": self.config.timeout_secs,
                 "settle_ms": self.config.settle_ms,
+                "window_ms": self.config.window_ms,
             },
             "holding": {
                 "side": self.state.holding_side,
