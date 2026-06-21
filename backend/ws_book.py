@@ -115,7 +115,7 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str, stop_e
                 async with session.ws_connect(OKX_WS_PUBLIC, heartbeat=20) as ws:
                     # Send initial REST snapshot
                     try:
-                        okx_url = f"https://us.okx.com/api/v5/market/pm-books?instId={asset_id}&sz=5"
+                        okx_url = f"https://www.okx.com/api/v5/market/pm-books?instId={asset_id}&sz=5"
                         async with session.get(
                             okx_url, timeout=aiohttp.ClientTimeout(total=5)
                         ) as snap_resp:
@@ -206,7 +206,7 @@ async def periodic_refresh(ws_out: WebSocket, poly_token: str, okx_asset: str, p
                             if node["host"] is not None:
                                 connector = ProxyConnector.from_url(f"socks5://{node['host']}:{node['port']}")
                         async with aiohttp.ClientSession(connector=connector) as sess2:
-                            url = f"https://us.okx.com/api/v5/market/pm-books?instId={okx_asset}&sz=5"
+                            url = f"https://www.okx.com/api/v5/market/pm-books?instId={okx_asset}&sz=5"
                             async with sess2.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
                                 if resp.status == 200:
                                     data = await resp.json()
