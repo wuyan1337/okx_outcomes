@@ -739,5 +739,9 @@ class PolySniper:
             } if self.state.status == "holding" else None,
             "last_yes_bid": self.state.last_yes_bid,
             "last_no_bid": self.state.last_no_bid,
+            "yes_token_id": self.state.yes_token_id,
+            "no_token_id": self.state.no_token_id,
+            "yes_asset_id": self.state.yes_asset_id,
+            "no_asset_id": self.state.no_asset_id,
             "logs": self.state.logs[-20:],
         }
