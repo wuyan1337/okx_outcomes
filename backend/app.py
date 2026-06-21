@@ -662,7 +662,7 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
         except Exception:
             pass
     if not no_asset_id:
-        no_asset_id = str(int(asset_id) + 100)
+        return JSONResponse(status_code=400, content={"ok": False, "error": "no_asset_id is required"})
     try:
         bal = await inst.client.get_balance()
         if isinstance(bal, dict) and bal.get("code") and str(bal["code"]) != "0":
@@ -891,7 +891,7 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
         except Exception:
             pass
     if not no_asset_id:
-        no_asset_id = str(int(asset_id) + 100)
+        return JSONResponse(status_code=400, content={"ok": False, "error": "no_asset_id is required"})
     # Monitor validation if enabled
     monitor = body.get("monitor")
     price_decimal = float(price) / 100.0 if float(price) >= 1 else float(price)
