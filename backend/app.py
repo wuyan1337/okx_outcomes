@@ -911,6 +911,7 @@ async def sniper_start(account_id: str, request: Request, user: str = Depends(ve
         position_pct=int(body.get("position_pct", 100)),
         timeout_secs=int(body.get("timeout_secs", 120)),
         settle_ms=int(body.get("settle_ms", 1000)),
+        window_ms=int(body.get("window_ms", 500)),
         poly_url=body.get("poly_url", ""),
         selected_outcome=body.get("selected_outcome", ""),
     )
