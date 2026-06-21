@@ -92,7 +92,8 @@ class PolySniper:
                     yes_asset_id: str, no_asset_id: str, market_id: str,
                     threshold_cents: int = 40, ask_levels: int = 1,
                     position_pct: int = 100, timeout_secs: int = 120,
-                    settle_ms: int = 1000):
+                    settle_ms: int = 1000, poly_url: str = "",
+                    selected_outcome: str = ""):
         """Start sniper monitoring."""
         if self._running:
             return {"ok": False, "error": "Already running"}
@@ -111,6 +112,8 @@ class PolySniper:
             no_asset_id=no_asset_id,
             market_id=market_id,
         )
+        self.state.poly_url = poly_url
+        self.state.selected_outcome = selected_outcome
 
         # Get initial Poly prices
         yes_bid = await self._get_poly_bid(yes_token_id)
@@ -760,5 +763,7 @@ class PolySniper:
             "no_token_id": self.state.no_token_id,
             "yes_asset_id": self.state.yes_asset_id,
             "no_asset_id": self.state.no_asset_id,
+            "poly_url": getattr(self.state, "poly_url", ""),
+            "selected_outcome": getattr(self.state, "selected_outcome", ""),
             "logs": self.state.logs[-20:],
         }
