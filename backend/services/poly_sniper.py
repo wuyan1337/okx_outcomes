@@ -332,8 +332,157 @@ class PolySniper:
 
     # ─── Execution ───
 
+    async def _execute_buy_immediate(self, side: str, asset_id: str, snapshot_asks: list,
+                                      prev_bid: float, current_bid: float) -> bool:
+        """Buy on OKX immediately using snapshot asks. Returns True if filled."""
+        self.state.status = "holding"
+        label = "YES" if side == "yes" else "NO"
+        jump_c = round((current_bid - prev_bid) * 100)
+        await self._notify(
+            f"\u26a1 {label} \u8df3\u4ef7: {prev_bid:.3f}\u2192{current_bid:.3f} (+{jump_c}\u00a2)"
+        )
+
+        # Take N levels from SNAPSHOT (pre-jump prices)
+        levels = snapshot_asks[:self.config.ask_levels]
+        max_price = float(levels[-1][0])
+        total_ask_size = sum(float(lvl[1]) for lvl in levels)
+
+        self.log(f"Executing immediate buy: ask levels={len(levels)}, max_price={max_price:.2f}")
+
+        # Calculate buy size
+        try:
+            bal_resp = await self.client.get_balance()
+            available = 0.0
+            if str(bal_resp.get("code", "")) == "0":
+                for entry in bal_resp.get("data", []):
+                    if entry.get("oddsType") == "points":
+                        available = float(entry.get("available", "0"))
+                        break
+
+            budget = available * (self.config.position_pct / 100.0)
+            max_units = int(budget / max_price)
+            buy_size = min(max_units, int(total_ask_size))
+
+            if buy_size < 1:
+                self.log(f"Insufficient balance or size too small: avail={available}, budget={budget}")
+                await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: \u4f59\u989d\u4e0d\u8db3")
+                self.state.status = "monitoring"
+                return False
+
+        except Exception as e:
+            self.log(f"Balance error: {e}")
+            await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: {e}")
+            self.state.status = "monitoring"
+            return False
+
+        # Place IOC buy order
+        price_str = f"{max_price:.2f}"
+        try:
+            resp = await self.client.place_order(
+                asset_id=asset_id,
+                side="buy",
+                price=price_str,
+                size=str(buy_size),
+                tif="ioc",
+            )
+            _buy_client_oid = resp.get("_clientOrderId", "") if isinstance(resp, dict) else ""
+            if str(resp.get("code", "")) != "0":
+                msg = resp.get("message", resp.get("msg", ""))
+                self.log(f"Buy order failed: {msg}")
+                await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: {msg}")
+                self.state.status = "monitoring"
+                return False
+
+        except Exception as e:
+            self.log(f"Buy order exception: {e}")
+            await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: {e}")
+            self.state.status = "monitoring"
+            return False
+
+        # Check fill - poll closed orders (IOC settles on-chain, may take 1-3s)
+        filled_size = 0.0
+        fill_price = max_price
+        for _attempt in range(4):
+            await asyncio.sleep(1)
+            try:
+                orders = await self.client.get_orders(status="closed")
+                if str(orders.get("code", "")) == "0":
+                    for o in orders.get("data", {}).get("list", []):
+                        if _buy_client_oid and o.get("clientOrderId") != _buy_client_oid:
+                            continue
+                        if (o.get("assetId") == asset_id and
+                            o.get("side", "").upper() == "BUY" and
+                            float(o.get("filledSize", "0") or "0") > 0):
+                            filled_size = float(o.get("filledSize", "0") or "0")
+                            filled_amt = float(o.get("filledAmount", "0") or "0")
+                            fill_price = filled_amt / filled_size if filled_amt > 0 else max_price
+                            break
+                if filled_size > 0:
+                    break
+            except Exception as e:
+                self.log(f"Fill check error: {e}")
+
+        if filled_size < 1:
+            self.log("IOC order got 0 fill \u2014 OKX already moved or no liquidity")
+            await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: \u65e0\u6df1\u5ea6")
+            self.state.status = "monitoring"
+            return False
+
+        # Buy success — store state for sell later
+        self.state.holding_side = side
+        self.state.buy_price = fill_price
+        self.state.buy_size = filled_size
+        self.state.hold_start = time.monotonic()
+        self.state.hold_start_epoch_ms = int(time.time() * 1000)
+
+        self.log(f"Bought {label} @{fill_price:.2f} x{filled_size:.0f}")
+        await self._notify(f"\u2705 \u5df2\u4e70\u5165 {label} @{fill_price:.2f} x{int(filled_size)}")
+        return True
+
+    async def _post_sell_at_price(self, poly_new_price: float):
+        """Post sell order at the settled Poly price."""
+        side = self.state.holding_side
+        label = "YES" if side == "yes" else "NO"
+        asset_id = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
+        fill_price = self.state.buy_price
+        filled_size = self.state.buy_size
+
+        # Price tick: 0.01 for 0.04-0.96, 0.001 outside that range
+        tick = 0.001 if (poly_new_price < 0.04 or poly_new_price > 0.96) else 0.01
+        decimals = 3 if tick == 0.001 else 2
+        sell_price_raw = round(poly_new_price, decimals)
+        if sell_price_raw <= fill_price:
+            sell_price_raw = round(fill_price + tick, decimals)
+
+        self.state.sell_target = sell_price_raw
+
+        sell_price_str = f"{sell_price_raw:.{decimals}f}"
+        sell_size_str = f"{filled_size:.10f}".rstrip("0").rstrip(".")
+        try:
+            sell_resp = await self.client.place_order(
+                asset_id=asset_id,
+                side="sell",
+                price=sell_price_str,
+                size=sell_size_str,
+                tif="gtc",
+            )
+            if str(sell_resp.get("code", "")) == "0":
+                self.state.sell_order_id = sell_resp.get("data", {}).get("oid", "") or sell_resp.get("data", {}).get("orderId", "")
+                self.log(f"Posted sell @{sell_price_str} x{sell_size_str}")
+                await self._notify(f"\ud83d\udce4 \u5df2\u6302 Sell {label} @{sell_price_str} x{int(filled_size)}")
+            else:
+                msg = sell_resp.get("message", sell_resp.get("msg", ""))
+                self.log(f"Sell post failed: {msg}")
+                await self._notify(f"\u26a0\ufe0f \u6302\u5356\u5931\u8d25: {msg}")
+        except Exception as e:
+            self.log(f"Sell order exception: {e}")
+            await self._notify(f"\u26a0\ufe0f \u6302\u5356\u5f02\u5e38: {e}")
+
+        # Start holding loop (timeout monitoring)
+        asyncio.create_task(self._holding_loop())
+
     async def _execute_buy(self, side: str, poly_new_price: float, initial_price: float = 0.0):
-        """Buy on OKX immediately."""
+        """Buy on OKX immediately. LEGACY — kept for compatibility but new flow uses _execute_buy_immediate + _post_sell_at_price."""
         self.state.status = "holding"
         asset_id = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
 
