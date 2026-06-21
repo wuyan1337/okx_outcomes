@@ -816,10 +816,14 @@ async function tgSniper(){
       if(!polySel||!polySel.value){al('ERROR','Select Poly outcome first');return;}
       // poly-sel value is the YES token, we need both YES and NO
       // The resolve should have stored both
-      var yesToken=_polyYesToken||'';
-      var noToken=_polyNoToken||'';
+      // Re-derive YES/NO tokens from dropdown (fresh, not stale vars)
+      var polySel=document.getElementById('poly-sel');
+      var polyOpts=polySel?polySel.options:[];
+      var yesToken='',noToken='';
+      if(polyOpts.length>=3){yesToken=polyOpts[1].value;noToken=polyOpts[2].value;}
+      if(!yesToken||!noToken){yesToken=_polyYesToken||'';noToken=_polyNoToken||'';}
       if(!yesToken||!noToken){al('ERROR','Poly tokens not resolved. Re-enter URL.');return;}
-      if(_polyResolvedToken&&yesToken!==_polyResolvedToken&&noToken!==_polyResolvedToken){al('ERROR','Token mismatch: orderbook shows different market. Re-enter Poly URL.');return;}
+      _polyYesToken=yesToken;_polyNoToken=noToken;
       var mkt=_mktMap[asset]||{};
       var payload={
         yes_token_id:yesToken,
