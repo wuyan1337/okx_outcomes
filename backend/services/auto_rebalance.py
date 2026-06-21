@@ -251,7 +251,44 @@ class AutoRebalance:
         except Exception as e:
             logger.warning(f"[Rebalance] capture_partial_fills error: {e}")
 
-    async def _wait_for_stable_price(self, poly_token_id: str) -> Optional[float]:
+    async def _reconcile_with_position(self, old_price_cents: int):
+        """After capture, check actual OKX position. If position > layers sum,
+        the difference is orphaned (sells were cancelled but position remains).
+        Add the gap at old_price_cents (best available cost estimate)."""
+        try:
+            params = self.get_strategy_params() if self.get_strategy_params else {}
+            asset_id = params.get('asset_id', '')
+            if not asset_id:
+                return
+
+            # Retry up to 3 times with delay to handle API lag after cancel
+            actual_pos = 0.0
+            for attempt in range(3):
+                if attempt > 0:
+                    await asyncio.sleep(1.0)
+                actual_pos = 0.0
+                resp = await self.client.get_positions(status='open')
+                if str(resp.get('code', '')) != '0':
+                    continue
+                raw = resp.get('data', {})
+                pos_list = raw.get('list', []) if isinstance(raw, dict) else raw if isinstance(raw, list) else []
+                for p in pos_list:
+                    if p.get('assetId', '') == asset_id or p.get('yesAssetId', '') == asset_id or p.get('noAssetId', '') == asset_id:
+                        actual_pos += float(p.get('size', p.get('pos', '0')) or '0')
+                if actual_pos > 0:
+                    break
+
+            layers_total = sum(self.cost_layers.values())
+            gap = actual_pos - layers_total
+            if gap > 0.5:
+                # Orphaned position not tracked in layers - add at old strategy price
+                self.add_to_layer(old_price_cents, gap)
+                logger.info(f"[Rebalance] Reconciled orphan position: +{gap:.0f} @ {old_price_cents}cent (actual={actual_pos:.0f}, layers={layers_total:.0f})")
+
+        except Exception as e:
+            logger.warning(f"[Rebalance] reconcile_with_position error: {e}")
+
+        async def _wait_for_stable_price(self, poly_token_id: str) -> Optional[float]:
         """Poll Poly every 5s. Need 12 consecutive readings at same price (within tolerance).
         Returns stable price as decimal, or None if not stabilized within max attempts."""
         import aiohttp
