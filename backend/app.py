@@ -370,20 +370,21 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         strategy = "manual"
     elif inst.strategy_s.running:
         strategy = "manual-s"
-    poly_running = False
-    poly_token = ''
-    poly_asset = ''
     return {
         "manual_running": inst.strategy_d.running,
         "manual_s_running": inst.strategy_s.running,
-            "sniper_running": inst.sniper.running,
-            "sniper_status": inst.sniper.state.status,
+        "sniper_running": inst.sniper.running,
+        "sniper_status": inst.sniper.state.status if inst.sniper.running else "stopped",
+        "sniper_yes_token": getattr(inst.sniper.state, "yes_token_id", ""),
+        "sniper_no_token": getattr(inst.sniper.state, "no_token_id", ""),
+        "sniper_yes_asset": getattr(inst.sniper.state, "yes_asset_id", ""),
+        "sniper_no_asset": getattr(inst.sniper.state, "no_asset_id", ""),
+        "sniper_poly_url": getattr(inst.sniper.state, "poly_url", "") if inst.sniper.running else "",
+        "sniper_selected_outcome": getattr(inst.sniper.state, "selected_outcome", "") if inst.sniper.running else "",
         "manual_s_price": getattr(inst.strategy_s.state, "price_a", None) if inst.strategy_s.running else None,
         "manual_s_side": getattr(inst.strategy_s.state, "side", None) if inst.strategy_s.running else None,
         "manual_s_asset_id": getattr(inst.strategy_s.state, "yes_asset_id", None) if inst.strategy_s.running else None,
-        "poly_running": poly_running,
-        "poly_url": poly_token,
-        "poly_asset_id": poly_asset,
+
         "strategy": strategy or "none",
         "running": inst.strategy_d.running or inst.strategy_s.running or inst.sniper.running,
         "cycles": inst.strategy_d.cycles + inst.strategy_s.cycles,
@@ -910,6 +911,8 @@ async def sniper_start(account_id: str, request: Request, user: str = Depends(ve
         position_pct=int(body.get("position_pct", 100)),
         timeout_secs=int(body.get("timeout_secs", 120)),
         settle_ms=int(body.get("settle_ms", 1000)),
+        poly_url=body.get("poly_url", ""),
+        selected_outcome=body.get("selected_outcome", ""),
     )
     return result
 
