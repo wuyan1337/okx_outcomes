@@ -397,6 +397,7 @@ class PolySniper:
                 size=str(buy_size),
                 tif="ioc",
             )
+            _buy_client_oid = resp.get("_clientOrderId", "") if isinstance(resp, dict) else ""
             if str(resp.get("code", "")) != "0":
                 msg = resp.get("message", resp.get("msg", ""))
                 self.log(f"Buy order failed: {msg}")
@@ -419,6 +420,9 @@ class PolySniper:
                 orders = await self.client.get_orders(status="closed")
                 if str(orders.get("code", "")) == "0":
                     for o in orders.get("data", {}).get("list", []):
+                        # Match by clientOrderId for precision (avoid picking up old orders)
+                        if _buy_client_oid and o.get("clientOrderId") != _buy_client_oid:
+                            continue
                         if (o.get("assetId") == asset_id and
                             o.get("side", "").upper() == "BUY" and
                             float(o.get("filledSize", "0") or "0") > 0):
