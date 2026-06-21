@@ -455,6 +455,7 @@ class PolySniper:
 
         self.state.sell_target = sell_price_raw
         self.state.hold_start = time.monotonic()
+        self.state.hold_start_epoch_ms = int(time.time() * 1000)
 
         self.log(f"Bought {label} @{fill_price:.2f} x{filled_size:.0f}")
         await self._notify(f"✅ 已买入 {label} @{fill_price:.2f} x{int(filled_size)}")
@@ -512,7 +513,7 @@ class PolySniper:
                                 return
                     else:
                         # No oid — scan SELL orders for this asset since hold_start
-                        hold_start_ms = int(self.state.hold_start * 1000)
+                        hold_start_ms = getattr(self.state, 'hold_start_epoch_ms', int(time.time() * 1000))
                         for status_filter in ("open", "closed"):
                             orders_resp = await self.client.get_orders(status=status_filter)
                             if str(orders_resp.get("code", "")) == "0":
