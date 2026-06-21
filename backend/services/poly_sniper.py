@@ -267,8 +267,8 @@ class PolySniper:
         # Check jump
         jump_cents = round((current_bid - prev_bid) * 100)
         if jump_cents >= self.config.threshold_cents:
-            self.log(f"JUMP detected: {side.upper()} {prev_bid:.3f} → {current_bid:.3f} (+{jump_cents}¢), snapshotting OKX...")
-            # IMMEDIATELY snapshot OKX orderbook before it catches up
+            self.log(f"JUMP detected: {side.upper()} {prev_bid:.3f} → {current_bid:.3f} (+{jump_cents}¢), buying immediately...")
+            # IMMEDIATELY snapshot OKX orderbook and BUY before it catches up
             okx_asset = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
             snapshot_asks = await self._snapshot_okx_asks(okx_asset)
             if not snapshot_asks:
@@ -280,41 +280,43 @@ class PolySniper:
                 self.log(f"OKX already caught up: ask={snapshot_best_ask:.2f} >= poly={current_bid:.3f}, skipping")
                 return
             self.log(f"OKX snapshot: best ask={snapshot_best_ask:.2f} (poly={current_bid:.3f}, spread={round((current_bid - snapshot_best_ask)*100)}¢)")
-            # Enter settling state with OKX snapshot locked in
+
+            # BUY FIRST — execute immediately at snapshot prices
+            bought = await self._execute_buy_immediate(side, okx_asset, snapshot_asks, prev_bid, current_bid)
+            if not bought:
+                return
+
+            # THEN settle — watch Poly for final stable price to determine sell target
             self.state.settling = True
             self.state.settle_side = side
             self.state.settle_price = current_bid
             self.state.settle_initial = prev_bid
             self.state.settle_last_update = time.monotonic()
-            self.state.okx_snapshot_price = snapshot_best_ask
-            self.state.okx_snapshot_asks = snapshot_asks
-            # Start settle timer task
-            asyncio.create_task(self._settle_wait())
+            # Start settle timer task (will post sell when done)
+            asyncio.create_task(self._settle_then_sell())
 
-    async def _settle_wait(self):
-        """Wait until price stabilizes (no update for settle_ms), then execute."""
+    async def _settle_then_sell(self):
+        """After buying, wait for Poly price to stabilize, then post sell at final price."""
         settle_sec = self.config.settle_ms / 1000.0
         while self._running and self.state.settling:
             elapsed = time.monotonic() - self.state.settle_last_update
             if elapsed >= settle_sec:
-                # Price stable — check if jump still valid
-                side = self.state.settle_side
+                # Price stable
                 final_price = self.state.settle_price
                 initial_price = self.state.settle_initial
-                total_jump = round((final_price - initial_price) * 100)
-                if total_jump < self.config.threshold_cents:
-                    # Price reverted — false signal
-                    self.log(f"Settle aborted: {side.upper()} reverted to {final_price:.3f} (+{total_jump}¢ < {self.config.threshold_cents}¢)")
-                    self.state.settling = False
-                    return
-                self.log(f"Settled: {side.upper()} {initial_price:.3f} → {final_price:.3f} (+{total_jump}¢)")
+                side = self.state.settle_side
                 self.state.settling = False
-                await self._execute_buy(side, final_price, initial_price=initial_price)
+                self.log(f"Settled: {side.upper()} final={final_price:.3f} (from {initial_price:.3f})")
+                # Post sell at settled price
+                await self._post_sell_at_price(final_price)
                 return
             # Check every 50ms
             await asyncio.sleep(0.05)
-        # If stopped during settling
-        self.state.settling = False
+        # If stopped during settling — still need to post sell at whatever we have
+        if self.state.buy_size > 0 and self.state.status == "holding":
+            self.state.settling = False
+            # Use current settle_price as best available
+            await self._post_sell_at_price(self.state.settle_price)
 
     async def _snapshot_okx_asks(self, asset_id: str) -> list:
         """Instantly grab OKX asks at trigger moment."""
