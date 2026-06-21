@@ -124,7 +124,6 @@ class AccountInstance:
             await self.strategy_d.stop()
         if self.strategy_s.running:
             await self.strategy_s.stop()
-        self._poly_running = False
         # Clear DB poly state so restart doesn't resurrect stopped strategies
         try:
             from ..core.database import set_global_config

@@ -1112,7 +1112,7 @@ async def proxy_latency_single(node_id: str, user: str = Depends(verify_auth)):
 @app.get("/api/poly/resolve")
 async def poly_resolve(url: str = "", user: str = Depends(verify_auth)):
     """Resolve a Polymarket URL/slug to token_ids."""
-    import aiohttp, re, ast
+    import aiohttp, re, json
     if not url:
         return {"ok": False, "error": "No URL provided"}
     
@@ -1177,9 +1177,9 @@ async def poly_resolve(url: str = "", user: str = Depends(verify_auth)):
                         all_tokens = []
                         for mkt in item["markets"]:
                             tokens_raw = mkt.get("clobTokenIds", "[]")
-                            tokens = ast.literal_eval(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
+                            tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
                             outcomes_raw = mkt.get("outcomes", "[]")
-                            outcomes = ast.literal_eval(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
                             q = mkt.get("question", "")
                             for i, tid in enumerate(tokens):
                                 outcome = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
@@ -1193,9 +1193,9 @@ async def poly_resolve(url: str = "", user: str = Depends(verify_auth)):
                     else:
                         # Single market
                         tokens_raw = item.get("clobTokenIds", "[]")
-                        tokens = ast.literal_eval(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
+                        tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
                         outcomes_raw = item.get("outcomes", "[]")
-                        outcomes = ast.literal_eval(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
                         result = []
                         for i, tid in enumerate(tokens):
                             outcome = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
@@ -1214,9 +1214,9 @@ async def poly_resolve(url: str = "", user: str = Depends(verify_auth)):
                     if data:
                         market = data[0]
                         tokens_raw = market.get("clobTokenIds", "[]")
-                        tokens = ast.literal_eval(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
+                        tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
                         outcomes_raw = market.get("outcomes", "[]")
-                        outcomes = ast.literal_eval(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
                         result = []
                         for i, tid in enumerate(tokens):
                             outcome = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
