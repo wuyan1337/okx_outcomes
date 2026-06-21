@@ -11,7 +11,7 @@ from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 
 from .core.database import (
     init_db, get_accounts, get_account, get_account_decrypted,
