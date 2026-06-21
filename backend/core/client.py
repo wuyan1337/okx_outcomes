@@ -239,25 +239,38 @@ class OKXOutcomesClient:
         return await self._post("/api/v5/predictions/positions/merge", body)
 
     async def heartbeat(self) -> dict:
-        nonce = self.signer.now_millis()
-        expires_after = nonce + 300000
+        """Send heartbeat with retry (3 attempts, 2s apart)."""
+        import asyncio as _asyncio
+        for attempt in range(3):
+            nonce = self.signer.now_millis()
+            expires_after = nonce + 300000
 
-        signature = self.signer.sign_cancel_all([], nonce, expires_after)
+            signature = self.signer.sign_cancel_all([], nonce, expires_after)
 
-        body = {
-            "action": {
-                "type": "cancelAll",
-                "assetIds": [],
-                "marketType": "prediction",
-            },
-            "nonce": nonce,
-            "expiresAfter": expires_after,
-            "signature": {"Ecdsa": signature},
-        }
-        result = await self._post("/api/v5/predictions/heartbeat", body)
-        if isinstance(result, dict) and str(result.get("code", "")) == "0":
-            from datetime import datetime, timezone
-            self.last_heartbeat = datetime.now(timezone.utc).isoformat()
+            body = {
+                "action": {
+                    "type": "cancelAll",
+                    "assetIds": [],
+                    "marketType": "prediction",
+                },
+                "nonce": nonce,
+                "expiresAfter": expires_after,
+                "signature": {"Ecdsa": signature},
+            }
+            try:
+                result = await self._post("/api/v5/predictions/heartbeat", body)
+                if isinstance(result, dict) and str(result.get("code", "")) == "0":
+                    from datetime import datetime, timezone
+                    self.last_heartbeat = datetime.now(timezone.utc).isoformat()
+                    return result
+                # Non-zero code, retry
+                if attempt < 2:
+                    await _asyncio.sleep(2)
+            except Exception:
+                if attempt < 2:
+                    await _asyncio.sleep(2)
+                else:
+                    raise
         return result
 
     # ─── Internal ───
