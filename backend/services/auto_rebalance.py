@@ -184,13 +184,15 @@ class AutoRebalance:
             # Step 4: Sync cost layers with actual positions
             # Guard: if we just captured partial fills, don't let sync wipe them
             # (OKX position API may lag behind cancel/fill events)
+            layers_snapshot = dict(self.cost_layers)  # preserve actual costs
             layers_before_sync = sum(self.cost_layers.values())
             await self._sync_positions()
             layers_after_sync = sum(self.cost_layers.values())
             if layers_before_sync > 0 and layers_after_sync <= 0:
-                logger.warning(f"[Rebalance:{self.account_id}] sync wiped {layers_before_sync:.0f} units - API lag, restoring")
-                # Restore: re-add what _capture_partial_fills found
-                self.add_to_layer(old_price_cents, layers_before_sync)
+                logger.warning(f"[Rebalance:{self.account_id}] sync wiped {layers_before_sync:.0f} units - API lag, restoring from snapshot")
+                # Restore from snapshot (preserves actual cost prices, not old_price_cents)
+                for price_c, qty in layers_snapshot.items():
+                    self.add_to_layer(price_c, qty)
 
             # Step 5: Post sells for existing layers
             new_sell_price_cents = new_price_cents + 1
