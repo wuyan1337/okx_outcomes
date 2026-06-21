@@ -2,7 +2,7 @@
 
 When monitor triggers (price DROP only), instead of just stopping:
 1. Cancel all orders + stop strategy
-2. Observe Poly for 60s (12 checks x 5s), wait for stable price
+2. Observe Poly for 60s (1 check x 5s), wait for stable price
 3. Determine new price (Poly best bid rounded to cent)
 4. Post sells for existing positions at max(cost_price, new_price+1)
 5. Restart strategy at new price with monitor
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 COST_LAYERS_FILE = "data/cost_layers_{account_id}.json"
 STABILIZE_INTERVAL = 5       # seconds between checks
-STABILIZE_COUNT = 12         # consecutive same-price checks needed
+STABILIZE_COUNT = 1         # consecutive same-price checks needed (1=5s)
 STABILIZE_TOLERANCE = 0.005  # price must be within this to count as "same"
 
 
@@ -156,12 +156,12 @@ class AutoRebalance:
             await self._capture_partial_fills(old_price_cents)
 
             # Step 1: Notify start
-            await self._notify(f"🔄 Auto-Rebalance 开始观察 (60s)\nTrigger: {trigger_reason}")
+            await self._notify(f"🔄 Auto-Rebalance 开始观察 (5s)\nTrigger: {trigger_reason}")
 
             # Step 2: Wait for stable price
             new_price_decimal = await self._wait_for_stable_price(poly_token_id)
             if new_price_decimal is None:
-                await self._notify("❌ Auto-Rebalance 失败: 60s内价格未稳定，需手动处理")
+                await self._notify("❌ Auto-Rebalance 失败: 观察期内价格未稳定，需手动处理")
                 self._rebalancing = False
                 return
 
