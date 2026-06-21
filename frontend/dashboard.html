@@ -577,6 +577,8 @@ var dot=document.getElementById('sn-dot'),st=document.getElementById('sn-state')
 if(!dot)return;
 // Prices
 if(d.last_yes_bid>0||d.last_no_bid>0){prices.style.display='';document.getElementById('sn-yes').textContent='YES '+d.last_yes_bid.toFixed(3);document.getElementById('sn-no').textContent='NO '+d.last_no_bid.toFixed(3);}else{prices.style.display='none';}
+// Restore config inputs from running sniper
+if(d.config){var _snt=document.getElementById('sn-thresh'),_snl=document.getElementById('sn-levels'),_snp=document.getElementById('sn-pct'),_snto=document.getElementById('sn-timeout'),_sns=document.getElementById('sn-settle');if(_snt&&document.activeElement!==_snt)_snt.value=d.config.threshold_cents;if(_snl&&document.activeElement!==_snl)_snl.value=d.config.ask_levels;if(_snp&&document.activeElement!==_snp)_snp.value=d.config.position_pct;if(_snto&&document.activeElement!==_snto)_snto.value=d.config.timeout_secs;if(_sns&&document.activeElement!==_sns)_sns.value=d.config.settle_ms;}
 // State
 if(d.status==='monitoring'){dot.className='sn-dot monitoring';st.textContent='Monitoring';det.textContent='';timer.style.display='none';}
 else if(d.status==='settling'&&d.settling){dot.className='sn-dot settling';st.textContent='Settling';det.textContent=d.settling.side.toUpperCase()+' '+d.settling.initial.toFixed(3)+'→'+d.settling.current.toFixed(3);timer.style.display='none';}
