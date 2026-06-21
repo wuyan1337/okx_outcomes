@@ -343,6 +343,8 @@ class ManualStrategyD:
                     continue
                 if side != "BUY":
                     continue
+                if asset_id not in (self.state.yes_asset_id, self.state.no_asset_id):
+                    continue
 
                 filled = float(filled_size)
                 if filled < 0.01:

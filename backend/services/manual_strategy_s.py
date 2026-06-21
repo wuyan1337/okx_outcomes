@@ -264,6 +264,8 @@ class ManualStrategyS:
                     continue
                 if side != "BUY":
                     continue
+                if o.get("assetId", "") != self.state.asset_id:
+                    continue
 
                 filled = float(filled_size)
                 if filled < 0.01:
