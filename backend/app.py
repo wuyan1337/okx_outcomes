@@ -117,6 +117,11 @@ async def serve_dashboard():
     return HTMLResponse(content=(frontend_dir / "dashboard.html").read_text(), status_code=200)
 
 
+@app.get("/sniper-help", response_class=HTMLResponse)
+async def sniper_help():
+    return HTMLResponse(content=(frontend_dir / "sniper-help.html").read_text(), status_code=200)
+
+
 # ─── Global APIs ───
 
 
