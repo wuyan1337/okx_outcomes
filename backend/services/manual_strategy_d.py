@@ -258,7 +258,7 @@ class ManualStrategyD:
             await self._deploy_balance()
 
             while self.state.running:
-                await asyncio.sleep(10)
+                await asyncio.sleep(60)
                 if not self.state.running:
                     break
 
