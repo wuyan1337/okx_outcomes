@@ -94,8 +94,8 @@ class PolySniper:
                     yes_asset_id: str, no_asset_id: str, market_id: str,
                     threshold_cents: int = 40, ask_levels: int = 1,
                     position_pct: int = 100, timeout_secs: int = 120,
-                    settle_ms: int = 1000, poly_url: str = "",
-                    selected_outcome: str = ""):
+                    settle_ms: int = 1000, window_ms: int = 500,
+                    poly_url: str = "", selected_outcome: str = ""):
         """Start sniper monitoring."""
         if self._running:
             return {"ok": False, "error": "Already running"}
@@ -105,7 +105,9 @@ class PolySniper:
         self.config.position_pct = position_pct
         self.config.timeout_secs = timeout_secs
         self.config.settle_ms = settle_ms
+        self.config.window_ms = window_ms
 
+        self._price_window = {"yes": [], "no": []}
         self.state = SniperState(
             status="monitoring",
             yes_token_id=yes_token_id,
@@ -144,7 +146,7 @@ class PolySniper:
 
         self._running = True
         self._task = asyncio.create_task(self._monitor_loop())
-        self.log(f"Started: threshold={threshold_cents}¢, levels={ask_levels}, pct={position_pct}%, settle={settle_ms}ms")
+        self.log(f"Started: threshold={threshold_cents}¢, levels={ask_levels}, pct={position_pct}%, settle={settle_ms}ms, window={window_ms}ms")
         return {"ok": True}
 
     async def stop(self):
