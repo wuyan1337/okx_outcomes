@@ -451,9 +451,6 @@ class PolySniper:
         tick = 0.001 if (poly_new_price < 0.04 or poly_new_price > 0.96) else 0.01
         decimals = 3 if tick == 0.001 else 2
         sell_price_raw = round(poly_new_price, decimals)
-        if sell_price_raw <= fill_price:
-            sell_price_raw = round(fill_price + tick, decimals)
-
         self.state.sell_target = sell_price_raw
 
         sell_price_str = f"{sell_price_raw:.{decimals}f}"
