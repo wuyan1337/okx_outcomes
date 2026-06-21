@@ -618,6 +618,95 @@ async def account_cancel_order(account_id: str, request: Request, user: str = De
         return {"ok": False, "error": str(e)}
 
 
+
+
+# ─── Manual Trading ───
+
+@app.get("/api/accounts/{account_id}/trades")
+async def account_trades(account_id: str, limit: int = 50, asset_id: str = None, user: str = Depends(verify_auth)):
+    inst = manager.get_instance(account_id)
+    if not inst:
+        raise HTTPException(404, "Account not found")
+    try:
+        data = await inst.client.get_orders(status="closed")
+        trades = []
+        if isinstance(data, dict) and str(data.get("code", "")) == "0":
+            for o in data.get("data", {}).get("list", []):
+                aid = o.get("assetId", "")
+                if asset_id and aid != asset_id:
+                    continue
+                token = "Yes" if aid.endswith("000") else "No"
+                trades.append({
+                    "order_id": o.get("oid", o.get("id", "")),
+                    "side": o.get("side", ""),
+                    "price": o.get("price", ""),
+                    "size": o.get("size", ""),
+                    "asset_id": aid,
+                    "token": token,
+                    "filled_at": o.get("updatedAt", o.get("createdAt", "")),
+                    "market_id": o.get("marketId", ""),
+                })
+        trades.sort(key=lambda x: x["filled_at"], reverse=True)
+        return {"trades": trades[:limit]}
+    except Exception as e:
+        return {"trades": [], "error": str(e)}
+
+
+@app.post("/api/accounts/{account_id}/manual/place")
+async def account_manual_place(account_id: str, request: Request, user: str = Depends(verify_auth)):
+    inst = manager.get_instance(account_id)
+    if not inst:
+        raise HTTPException(404, "Account not found")
+    body = await request.json()
+    asset_id = body.get("asset_id", "")
+    side = body.get("side", "").upper()
+    price = body.get("price", "")
+    size = body.get("size", "")
+    tif = body.get("tif", "gtc").lower()
+    if not asset_id or side not in ("BUY", "SELL") or not price or not size:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "asset_id, side, price, size required"})
+    if tif not in ("gtc", "ioc"):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "tif must be gtc or ioc"})
+    try:
+        result = await inst.client.place_order(
+            asset_id=asset_id,
+            side=side,
+            price=str(price),
+            size=str(size),
+            tif=tif,
+        )
+        if isinstance(result, dict) and str(result.get("code", "")) == "0":
+            return {"ok": True, "result": result}
+        return {"ok": False, "error": result.get("msg", str(result))}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/accounts/{account_id}/ticker")
+async def account_ticker(account_id: str, asset_id: str, user: str = Depends(verify_auth)):
+    inst = manager.get_instance(account_id)
+    if not inst:
+        raise HTTPException(404, "Account not found")
+    if not asset_id:
+        return JSONResponse(status_code=400, content={"error": "asset_id required"})
+    try:
+        data = await inst.client.get_orderbook(asset_id, depth=1)
+        best_ask = None
+        best_bid = None
+        if isinstance(data, dict) and "data" in data:
+            book = data["data"]
+            if isinstance(book, list) and len(book) > 0:
+                asks = book[0].get("asks", [])
+                bids = book[0].get("bids", [])
+                if asks:
+                    best_ask = asks[0][0]
+                if bids:
+                    best_bid = bids[0][0]
+        return {"best_ask": best_ask, "best_bid": best_bid}
+    except Exception as e:
+        return {"best_ask": None, "best_bid": None, "error": str(e)}
+
+
 # ─── Account Settings (risk control) ───
 
 # (removed dead config routes — see per-account v2 routes below)
