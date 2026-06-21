@@ -278,7 +278,7 @@ class OKXOutcomesClient:
     async def _get(self, path: str, params: dict = None) -> dict:
         query = ""
         if params:
-            query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
+            from urllib.parse import urlencode as _urlencode; query = "?" + _urlencode(params)
         full_path = path + query
         headers = self.auth.headers("GET", full_path)
 
