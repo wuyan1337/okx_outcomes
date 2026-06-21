@@ -408,7 +408,7 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
         return JSONResponse(status_code=400, content={"ok": False, "error": "Missing params"})
 
     if not no_asset_id:
-        no_asset_id = str(int(yes_asset_id) + 100)
+        return JSONResponse(status_code=400, content={"ok": False, "error": "no_asset_id is required"})
 
     price_f = float(price)
     # OKX uses cents (e.g. 33 for 0.33)
