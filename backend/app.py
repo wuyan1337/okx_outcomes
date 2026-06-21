@@ -1300,8 +1300,9 @@ async def poly_resolve(url: str = "", user: str = Depends(verify_auth)):
                             "tokens": result
                         }
             
-            # Nothing found - try slug_contains as last resort
-            api_url = f"https://gamma-api.polymarket.com/markets?slug_contains={slug}&closed=false&limit=3"
+            # Nothing found - try text search with exact question match as last resort
+            # slug_contains is too loose (returns random markets), use text_search instead
+            api_url = f"https://gamma-api.polymarket.com/markets?slug={slug}&active=true&limit=1"
             async with sess.get(api_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
