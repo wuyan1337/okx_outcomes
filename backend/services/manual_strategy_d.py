@@ -312,12 +312,12 @@ class ManualStrategyD:
         condition where changing price mid-loop would cause sells at wrong prices.
         """
         try:
-            # Get filled orders
-            resp = await self.client.get_orders(status="closed")
-            if str(resp.get("code", "")) != "0":
-                return
-
-            order_list = resp.get("data", {}).get("list", [])
+            # Use passed order_list if available, otherwise fetch
+            if order_list is None:
+                resp = await self.client.get_orders(status="closed")
+                if str(resp.get("code", "")) != "0":
+                    return
+                order_list = resp.get("data", {}).get("list", [])
             changed = False
 
             for o in order_list:
