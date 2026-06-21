@@ -151,7 +151,11 @@ class OKXOutcomesClient:
             "nonce": nonce,
             "signature": {"Ecdsa": signature},
         }
-        return await self._post("/api/v5/predictions/orders", body)
+        result = await self._post("/api/v5/predictions/orders", body)
+        # Attach clientOrderId to response for caller tracking
+        if isinstance(result, dict):
+            result["_clientOrderId"] = client_order_id
+        return result
 
     async def cancel_order(self, asset_id: str, order_id: str = None,
                            client_order_id: str = None) -> dict:
