@@ -38,8 +38,8 @@ class OKXAuth:
         return base64.b64encode(mac.digest()).decode("utf-8")
 
     def headers(self, method: str, path: str, body: str = "") -> dict:
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
-             f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+        _now = datetime.now(timezone.utc)
+        ts = _now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{_now.microsecond // 1000:03d}Z"
         sign = self._sign(ts, method, path, body)
         return {
             "OK-ACCESS-KEY": self.api_key,
