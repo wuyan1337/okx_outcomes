@@ -46,7 +46,7 @@ class SniperState:
     settle_side: str = ""           # which side triggered
     settle_price: float = 0.0       # latest price during settle
     settle_initial: float = 0.0     # price before the jump
-    settle_last_update: float = 0.0 # time.time() of last price change
+    settle_last_update: float = 0.0 # time.monotonic() of last price change
     # OKX snapshot at trigger time (before market catches up)
     okx_snapshot_price: float = 0.0 # OKX best ask at moment of trigger
     okx_snapshot_asks: list = field(default_factory=list)  # Full ask levels snapshot
@@ -228,7 +228,7 @@ class PolySniper:
         if self.state.settling and side == self.state.settle_side:
             if current_bid != self.state.settle_price:
                 self.state.settle_price = current_bid
-                self.state.settle_last_update = time.time()
+                self.state.settle_last_update = time.monotonic()
                 self.log(f"Settle update: {side.upper()} now {current_bid:.3f}")
             return
 
@@ -265,7 +265,7 @@ class PolySniper:
             self.state.settle_side = side
             self.state.settle_price = current_bid
             self.state.settle_initial = prev_bid
-            self.state.settle_last_update = time.time()
+            self.state.settle_last_update = time.monotonic()
             self.state.okx_snapshot_price = snapshot_best_ask
             self.state.okx_snapshot_asks = snapshot_asks
             # Start settle timer task
@@ -275,7 +275,7 @@ class PolySniper:
         """Wait until price stabilizes (no update for settle_ms), then execute."""
         settle_sec = self.config.settle_ms / 1000.0
         while self._running and self.state.settling:
-            elapsed = time.time() - self.state.settle_last_update
+            elapsed = time.monotonic() - self.state.settle_last_update
             if elapsed >= settle_sec:
                 # Price stable — check if jump still valid
                 side = self.state.settle_side
@@ -454,7 +454,7 @@ class PolySniper:
             sell_price_raw = round(fill_price + tick, decimals)
 
         self.state.sell_target = sell_price_raw
-        self.state.hold_start = time.time()
+        self.state.hold_start = time.monotonic()
 
         self.log(f"Bought {label} @{fill_price:.2f} x{filled_size:.0f}")
         await self._notify(f"✅ 已买入 {label} @{fill_price:.2f} x{int(filled_size)}")
@@ -538,7 +538,7 @@ class PolySniper:
                     self.log(f"Sell check error: {e}")
 
                 # Check timeout
-                elapsed = time.time() - self.state.hold_start
+                elapsed = time.monotonic() - self.state.hold_start
                 if elapsed >= self.config.timeout_secs:
                     await self._handle_timeout(asset_id, label)
                     return
@@ -720,7 +720,7 @@ class PolySniper:
                 "side": self.state.settle_side,
                 "initial": self.state.settle_initial,
                 "current": self.state.settle_price,
-                "elapsed_ms": int((time.time() - self.state.settle_last_update) * 1000) if self.state.settle_last_update else 0,
+                "elapsed_ms": int((time.monotonic() - self.state.settle_last_update) * 1000) if self.state.settle_last_update else 0,
             } if self.state.settling else None,
             "config": {
                 "threshold_cents": self.config.threshold_cents,
@@ -734,7 +734,7 @@ class PolySniper:
                 "buy_price": self.state.buy_price,
                 "buy_size": self.state.buy_size,
                 "sell_target": self.state.sell_target,
-                "elapsed": int(time.time() - self.state.hold_start) if self.state.hold_start else 0,
+                "elapsed": int(time.monotonic() - self.state.hold_start) if self.state.hold_start else 0,
             } if self.state.status == "holding" else None,
             "last_yes_bid": self.state.last_yes_bid,
             "last_no_bid": self.state.last_no_bid,
