@@ -64,7 +64,7 @@ async def poly_ws_relay(ws_out: WebSocket, token_id: str, stop_event: asyncio.Ev
                         pass
 
                     # Subscribe to WS for real-time updates
-                    sub_msg = json.dumps({"type": "market", "assets_id": token_id})
+                    sub_msg = json.dumps({"type": "market", "assets_ids": [token_id]})
                     await ws.send_str(sub_msg)
                     logger.info(f"Poly WS subscribed: {token_id[:20]}...")
                     retry_delay = 1
