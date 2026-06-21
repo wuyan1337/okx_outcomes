@@ -307,6 +307,13 @@ class PolySniper:
                 side = self.state.settle_side
                 self.state.settling = False
                 self.log(f"Settled: {side.upper()} final={final_price:.3f} (from {initial_price:.3f})")
+                # If price reverted below buy cost, stop immediately
+                if final_price <= self.state.buy_price:
+                    self.log(f"Settled price {final_price:.3f} <= buy cost {self.state.buy_price:.2f}, stopping")
+                    await self._notify(f"🚨 settle价 {final_price:.3f} ≤ 成本 {self.state.buy_price:.2f}, 已停止")
+                    self._running = False
+                    self.state.status = "stopped"
+                    return
                 # Post sell at settled price
                 await self._post_sell_at_price(final_price)
                 return
