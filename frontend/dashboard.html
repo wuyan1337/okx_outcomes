@@ -261,7 +261,7 @@ select.cinput option{background:var(--bg);color:#fff;}
 <div class="sdrop" id="sdrop-smkt"><button type="button" class="sdrop-btn" id="smkt-btn">-- Select market --</button><div class="sdrop-panel"><div class="sdrop-search"><input type="text" id="smkt-q" placeholder="Search markets..." autocomplete="off"></div><div class="sdrop-list" id="smkt-list"></div></div></div>
 <input type="hidden" id="smkt">
 </div>
-<div class="fg"><label>Side</label><select id="ms-side"><option value="YES">YES</option><option value="NO">NO</option></select></div>
+<div class="fg"><label>Side</label><select id="ms-side" onchange="msSideChange()"><option value="YES">YES</option><option value="NO">NO</option></select></div>
 <div class="fg"><label>Price</label><input type="number" id="ms-price" autocomplete="off" step="1" min="4" max="96" placeholder="e.g. 45"></div>
 <div class="status-line" id="mss" style="color:var(--muted)">Idle</div>
 <div class="monitor-section" id="ms-mon-sec">
