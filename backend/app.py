@@ -757,14 +757,16 @@ async def account_manual_place(account_id: str, request: Request, user: str = De
 
 
 @app.get("/api/accounts/{account_id}/ticker")
-async def account_ticker(account_id: str, asset_id: str, user: str = Depends(verify_auth)):
+async def account_ticker(account_id: str, asset_id: str, yes_asset_id: str = "", user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
     if not asset_id:
         return JSONResponse(status_code=400, content={"error": "asset_id required"})
     try:
-        data = await inst.client.get_orderbook(asset_id, depth=1)
+        # For NO positions: query YES asset book and invert (OKX only has YES orderbook)
+        query_asset = yes_asset_id if yes_asset_id else asset_id
+        data = await inst.client.get_orderbook(query_asset, depth=1)
         best_ask = None
         best_bid = None
         if isinstance(data, dict) and "data" in data:
@@ -776,6 +778,11 @@ async def account_ticker(account_id: str, asset_id: str, user: str = Depends(ver
                     best_ask = asks[0][0]
                 if bids:
                     best_bid = bids[0][0]
+        # If querying YES book for a NO position, invert prices
+        if yes_asset_id and yes_asset_id != asset_id:
+            inv_bid = "{:.2f}".format(1 - float(best_ask)) if best_ask else None
+            inv_ask = "{:.2f}".format(1 - float(best_bid)) if best_bid else None
+            best_bid, best_ask = inv_bid, inv_ask
         return {"best_ask": best_ask, "best_bid": best_bid}
     except Exception as e:
         return {"best_ask": None, "best_bid": None, "error": str(e)}
