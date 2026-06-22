@@ -604,11 +604,13 @@ function clearOb(){document.getElementById('ob-id').textContent='--';document.ge
 function clearPolyOb(){document.getElementById('pob-status').textContent='--';document.getElementById('pob-b').innerHTML='<div class="obr" style="color:var(--muted)">--</div>';document.getElementById('pob-a').innerHTML='<div class="obr" style="color:var(--muted)">--</div>';}
 
 function renderOkxOb(){
-  /* Render whenever we have an active OKX subscription */
   if(!_okxAsset)return;
-  document.getElementById('ob-id').textContent='Live orderbook';
-  document.getElementById('ob-b').innerHTML=_cachedOkxBids.length?_cachedOkxBids.map(function(b){return '<div class="obr"><span class="obp">'+b[0]+'</span><span class="obs">'+b[1]+'</span></div>';}).join(''):'<div style="color:var(--muted)">Empty</div>';
-  document.getElementById('ob-a').innerHTML=_cachedOkxAsks.length?_cachedOkxAsks.map(function(b){return '<div class="obr"><span class="obp">'+b[0]+'</span><span class="obs">'+b[1]+'</span></div>';}).join(''):'<div style="color:var(--muted)">Empty</div>';
+  var label=_obNoSide?"Live orderbook (NO)":"Live orderbook";
+  document.getElementById("ob-id").textContent=label;
+  var bids=_cachedOkxBids,asks=_cachedOkxAsks;
+  if(_obNoSide){bids=_cachedOkxAsks.map(function(a){return[(1-parseFloat(a[0])).toFixed(2),a[1]];});asks=_cachedOkxBids.map(function(b){return[(1-parseFloat(b[0])).toFixed(2),b[1]];});}
+  document.getElementById("ob-b").innerHTML=bids.length?bids.map(function(b){return '<div class="obr"><span class="obp">'+b[0]+'</span><span class="obs">'+b[1]+'</span></div>';}).join(""):'<div style="color:var(--muted)">Empty</div>';
+  document.getElementById("ob-a").innerHTML=asks.length?asks.map(function(b){return '<div class="obr"><span class="obp">'+b[0]+'</span><span class="obs">'+b[1]+'</span></div>';}).join(""):'<div style="color:var(--muted)">Empty</div>';
 }
 function renderPolyOb(){
   /* Render whenever we have an active Poly subscription */
