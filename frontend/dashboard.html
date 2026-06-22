@@ -381,7 +381,7 @@ select.cinput option{background:var(--bg);color:#fff;}
 <table><thead><tr><th>Side</th><th>Price</th><th>Size</th><th>Age</th><th></th></tr></thead>
 <tbody id="otb"><tr><td colspan="5" style="color:var(--muted)">No active orders</td></tr></tbody></table>
 </div>
-<button class="btn-cx" onclick="cxAll()">Cancel All Orders</button>
+<div style="display:flex;gap:6px"><button class="btn-cx" onclick="cxAll()" style="flex:1">Cancel All</button><button class="btn-cx" onclick="flashClose()" style="flex:1;background:var(--red);border-color:var(--red)">&#9889; Flash</button></div>
 </div>
 <div class="panel" style="flex:1">
 <div class="ph"><span class="pt">Log</span><span style="font-size:11px;color:var(--muted);cursor:pointer" onclick="logs=[];rl()">Clear</span></div>
@@ -533,6 +533,7 @@ async function tgMS(){var btn=document.getElementById('msb');if(btn.disabled)ret
 
 // Cancel
 async function cxAll(){if(!confirm('Cancel all orders? This will also stop any running strategy.'))return;if(MR||MSR||PR){await api('/api/strategy/stop',{method:'POST'});}var r=await api('/api/cancel_all',{method:'POST'});var d=await r.json();if(d.ok){al('CANCEL','All cancelled'+(MR||MSR||PR?' + strategy stopped':''));MR=false;MSR=false;PR=false;setTimeout(poll,1500);}else{al('ERROR','Cancel failed: '+(d.error||JSON.stringify(d)));}}
+async function flashClose(){var r=await api('/api/accounts/'+currentAcctId+'/flash_close',{method:'POST'});var d=await r.json();if(d.ok){al('FLASH','Closed: '+d.result.cancelled+' orders cancelled, '+d.result.sold+' positions sold');MR=false;MSR=false;PR=false;setTimeout(poll,1500);}else{al('ERROR','Flash failed: '+(d.error||JSON.stringify(d)));}}
 async function cx(id,aid){var r=await api('/api/cancel_order',{method:'POST',body:JSON.stringify({order_id:id,asset_id:aid})});var d=await r.json();if(d.ok){al('CANCEL','Cancelled '+id);setTimeout(poll,1500);}else{al('ERROR','Cancel failed: '+(d.error||JSON.stringify(d)));}}
 
 // ═══ Manual Trading Tab ═══
