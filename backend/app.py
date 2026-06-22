@@ -4,7 +4,7 @@ import json
 import asyncio
 import yaml
 import secrets
-import logging
+import logging; import sys
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -519,10 +519,10 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
                 inst.poly_monitor.set_strategy_context(strategy_type, int(price_f), yes_asset_id)
             else:
                 # Strategy started but monitor failed - log warning, don't fail the whole thing
-                import logging
+                import logging; import sys
                 logging.getLogger(__name__).warning(f"Monitor start failed: {result}")
         except Exception as e:
-            import logging
+            import logging; import sys
             logging.getLogger(__name__).warning(f"Monitor start error: {e}")
 
     return {"ok": True}
@@ -744,8 +744,8 @@ async def account_manual_place(account_id: str, request: Request, user: str = De
     except (ValueError, TypeError):
         return JSONResponse(status_code=400, content={"ok": False, "error": f"Invalid price: {price}"})
     size_str = str(int(float(size)))
-    import logging
-    logging.info(f"[MANUAL PLACE] asset_id={asset_id} side={side.lower()} price={price_str} size={size_str} tif={tif}")
+    import logging; import sys
+    print(f"[MANUAL PLACE] asset_id={asset_id} side={side.lower()} price={price_str} size={size_str} tif={tif}")
     try:
         result = await inst.client.place_order(
             asset_id=asset_id,
@@ -756,7 +756,7 @@ async def account_manual_place(account_id: str, request: Request, user: str = De
         )
         if isinstance(result, dict) and str(result.get("code", "")) == "0":
             return {"ok": True, "result": result}
-        logging.warning(f"[MANUAL PLACE] OKX error: {result}")
+        print(f"[MANUAL PLACE] OKX error: {result}")
         return {"ok": False, "error": result.get("message", result.get("msg", str(result)))}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -898,7 +898,7 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
             if r and r.get("ok"):
                 inst.poly_monitor.set_strategy_context("manual-d", int(price), asset_id)
         except Exception as e:
-            import logging
+            import logging; import sys
             logging.getLogger(__name__).warning(f"Monitor start error: {e}")
 
     return {"ok": True}
@@ -1126,7 +1126,7 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
             if r and r.get("ok"):
                 inst.poly_monitor.set_strategy_context("manual-s", int(price), asset_id)
         except Exception as e:
-            import logging
+            import logging; import sys
             logging.getLogger(__name__).warning(f"Monitor start error: {e}")
 
     return {"ok": True}
