@@ -629,6 +629,9 @@ async def account_cancel_order(account_id: str, request: Request, user: str = De
 
 # ─── Manual Trading ───
 
+# Market name cache: market_id -> question
+_market_name_cache: dict = {}
+
 @app.get("/api/accounts/{account_id}/trades")
 async def account_trades(account_id: str, limit: int = 50, asset_id: str = None, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
@@ -637,12 +640,14 @@ async def account_trades(account_id: str, limit: int = 50, asset_id: str = None,
     try:
         data = await inst.client.get_orders(status="closed")
         trades = []
+        missing_mids = set()
         if isinstance(data, dict) and str(data.get("code", "")) == "0":
             for o in data.get("data", {}).get("list", []):
                 aid = o.get("assetId", "")
                 if asset_id and aid != asset_id:
                     continue
                 token = "Yes" if aid.endswith("000") else "No"
+                mid = o.get("marketId", "")
                 trades.append({
                     "order_id": o.get("oid", o.get("id", "")),
                     "side": o.get("side", ""),
@@ -651,8 +656,30 @@ async def account_trades(account_id: str, limit: int = 50, asset_id: str = None,
                     "asset_id": aid,
                     "token": token,
                     "filled_at": o.get("updatedAt", o.get("createdAt", "")),
-                    "market_id": o.get("marketId", ""),
+                    "market_id": mid,
+                    "market_name": _market_name_cache.get(mid, ""),
                 })
+                if mid and mid not in _market_name_cache:
+                    missing_mids.add(mid)
+        # Populate cache from events if needed
+        if missing_mids:
+            try:
+                for st in ("active", "settled"):
+                    events = await inst.client.get_events(status=st, page_size=50)
+                    if isinstance(events, dict):
+                        for ev in events.get("data", {}).get("events", []):
+                            for mkt in ev.get("markets", []):
+                                _mid = mkt.get("marketId", "")
+                                if _mid:
+                                    q = mkt.get("question", "") or ev.get("eventTitle", "")
+                                    _market_name_cache[_mid] = q.replace("Will ", "").rstrip("?")
+                    if not (missing_mids - set(_market_name_cache.keys())):
+                        break
+            except Exception:
+                pass
+            for t in trades:
+                if not t["market_name"] and t["market_id"] in _market_name_cache:
+                    t["market_name"] = _market_name_cache[t["market_id"]]
         trades.sort(key=lambda x: x["filled_at"], reverse=True)
         return {"trades": trades[:limit]}
     except Exception as e:
