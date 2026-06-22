@@ -743,16 +743,20 @@ async def account_manual_place(account_id: str, request: Request, user: str = De
         price_str = f"{price_f:.2f}" if 4 <= cents <= 96 else f"{price_f:.3f}"
     except (ValueError, TypeError):
         return JSONResponse(status_code=400, content={"ok": False, "error": f"Invalid price: {price}"})
+    size_str = str(int(float(size)))
+    import logging
+    logging.info(f"[MANUAL PLACE] asset_id={asset_id} side={side.lower()} price={price_str} size={size_str} tif={tif}")
     try:
         result = await inst.client.place_order(
             asset_id=asset_id,
             side=side.lower(),
             price=price_str,
-            size=str(int(float(size))),
+            size=size_str,
             tif=tif,
         )
         if isinstance(result, dict) and str(result.get("code", "")) == "0":
             return {"ok": True, "result": result}
+        logging.warning(f"[MANUAL PLACE] OKX error: {result}")
         return {"ok": False, "error": result.get("msg", str(result))}
     except Exception as e:
         return {"ok": False, "error": str(e)}
