@@ -397,6 +397,7 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         "manual_s_side": getattr(inst.strategy_s.state, "side", None) if inst.strategy_s.running else None,
         "manual_s_asset_id": getattr(inst.strategy_s.state, "asset_id", None) if inst.strategy_s.running else None,
         "manual_s_yes_asset_id": getattr(inst.strategy_s.state, "yes_asset_id", None) if inst.strategy_s.running else None,
+        "manual_s_position_pct": getattr(inst.strategy_s.state, "position_pct", 100) if inst.strategy_s.running else 100,
 
         "strategy": strategy or "none",
         "running": inst.strategy_d.running or inst.strategy_s.running or inst.sniper.running,
@@ -493,7 +494,7 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
                 yes_asset_id=yes_asset_id,
                 no_asset_id=no_asset_id,
                 price_a=price_f,
-            )
+            , position_pct=int(body.get("position_pct", 100)))
         elif strategy_type == "manual-s":
             await inst.strategy_s.start(
                 market_id=market_id,
@@ -1195,7 +1196,7 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly book check: {e}"})
 
     try:
-        await inst.strategy_s.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price), side=side)
+        await inst.strategy_s.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price), side=side, position_pct=int(body.get("position_pct", 100)))
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
