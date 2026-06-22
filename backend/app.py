@@ -757,7 +757,7 @@ async def account_manual_place(account_id: str, request: Request, user: str = De
         if isinstance(result, dict) and str(result.get("code", "")) == "0":
             return {"ok": True, "result": result}
         logging.warning(f"[MANUAL PLACE] OKX error: {result}")
-        return {"ok": False, "error": result.get("msg", str(result))}
+        return {"ok": False, "error": result.get("message", result.get("msg", str(result)))}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
