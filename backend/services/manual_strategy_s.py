@@ -445,10 +445,30 @@ class ManualStrategyS:
 
             balance = await self.client.get_balance()
             available = self._parse_available(balance)
-            available = available * self.state.position_pct / 100.0
+
+            # Calculate how much is already locked in open BUY orders
+            locked_in_buys = 0.0
+            try:
+                resp_open = await self.client.get_orders(status="open")
+                if str(resp_open.get("code", "")) == "0":
+                    for o in resp_open.get("data", {}).get("list", []):
+                        if o.get("side", "").upper() == "BUY" and o.get("assetId", "") == self.state.asset_id:
+                            sz = float(o.get("size", "0") or "0") - float(o.get("filledSize", "0") or "0")
+                            px = float(o.get("price", "0") or "0")
+                            locked_in_buys += sz * px
+            except Exception:
+                pass
+
+            # total_capital = available + locked; max to deploy = total * pct%
+            total_capital = available + locked_in_buys
+            max_deploy = total_capital * self.state.position_pct / 100.0
+            # How much more we can deploy = max - already deployed
+            remaining_budget = max_deploy - locked_in_buys
+            if remaining_budget <= 0:
+                return
 
             cost_per_unit = self.state.price_a / 100.0
-            units = int(available / cost_per_unit)
+            units = int(remaining_budget / cost_per_unit)
 
             if units < 1:
                 return
