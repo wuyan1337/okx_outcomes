@@ -302,15 +302,20 @@ async def account_positions(account_id: str, user: str = Depends(verify_auth)):
     if not inst:
         raise HTTPException(404, "Account not found")
     try:
+        await _ensure_market_cache(inst)
         data = await inst.client.get_positions(status="open")
         positions = []
         if isinstance(data, dict) and str(data.get("code", "")) == "0":
             for p in data.get("data", {}).get("list", []):
+                mid = p.get("marketId", "")
+                aid = p.get("yesAssetId", "") or p.get("assetId", "")
                 positions.append({
-                    "market_id": p.get("marketId", ""),
+                    "market_id": mid,
+                    "asset_id": aid,
                     "token_name": p.get("tokenName", ""),
                     "size": p.get("size", "0"),
                     "avg_price": p.get("avgPrice", "0"),
+                    "market_name": _market_name_cache.get(mid, ""),
                 })
         return {"positions": positions}
     except Exception as e:
