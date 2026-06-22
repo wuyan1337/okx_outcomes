@@ -674,12 +674,21 @@ async def account_manual_place(account_id: str, request: Request, user: str = De
         return JSONResponse(status_code=400, content={"ok": False, "error": "asset_id, side, price, size required"})
     if tif not in ("gtc", "ioc"):
         return JSONResponse(status_code=400, content={"ok": False, "error": "tif must be gtc or ioc"})
+    # Normalize price: ensure decimal format (e.g. "45" -> "0.45", "0.9" -> "0.90")
+    try:
+        price_f = float(price)
+        if price_f >= 1:
+            price_f = price_f / 100.0  # cents -> decimal
+        cents = round(price_f * 100)
+        price_str = f"{price_f:.2f}" if 4 <= cents <= 96 else f"{price_f:.3f}"
+    except (ValueError, TypeError):
+        return JSONResponse(status_code=400, content={"ok": False, "error": f"Invalid price: {price}"})
     try:
         result = await inst.client.place_order(
             asset_id=asset_id,
-            side=side,
-            price=str(price),
-            size=str(size),
+            side=side.lower(),
+            price=price_str,
+            size=str(int(float(size))),
             tif=tif,
         )
         if isinstance(result, dict) and str(result.get("code", "")) == "0":
