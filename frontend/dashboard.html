@@ -318,12 +318,14 @@ select.cinput option{background:var(--bg);color:#fff;}
 </div></div>
 <div id="mt-market-sec">
 <div class="fg"><label>Best Ask</label><span id="mt-ask" style="color:var(--green)">--</span></div>
-<div class="fg"><label>Size</label><input type="number" id="mt-mkt-size" autocomplete="off" step="1" min="1" placeholder="Quantity"></div>
+<div class="fg"><label>Size</label><input type="number" id="mt-mkt-size" autocomplete="off" step="1" min="1" placeholder="Quantity" oninput="mtCalcXp('mkt')"></div>
+<div class="fg"><label>XP Cost</label><input type="number" id="mt-mkt-xp" autocomplete="off" step="0.01" min="0" placeholder="XP to spend" oninput="mtCalcSize('mkt')"></div>
 <button class="btn-go" id="mt-mkt-buy" onclick="mtBuyMarket()">Buy @ --</button>
 </div>
 <div id="mt-limit-sec" style="display:none">
-<div class="fg"><label>Price (¢)</label><input type="number" id="mt-lmt-price" autocomplete="off" step="1" min="4" max="96" placeholder="e.g. 12"></div>
-<div class="fg"><label>Size</label><input type="number" id="mt-lmt-size" autocomplete="off" step="1" min="1" placeholder="Quantity"></div>
+<div class="fg"><label>Price (¢)</label><input type="number" id="mt-lmt-price" autocomplete="off" step="1" min="4" max="96" placeholder="e.g. 12" oninput="mtCalcXp('lmt')"></div>
+<div class="fg"><label>Size</label><input type="number" id="mt-lmt-size" autocomplete="off" step="1" min="1" placeholder="Quantity" oninput="mtCalcXp('lmt')"></div>
+<div class="fg"><label>XP Cost</label><input type="number" id="mt-lmt-xp" autocomplete="off" step="0.01" min="0" placeholder="XP to spend" oninput="mtCalcSize('lmt')"></div>
 <button class="btn-go" onclick="mtBuyLimit()">Place Buy</button>
 </div>
 
@@ -554,6 +556,8 @@ function mtSellList(assetId,size){_mtSellAsset=assetId;_mtSellSize=size;document
 function mtSellConfirm(){var price=document.getElementById('mt-sell-price').value;if(!price){al('ERROR','Enter sell price');return;}api('/api/accounts/'+currentAcctId+'/manual/place',{method:'POST',body:JSON.stringify({asset_id:_mtSellAsset,side:'SELL',price:String(parseInt(price)),size:String(_mtSellSize),tif:'gtc'})}).then(function(r){return r.json();}).then(function(d){if(d.ok){al('INFO','Sell listed @ '+price+'\u00a2');mtSellCancel();mtRefresh();}else{al('ERROR',d.error||'List failed');}}).catch(function(e){al('ERROR',e.message);});}
 
 function mtSellCancel(){document.getElementById('mt-sell-modal').style.display='none';}
+function mtCalcXp(mode){var sizeEl=document.getElementById('mt-'+mode+'-size');var xpEl=document.getElementById('mt-'+mode+'-xp');var size=parseFloat(sizeEl.value)||0;if(!size){xpEl.value='';return;}var price=0;if(mode==='mkt'){var askEl=document.getElementById('mt-ask').textContent;price=parseFloat(askEl)||0;}else{price=(parseFloat(document.getElementById('mt-lmt-price').value)||0)/100;}if(!price){xpEl.value='';return;}xpEl.value=(size*price).toFixed(2);}
+function mtCalcSize(mode){var sizeEl=document.getElementById('mt-'+mode+'-size');var xpEl=document.getElementById('mt-'+mode+'-xp');var xp=parseFloat(xpEl.value)||0;if(!xp){sizeEl.value='';return;}var price=0;if(mode==='mkt'){var askEl=document.getElementById('mt-ask').textContent;price=parseFloat(askEl)||0;}else{price=(parseFloat(document.getElementById('mt-lmt-price').value)||0)/100;}if(!price){sizeEl.value='';return;}sizeEl.value=Math.floor(xp/price);}
 
 async function mtRefresh(){await mtLoadPositions();await mtLoadHistory();}
 
