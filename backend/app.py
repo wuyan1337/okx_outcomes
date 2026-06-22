@@ -493,15 +493,14 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
                 market_id=market_id,
                 yes_asset_id=yes_asset_id,
                 no_asset_id=no_asset_id,
-                price_a=price_f,
-            , position_pct=int(body.get("position_pct", 100)))
+                price_a=price_f, position_pct=int(body.get("position_pct", 100)))
         elif strategy_type == "manual-s":
             await inst.strategy_s.start(
                 market_id=market_id,
                 yes_asset_id=yes_asset_id,
                 no_asset_id=no_asset_id,
                 side=side,
-                price_a=price_f,
+                price_a=price_f, position_pct=int(body.get("position_pct", 100)))
             )
         else:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Unknown strategy: {strategy_type}"})
