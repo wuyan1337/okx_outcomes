@@ -200,7 +200,7 @@ class ManualStrategyS:
         try:
             await self._deploy_balance()
             while self.state.running:
-                await asyncio.sleep(60)
+                await asyncio.sleep(10)
                 if not self.state.running:
                     break
                 # Fetch both closed AND open orders to catch partial fills
