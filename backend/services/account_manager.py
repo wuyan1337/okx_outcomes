@@ -84,19 +84,24 @@ class AccountInstance:
             return
 
         if strategy_type == "manual-s":
+            # Preserve position_pct from running strategy
+            pct = self.strategy_s.state.position_pct if self.strategy_s.state.position_pct else 100
             await self.strategy_s.start(
                 market_id=params["market_id"],
                 yes_asset_id=params["yes_asset_id"],
                 no_asset_id=params["no_asset_id"],
                 side=params["side"],
                 price_a=float(new_price_cents),
+                position_pct=pct,
             )
         elif strategy_type == "manual-d":
+            pct = self.strategy_d.state.position_pct if self.strategy_d.state.position_pct else 100
             await self.strategy_d.start(
                 market_id=params["market_id"],
                 yes_asset_id=params["yes_asset_id"],
                 no_asset_id=params["no_asset_id"],
                 price_a=float(new_price_cents),
+                position_pct=pct,
             )
 
     async def _restart_monitor(self, reference_price: float, poly_token_id: str):
