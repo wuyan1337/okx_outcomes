@@ -677,6 +677,18 @@ async def account_trades(account_id: str, limit: int = 50, asset_id: str = None,
                         break
             except Exception:
                 pass
+            # Fallback: fetch individual markets still missing
+            still_missing = missing_mids - set(_market_name_cache.keys())
+            for sm in list(still_missing)[:5]:
+                try:
+                    mr = await inst.client.get_market(sm)
+                    if isinstance(mr, dict) and str(mr.get("code", "")) == "0":
+                        mdata = mr.get("data", {})
+                        q = mdata.get("question", "") or mdata.get("eventTitle", "")
+                        if q:
+                            _market_name_cache[sm] = q.replace("Will ", "").rstrip("?")
+                except Exception:
+                    pass
             for t in trades:
                 if not t["market_name"] and t["market_id"] in _market_name_cache:
                     t["market_name"] = _market_name_cache[t["market_id"]]
