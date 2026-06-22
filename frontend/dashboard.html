@@ -597,7 +597,7 @@ if(_nav!==navId)return;var [br,pr2,or2]=await Promise.all([api('/api/balance'),a
 var _bookWs=null,_bookReconnect=null,obConnected=false;
 var _polyToken='',_okxAsset='';
 /* Cached book data — keeps last snapshot so tab switch is instant */
-var _cachedOkxBids=[],_cachedOkxAsks=[],_cachedPolyBids=[],_cachedPolyAsks=[];
+var _cachedOkxBids=[],_cachedOkxAsks=[],_cachedPolyBids=[],_cachedPolyAsks=[],_obNoSide=false;
 var _activeTab=0; /* which tab is currently visible */
 
 function clearOb(){document.getElementById('ob-id').textContent='--';document.getElementById('ob-b').innerHTML='<div style="color:var(--muted)">--</div>';document.getElementById('ob-a').innerHTML='<div style="color:var(--muted)">--</div>';}
