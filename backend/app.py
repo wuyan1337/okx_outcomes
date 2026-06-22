@@ -629,8 +629,31 @@ async def account_cancel_order(account_id: str, request: Request, user: str = De
 
 # ─── Manual Trading ───
 
-# Market name cache: market_id -> question
+# Market name cache: market_id -> question (auto-populated, persistent in memory)
 _market_name_cache: dict = {}
+_market_cache_populated = False  # whether we've done a full scan
+
+async def _ensure_market_cache(inst):
+    """Populate market name cache from active+settled+closed events. Only full-scans once."""
+    global _market_cache_populated
+    if _market_cache_populated:
+        return
+    try:
+        for st in ("active", "settled", "closed"):
+            try:
+                events = await inst.client.get_events(status=st, page_size=50)
+                if isinstance(events, dict):
+                    for ev in events.get("data", {}).get("events", []):
+                        for mkt in ev.get("markets", []):
+                            _mid = mkt.get("marketId", "")
+                            if _mid and _mid not in _market_name_cache:
+                                q = mkt.get("question", "") or ev.get("eventTitle", "")
+                                _market_name_cache[_mid] = q.replace("Will ", "").rstrip("?")
+            except Exception:
+                pass
+        _market_cache_populated = True
+    except Exception:
+        pass
 
 @app.get("/api/accounts/{account_id}/trades")
 async def account_trades(account_id: str, limit: int = 50, asset_id: str = None, user: str = Depends(verify_auth)):
@@ -638,6 +661,9 @@ async def account_trades(account_id: str, limit: int = 50, asset_id: str = None,
     if not inst:
         raise HTTPException(404, "Account not found")
     try:
+        # Ensure cache is populated (once)
+        await _ensure_market_cache(inst)
+
         data = await inst.client.get_orders(status="closed")
         trades = []
         missing_mids = set()
@@ -661,34 +687,19 @@ async def account_trades(account_id: str, limit: int = 50, asset_id: str = None,
                 })
                 if mid and mid not in _market_name_cache:
                     missing_mids.add(mid)
-        # Populate cache from events if needed
-        if missing_mids:
+        # Fallback: fetch individual markets still missing from cache
+        for sm in list(missing_mids)[:5]:
             try:
-                for st in ("active", "settled"):
-                    events = await inst.client.get_events(status=st, page_size=50)
-                    if isinstance(events, dict):
-                        for ev in events.get("data", {}).get("events", []):
-                            for mkt in ev.get("markets", []):
-                                _mid = mkt.get("marketId", "")
-                                if _mid:
-                                    q = mkt.get("question", "") or ev.get("eventTitle", "")
-                                    _market_name_cache[_mid] = q.replace("Will ", "").rstrip("?")
-                    if not (missing_mids - set(_market_name_cache.keys())):
-                        break
+                mr = await inst.client.get_market(sm)
+                if isinstance(mr, dict) and str(mr.get("code", "")) == "0":
+                    mdata = mr.get("data", {})
+                    q = mdata.get("question", "") or mdata.get("eventTitle", "")
+                    if q:
+                        _market_name_cache[sm] = q.replace("Will ", "").rstrip("?")
             except Exception:
                 pass
-            # Fallback: fetch individual markets still missing
-            still_missing = missing_mids - set(_market_name_cache.keys())
-            for sm in list(still_missing)[:5]:
-                try:
-                    mr = await inst.client.get_market(sm)
-                    if isinstance(mr, dict) and str(mr.get("code", "")) == "0":
-                        mdata = mr.get("data", {})
-                        q = mdata.get("question", "") or mdata.get("eventTitle", "")
-                        if q:
-                            _market_name_cache[sm] = q.replace("Will ", "").rstrip("?")
-                except Exception:
-                    pass
+        # Fill names for any that were missing
+        if missing_mids:
             for t in trades:
                 if not t["market_name"] and t["market_id"] in _market_name_cache:
                     t["market_name"] = _market_name_cache[t["market_id"]]
@@ -696,8 +707,6 @@ async def account_trades(account_id: str, limit: int = 50, asset_id: str = None,
         return {"trades": trades[:limit]}
     except Exception as e:
         return {"trades": [], "error": str(e)}
-
-
 @app.post("/api/accounts/{account_id}/manual/place")
 async def account_manual_place(account_id: str, request: Request, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
