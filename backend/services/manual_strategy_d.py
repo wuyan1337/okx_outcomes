@@ -45,6 +45,7 @@ class ManualStateD:
     total_sells_posted: int = 0
     total_profit: float = 0.0
     consecutive_failures: int = 0
+    position_pct: int = 100
     logs: list = field(default_factory=list)
     notified_fills: Set[str] = field(default_factory=set)  # order IDs already notified
 
@@ -103,7 +104,7 @@ class ManualStrategyD:
         logger.info(msg)
 
     async def start(self, market_id: str, yes_asset_id: str, no_asset_id: str,
-                    price_a: float, size: int = 0):
+                    price_a: float, size: int = 0, position_pct: int = 100):
         """Start the spread strategy."""
         if self.state.running:
             return
@@ -119,6 +120,7 @@ class ManualStrategyD:
         self.state.yes_asset_id = yes_asset_id
         self.state.no_asset_id = no_asset_id
         self.state.price_a = a
+        self.state.position_pct = max(1, min(100, position_pct))
         self.state.price_b = 99 - a
         self.state.sell_a = a + 1
         self.state.sell_b = 100 - a
@@ -489,6 +491,7 @@ class ManualStrategyD:
 
             balance = await self.client.get_balance()
             available = self._parse_available(balance)
+            available = available * self.state.position_pct / 100.0
 
             pair_cost = (self.state.price_a + self.state.price_b) / 100.0
             pairs = int(available / pair_cost)

@@ -42,6 +42,7 @@ class ManualStateS:
     total_profit: float = 0.0
     consecutive_failures: int = 0
     notified_fills: Set[str] = field(default_factory=set)  # order IDs already notified
+    position_pct: int = 100  # % of available balance to deploy
     logs: list = field(default_factory=list)
 
 
@@ -98,7 +99,7 @@ class ManualStrategyS:
         logger.info(msg)
 
     async def start(self, market_id: str, yes_asset_id: str, no_asset_id: str,
-                    side: str, price_a: float, size: int = 0):
+                    side: str, price_a: float, size: int = 0, position_pct: int = 100):
         """Start single-side strategy."""
         if self.state.running:
             return
@@ -122,6 +123,7 @@ class ManualStrategyS:
         self.state.asset_id = yes_asset_id if side == "yes" else no_asset_id
         self.state.price_a = a
         self.state.sell_price = a + 1
+        self.state.position_pct = max(1, min(100, position_pct))
         self.state.consecutive_failures = 0
 
         import time as _time
@@ -443,6 +445,7 @@ class ManualStrategyS:
 
             balance = await self.client.get_balance()
             available = self._parse_available(balance)
+            available = available * self.state.position_pct / 100.0
 
             cost_per_unit = self.state.price_a / 100.0
             units = int(available / cost_per_unit)
