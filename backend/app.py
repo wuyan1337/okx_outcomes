@@ -322,17 +322,6 @@ async def account_positions(account_id: str, user: str = Depends(verify_auth)):
                     "avg_price": p.get("avgPrice", "0"),
                     "market_name": _market_name_cache.get(mid, ""),
                 })
-
-
-
-
-
-
-
-
-
-
-
         return {"positions": positions}
     except Exception as e:
         return {"positions": [], "error": str(e)}
