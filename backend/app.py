@@ -620,6 +620,90 @@ async def account_cancel_all(account_id: str, user: str = Depends(verify_auth)):
         return {"ok": False, "error": str(e)}
 
 
+@app.post("/api/accounts/{account_id}/flash_close")
+async def account_flash_close(account_id: str, user: str = Depends(verify_auth)):
+    """Emergency close: stop strategies, cancel all orders, sell all positions at market."""
+    inst = manager.get_instance(account_id)
+    if not inst:
+        raise HTTPException(404, "Account not found")
+    try:
+        import asyncio as _asyncio
+
+        # Step 1: Stop strategies
+        if inst.strategy_s.running:
+            await inst.strategy_s.stop()
+        if inst.strategy_d.running:
+            await inst.strategy_d.stop()
+        if inst.sniper.running:
+            await inst.sniper.stop()
+        if inst.poly_monitor.running:
+            await inst.poly_monitor.stop()
+
+        # Step 2: Cancel all orders
+        orders_resp = await inst.client.get_orders(status="open")
+        orders = []
+        if str(orders_resp.get("code", "")) == "0":
+            orders = orders_resp.get("data", {}).get("list", [])
+        if orders:
+            cancels = [{"assetId": o.get("assetId", ""), "oid": o.get("oid", o.get("id", ""))}
+                       for o in orders if o.get("assetId") and (o.get("oid") or o.get("id"))]
+            if cancels:
+                try:
+                    await inst.client.cancel_orders_batch(cancels)
+                except Exception:
+                    pass
+
+        # Step 3: Sell all positions at market (IOC at best bid)
+        await _asyncio.sleep(0.3)
+        pos_resp = await inst.client.get_positions(status="open")
+        sold = 0
+        if str(pos_resp.get("code", "")) == "0":
+            positions = pos_resp.get("data", {}).get("list", [])
+            for p in positions:
+                mid = p.get("marketId", "")
+                token_idx = p.get("tokenIndex", "1")
+                size = p.get("availableSize", p.get("size", "0"))
+                if not mid or float(size) <= 0:
+                    continue
+                yes_aid = f"{mid}000"
+                no_aid = f"{mid}100"
+                trade_aid = no_aid if token_idx == "2" else yes_aid
+                # Get best bid for this asset
+                try:
+                    book = await inst.client.get_orderbook(yes_aid, depth=1)
+                    best_bid = None
+                    if isinstance(book, dict) and "data" in book:
+                        bdata = book["data"]
+                        if isinstance(bdata, list) and len(bdata) > 0:
+                            if token_idx == "2":
+                                # NO position: bid = 1 - YES best_ask
+                                asks = bdata[0].get("asks", [])
+                                if asks:
+                                    best_bid = f"{1 - float(asks[0][0]):.2f}"
+                            else:
+                                bids = bdata[0].get("bids", [])
+                                if bids:
+                                    best_bid = bids[0][0]
+                    if best_bid and float(best_bid) > 0:
+                        resp = await inst.client.place_order(
+                            asset_id=trade_aid,
+                            side="sell",
+                            price=best_bid,
+                            size=str(int(float(size))),
+                            tif="ioc",
+                        )
+                        if str(resp.get("code", "")) == "0":
+                            sold += 1
+                except Exception:
+                    pass
+
+        return {"ok": True, "result": {"cancelled": len(orders), "sold": sold}}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/api/accounts/{account_id}/cancel_order")
 async def account_cancel_order(account_id: str, request: Request, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
