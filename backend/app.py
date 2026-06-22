@@ -994,9 +994,12 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
     # Monitor validation if enabled
     monitor = body.get("monitor")
     price_decimal = float(price) / 100.0 if float(price) >= 1 else float(price)
+    is_no_side = side.upper() == "NO"
     if monitor and monitor.get("poly_token_id"):
         poly_token_id = monitor["poly_token_id"]
         # Check OKX best bid == strategy price
+        # OKX only has YES orderbook; for NO side, YES bid should be ~(1-NO_price)
+        okx_expected = (1.0 - price_decimal) if is_no_side else price_decimal
         try:
             okx_book = await inst.client.get_orderbook(asset_id, depth=5)
             okx_bids = []
@@ -1007,8 +1010,8 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
             if not okx_bids:
                 return JSONResponse(status_code=400, content={"ok": False, "error": "No OKX bids found"})
             okx_best_bid = float(okx_bids[0][0])
-            if abs(okx_best_bid - price_decimal) > 0.02:
-                return JSONResponse(status_code=400, content={"ok": False, "error": f"OKX best bid ({okx_best_bid:.4f}) != price ({price_decimal:.4f})"})
+            if abs(okx_best_bid - okx_expected) > 0.02:
+                return JSONResponse(status_code=400, content={"ok": False, "error": f"OKX best bid ({okx_best_bid:.4f}) != expected ({okx_expected:.4f})"})
         except Exception as e:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"OKX book check: {e}"})
         # Check Poly best bid
