@@ -308,11 +308,13 @@ async def account_positions(account_id: str, user: str = Depends(verify_auth)):
         if isinstance(data, dict) and str(data.get("code", "")) == "0":
             for p in data.get("data", {}).get("list", []):
                 mid = p.get("marketId", "")
-                token_name = p.get("tokenName", "YES")
-                yes_aid = p.get("yesAssetId", "") or p.get("assetId", "")
-                no_aid = p.get("noAssetId", "")
-                # Return the tradeable asset_id based on position side
-                aid = no_aid if token_name.upper() == "NO" and no_aid else yes_aid
+                token_name = p.get("tokenName", "Yes")
+                # OKX positions don't include assetId — derive from marketId + tokenIndex
+                # tokenIndex "1" = YES -> {marketId}000, tokenIndex "2" = NO -> {marketId}100
+                token_idx = p.get("tokenIndex", "1")
+                yes_aid = f"{mid}000" if mid else ""
+                no_aid = f"{mid}100" if mid else ""
+                aid = no_aid if token_idx == "2" or token_name.upper() == "NO" else yes_aid
                 positions.append({
                     "market_id": mid,
                     "asset_id": aid,
