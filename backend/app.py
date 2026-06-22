@@ -501,7 +501,6 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
                 no_asset_id=no_asset_id,
                 side=side,
                 price_a=price_f, position_pct=int(body.get("position_pct", 100)))
-            )
         else:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Unknown strategy: {strategy_type}"})
     except Exception as e:
