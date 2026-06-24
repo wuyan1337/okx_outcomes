@@ -378,6 +378,11 @@ class ManualStrategyD:
 
                 # Post sell order
                 size_str = f"{new_fill:.10f}".rstrip("0").rstrip(".")
+                # Minimum order check: price * size must >= 1 xp
+                sell_notional = (sell_cents / 100.0) * new_fill
+                if sell_notional < 1.0:
+                    self.log(f"Sell too small: {new_fill:.0f} x {sell_cents}\u00a2 = {sell_notional:.2f} xp < 1 xp, deferring")
+                    continue
                 sell_resp = await self.client.place_order(
                     asset_id=asset_id,
                     side="sell",
