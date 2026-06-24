@@ -287,6 +287,12 @@ class ManualStrategyS:
                 label = "Yes" if self.state.side == "yes" else "No"
 
                 size_str = f"{new_fill:.10f}".rstrip("0").rstrip(".")
+                # Minimum order check: price * size must >= 1 xp
+                sell_notional = (sell_cents / 100.0) * new_fill
+                if sell_notional < 1.0:
+                    # Accumulate - don't post undersized sell, wait for more fills
+                    self.log(f"Sell too small: {new_fill:.0f} x {sell_cents}\u00a2 = {sell_notional:.2f} xp < 1 xp, deferring")
+                    continue
                 sell_resp = await self.client.place_order(
                     asset_id=self.state.asset_id,
                     side="sell",
