@@ -536,6 +536,7 @@ _activeTab=n;
 /* Clear non-running tabs' selections */
 if(n!==0&&!MR&&!MSR&&!PR){document.getElementById('mkt').value='';document.getElementById('mkt-btn').textContent='-- Select market --';document.getElementById('mp').value='';document.getElementById('cn').textContent='NO price = 99 - a = --';resetMonitor('md-mon-');}
 if(n!==1&&!MSR&&!MR&&!PR){document.getElementById('smkt').value='';document.getElementById('smkt-btn').textContent='-- Select market --';document.getElementById('ms-price').value='';resetMonitor('ms-mon-');}
+if(n!==4&&!BSR&&!MR&&!PR){document.getElementById('bsmkt').value='';document.getElementById('bsmkt-btn').textContent='-- Select market --';document.getElementById('bs-price').value='';resetMonitor('bs-mon-');}
 if(n!==2&&!PR){document.getElementById('pmkt').value='';document.getElementById('pmkt-btn').textContent='-- Select market --';document.getElementById('pi').value='';clearPolyOb();var wrap=document.getElementById('poly-sel-wrap');if(wrap)wrap.style.display='none';var sel=document.getElementById('poly-sel');if(sel)sel.innerHTML='<option value="">-- Select outcome --</option>';_polyResolvedToken='';}
 if(n===3&&!_mtPoll){mtStartPoll();}if(n!==3){mtStopPoll();}
 var _obPanels=document.querySelectorAll('#poly-ob-panel,#okx-ob-panel');_obPanels.forEach(function(p){p.style.display=n===3?'none':'';});
