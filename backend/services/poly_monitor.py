@@ -247,11 +247,11 @@ class PolyMonitor:
             return
 
         # CONDITION B: Price rose (bid > reference)
-        # In bid-sell mode, ROSE means our sell is MORE likely to fill — skip trigger
-        if self._strategy_mode == bid-sell and current_bid > ref + 0.005:
+        # In bid-sell mode, ROSE means our sell is MORE likely to fill - skip trigger
+        if self._strategy_mode == "bid-sell" and current_bid > ref + 0.005:
             logger.info(
-                f[PolyMonitor] Bid rose {ref:.3f}- 
-                fbut bid-sell mode: sell safer, ignoring
+                f"[PolyMonitor] Bid rose {ref:.3f}->{current_bid:.3f} "
+                f"but bid-sell mode: sell safer at higher bid, ignoring"
             )
             return
 
