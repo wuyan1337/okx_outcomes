@@ -180,7 +180,7 @@ class AutoRebalance:
 
             # Step 3: Same price as before? Just restart
             if new_price_cents == old_price_cents:
-                await self._notify(f"✅ 价格回到 {old_price_cents}¢，原价重启")
+                await self._notify(f"✅ 价格回到 S{old_price_cents}¢/B{old_price_cents-1}¢，原价重启")
                 await self._restart(old_price_cents, poly_token_id, new_price_decimal, strategy_type)
                 self._rebalancing = False
                 return
@@ -219,7 +219,9 @@ class AutoRebalance:
                     logger.info(f"[Rebalance:{self.account_id}] Position confirmed 0 - clearing {layers_before_sync:.0f} stale layer units")
 
             # Step 5: Post sells for existing layers
-            new_sell_price_cents = new_price_cents + 1
+            # new_price_cents = stable poly bid = new SELL level
+            new_sell_price_cents = new_price_cents
+            new_buy_price_cents = new_price_cents - 1
             sells_posted = await self._post_layer_sells(new_sell_price_cents, strategy_type)
 
             # Step 6: Restart strategy at new price
@@ -229,7 +231,7 @@ class AutoRebalance:
             layers_info = ", ".join(f"{v:.0f}@{k}¢" for k, v in sorted(self.cost_layers.items()))
             await self._notify(
                 f"✅ Auto-Rebalance 完成\n"
-                f"新价: {new_price_cents}¢ (buy) / {new_sell_price_cents}¢ (sell)\n"
+                f"新价: B{new_buy_price_cents}¢ / S{new_sell_price_cents}¢\n"
                 f"存量 sells: {sells_posted} 笔\n"
                 f"持仓层: {layers_info or '无'}"
             )
