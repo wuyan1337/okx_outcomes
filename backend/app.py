@@ -135,7 +135,10 @@ async def get_status(user: str = Depends(verify_auth)):
         if inst.strategy_d.running:
             running_strategy = "Manual-D"
         elif inst.strategy_s.running:
-            running_strategy = "Manual-S"
+            mode = getattr(inst.strategy_s.state, "mode", "classic")
+            running_strategy = "Bid-Sell" if mode == "bid-sell" else "Manual-S"
+        elif inst.sniper.running:
+            running_strategy = "Sniper"
         # Get per-account stats for cards
         acct_orders = 0
         acct_positions = 0
@@ -164,7 +167,7 @@ async def get_status(user: str = Depends(verify_auth)):
             "id": inst.account_id,
             "name": inst.name,
             "proxy_node": inst.proxy_node,
-            "running": inst.strategy_d.running or inst.strategy_s.running,
+            "running": inst.strategy_d.running or inst.strategy_s.running or inst.sniper.running,
             "strategy": running_strategy,
             "orders": acct_orders,
             "positions": acct_positions,
