@@ -394,6 +394,7 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         "sniper_poly_url": getattr(inst.sniper.state, "poly_url", "") if inst.sniper.running else "",
         "sniper_selected_outcome": getattr(inst.sniper.state, "selected_outcome", "") if inst.sniper.running else "",
         "manual_s_price": getattr(inst.strategy_s.state, "price_a", None) if inst.strategy_s.running else None,
+        "manual_s_sell_price": getattr(inst.strategy_s.state, "sell_price", None) if inst.strategy_s.running else None,
         "manual_s_side": getattr(inst.strategy_s.state, "side", None) if inst.strategy_s.running else None,
         "manual_s_asset_id": getattr(inst.strategy_s.state, "asset_id", None) if inst.strategy_s.running else None,
         "manual_s_yes_asset_id": getattr(inst.strategy_s.state, "yes_asset_id", None) if inst.strategy_s.running else None,
