@@ -99,7 +99,7 @@ class ManualStrategyS:
         logger.info(msg)
 
     async def start(self, market_id: str, yes_asset_id: str, no_asset_id: str,
-                    side: str, price_a: float, size: int = 0, position_pct: int = 100):
+                    side: str, price_a: float, sell_price: float = 0, size: int = 0, position_pct: int = 100):
         """Start single-side strategy."""
         if self.state.running:
             return
@@ -122,7 +122,7 @@ class ManualStrategyS:
         self.state.side = side
         self.state.asset_id = yes_asset_id if side == "yes" else no_asset_id
         self.state.price_a = a
-        self.state.sell_price = a + 1
+        self.state.sell_price = int(sell_price) if sell_price > 0 else a + 1
         self.state.position_pct = max(1, min(100, position_pct))
         self.state.consecutive_failures = 0
 
