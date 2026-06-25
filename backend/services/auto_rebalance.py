@@ -186,17 +186,37 @@ class AutoRebalance:
                 return
 
             # Step 4: Sync cost layers with actual positions
-            # Guard: if we just captured partial fills, don't let sync wipe them
-            # (OKX position API may lag behind cancel/fill events)
-            layers_snapshot = dict(self.cost_layers)  # preserve actual costs
+            # Double-verify position before restoring wiped layers
+            layers_snapshot = dict(self.cost_layers)
             layers_before_sync = sum(self.cost_layers.values())
             await self._sync_positions()
             layers_after_sync = sum(self.cost_layers.values())
+
             if layers_before_sync > 0 and layers_after_sync <= 0:
-                logger.warning(f"[Rebalance:{self.account_id}] sync wiped {layers_before_sync:.0f} units - API lag, restoring from snapshot")
-                # Restore from snapshot (preserves actual cost prices, not old_price_cents)
-                for price_c, qty in layers_snapshot.items():
-                    self.add_to_layer(price_c, qty)
+                # Sync says position=0. Verify with a fresh query after short delay.
+                await asyncio.sleep(2)
+                params = self.get_strategy_params() if self.get_strategy_params else {}
+                asset_id = params.get("asset_id", "")
+                actual_pos = 0.0
+                try:
+                    resp2 = await self.client.get_positions()
+                    pos_list = resp2.get("data", {}).get("list", []) if isinstance(resp2.get("data"), dict) else []
+                    for p in pos_list:
+                        if p.get("assetId", "") == asset_id or asset_id.startswith(str(p.get("marketId", "---"))):
+                            actual_pos += float(p.get("size", "0") or "0")
+                except Exception as e:
+                    actual_pos = -1  # unknown
+
+                if actual_pos > 0.5:
+                    logger.warning(f"[Rebalance:{self.account_id}] sync wiped {layers_before_sync:.0f} but actual={actual_pos:.0f} - restoring")
+                    for price_c, qty in layers_snapshot.items():
+                        self.add_to_layer(price_c, qty)
+                elif actual_pos < 0:
+                    logger.warning(f"[Rebalance:{self.account_id}] position query failed - restoring conservatively")
+                    for price_c, qty in layers_snapshot.items():
+                        self.add_to_layer(price_c, qty)
+                else:
+                    logger.info(f"[Rebalance:{self.account_id}] Position confirmed 0 - clearing {layers_before_sync:.0f} stale layer units")
 
             # Step 5: Post sells for existing layers
             new_sell_price_cents = new_price_cents + 1
