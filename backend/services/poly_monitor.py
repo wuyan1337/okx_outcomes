@@ -53,6 +53,7 @@ class PolyMonitor:
         self.auto_rebalance = None       # AutoRebalance instance (set by AccountInstance)
         self._strategy_type = ""         # "manual-s" or "manual-d" (set on start)
         self._strategy_mode = "classic"   # "classic" or "bid-sell"
+        self._strategy_mode = "classic"   # "classic" or "bid-sell"
         self._old_price_cents = 0        # Strategy price when monitor started
 
     @property
@@ -89,6 +90,7 @@ class PolyMonitor:
         self._strategy_type = strategy_type
         self._old_price_cents = price_cents
         self._strategy_asset_id = asset_id
+        self._strategy_mode = mode
         self._strategy_mode = mode
 
     async def stop(self):
