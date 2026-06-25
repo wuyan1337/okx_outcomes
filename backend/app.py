@@ -1195,7 +1195,7 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly book check: {e}"})
 
     try:
-        await inst.strategy_s.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price), side=side, position_pct=int(body.get("position_pct", 100)))
+        await inst.strategy_s.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price), sell_price=float(body.get("sell_price", 0)), side=side, position_pct=int(body.get("position_pct", 100)))
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
