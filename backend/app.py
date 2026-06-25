@@ -962,8 +962,8 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
             if not poly_bids:
                 return JSONResponse(status_code=400, content={"ok": False, "error": "No Poly bids found"})
             poly_best_bid = float(poly_bids[0].get("price", 0))
-            if abs(poly_best_bid - price_decimal) > 0.005:
-                return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly best bid ({poly_best_bid:.4f}) != price ({price_decimal:.4f})"})
+            if abs(poly_best_bid - sell_price_decimal) > 0.02:
+                return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly best bid ({poly_best_bid:.4f}) too far from sell price ({sell_price_decimal:.4f})"})
         except Exception as e:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly book check: {e}"})
 
@@ -1158,13 +1158,15 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
         return JSONResponse(status_code=400, content={"ok": False, "error": "no_asset_id is required"})
     # Monitor validation if enabled
     monitor = body.get("monitor")
+    sell_price_val = float(body.get("sell_price", 0)) or (float(price) + 1)
     price_decimal = float(price) / 100.0 if float(price) >= 1 else float(price)
+    sell_price_decimal = sell_price_val / 100.0 if sell_price_val >= 1 else sell_price_val
     is_no_side = side.upper() == "NO"
     if monitor and monitor.get("poly_token_id"):
         poly_token_id = monitor["poly_token_id"]
-        # Check OKX best bid == strategy price
+        # Check OKX best bid near strategy sell price (monitor watches sell level)
         # OKX only has YES orderbook; for NO side, YES bid should be ~(1-NO_price)
-        okx_expected = (1.0 - price_decimal) if is_no_side else price_decimal
+        okx_expected = (1.0 - sell_price_decimal) if is_no_side else sell_price_decimal
         try:
             okx_book = await inst.client.get_orderbook(asset_id, depth=5)
             okx_bids = []
@@ -1175,8 +1177,8 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
             if not okx_bids:
                 return JSONResponse(status_code=400, content={"ok": False, "error": "No OKX bids found"})
             okx_best_bid = float(okx_bids[0][0])
-            if abs(okx_best_bid - okx_expected) > 0.02:
-                return JSONResponse(status_code=400, content={"ok": False, "error": f"OKX best bid ({okx_best_bid:.4f}) != expected ({okx_expected:.4f})"})
+            if abs(okx_best_bid - okx_expected) > 0.03:
+                return JSONResponse(status_code=400, content={"ok": False, "error": f"OKX best bid ({okx_best_bid:.4f}) too far from sell price ({okx_expected:.4f})"})
         except Exception as e:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"OKX book check: {e}"})
         # Check Poly best bid
@@ -1190,8 +1192,8 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
             if not poly_bids:
                 return JSONResponse(status_code=400, content={"ok": False, "error": "No Poly bids found"})
             poly_best_bid = float(poly_bids[0].get("price", 0))
-            if abs(poly_best_bid - price_decimal) > 0.005:
-                return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly best bid ({poly_best_bid:.4f}) != price ({price_decimal:.4f})"})
+            if abs(poly_best_bid - sell_price_decimal) > 0.02:
+                return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly best bid ({poly_best_bid:.4f}) too far from sell price ({sell_price_decimal:.4f})"})
         except Exception as e:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly book check: {e}"})
 
@@ -1205,7 +1207,7 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
         try:
             r = await inst.poly_monitor.start(
                 poly_token_id=monitor["poly_token_id"],
-                reference_price=price_decimal,
+                reference_price=sell_price_decimal,
                 depth_threshold=float(monitor.get("depth_threshold", 10000)),
             )
             if r and r.get("ok"):
