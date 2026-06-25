@@ -84,14 +84,17 @@ class AccountInstance:
             return
 
         if strategy_type == "manual-s":
-            # Preserve position_pct from running strategy
+            # Preserve position_pct and spread from running strategy
             pct = self.strategy_s.state.position_pct if self.strategy_s.state.position_pct else 100
+            old_spread = self.strategy_s.state.sell_price - self.strategy_s.state.price_a if self.strategy_s.state.sell_price > 0 else 1
+            new_sell_price = new_price_cents + old_spread
             await self.strategy_s.start(
                 market_id=params["market_id"],
                 yes_asset_id=params["yes_asset_id"],
                 no_asset_id=params["no_asset_id"],
                 side=params["side"],
                 price_a=float(new_price_cents),
+                sell_price=float(new_sell_price),
                 position_pct=pct,
             )
         elif strategy_type == "manual-d":
