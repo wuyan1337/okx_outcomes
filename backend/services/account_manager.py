@@ -84,15 +84,22 @@ class AccountInstance:
             return
 
         if strategy_type == "manual-s":
-            # Preserve position_pct and spread from running strategy
-            # new_price_cents = stable poly bid = new SELL level
             pct = self.strategy_s.state.position_pct if self.strategy_s.state.position_pct else 100
+            mode = self.strategy_s.state.mode or "classic"
             old_spread = self.strategy_s.state.sell_price - self.strategy_s.state.price_a if self.strategy_s.state.sell_price > 0 else 1
-            new_sell = new_price_cents  # poly stable bid = sell target
-            new_buy = new_price_cents - old_spread
-            if new_buy < 4:
-                new_buy = 4
-                new_sell = new_buy + old_spread
+
+            if mode == "bid-sell":
+                # new_price_cents = stable poly bid = new SELL level
+                new_sell = new_price_cents
+                new_buy = new_price_cents - old_spread
+                if new_buy < 4:
+                    new_buy = 4
+                    new_sell = new_buy + old_spread
+            else:
+                # classic: new_price_cents = stable poly bid = new BUY level
+                new_buy = new_price_cents
+                new_sell = new_price_cents + old_spread
+
             await self.strategy_s.start(
                 market_id=params["market_id"],
                 yes_asset_id=params["yes_asset_id"],
@@ -100,6 +107,7 @@ class AccountInstance:
                 side=params["side"],
                 price_a=float(new_buy),
                 sell_price=float(new_sell),
+                mode=mode,
                 position_pct=pct,
             )
         elif strategy_type == "manual-d":
