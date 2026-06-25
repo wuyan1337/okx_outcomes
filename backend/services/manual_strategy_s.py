@@ -28,9 +28,10 @@ SELLS_FILE_S = "data/pending_sells_s_{account_id}.json"
 @dataclass
 class ManualStateS:
     running: bool = False
+    mode: str = "classic"     # "classic" (MS) or "bid-sell" (BS)
     side: str = ""            # "yes" or "no"
     price_a: int = 0          # Buy price in cents
-    sell_price: int = 0       # Sell price = a + 1
+    sell_price: int = 0       # Sell price
     market_id: str = ""
     yes_asset_id: str = ""
     no_asset_id: str = ""
@@ -99,7 +100,7 @@ class ManualStrategyS:
         logger.info(msg)
 
     async def start(self, market_id: str, yes_asset_id: str, no_asset_id: str,
-                    side: str, price_a: float, sell_price: float = 0, size: int = 0, position_pct: int = 100):
+                    side: str, price_a: float, sell_price: float = 0, mode: str = "classic", size: int = 0, position_pct: int = 100):
         """Start single-side strategy."""
         if self.state.running:
             return
@@ -123,6 +124,7 @@ class ManualStrategyS:
         self.state.asset_id = yes_asset_id if side == "yes" else no_asset_id
         self.state.price_a = a
         self.state.sell_price = int(sell_price) if sell_price > 0 else a + 1
+        self.state.mode = mode
         self.state.position_pct = max(1, min(100, position_pct))
         self.state.consecutive_failures = 0
 
