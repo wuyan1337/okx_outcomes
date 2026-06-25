@@ -826,7 +826,7 @@ async def account_manual_place(account_id: str, request: Request, user: str = De
         price_str = f"{price_f:.2f}" if 4 <= cents <= 96 else f"{price_f:.3f}"
     except (ValueError, TypeError):
         return JSONResponse(status_code=400, content={"ok": False, "error": f"Invalid price: {price}"})
-    size_str = str(int(float(size))) if side.upper() != "SELL" else f"{float(size):.10f}".rstrip("0").rstrip(".")
+    size_str = str(int(float(size)))
     import logging; import sys
     print(f"[MANUAL PLACE] asset_id={asset_id} side={side.lower()} price={price_str} size={size_str} tif={tif}")
     try:
