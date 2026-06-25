@@ -283,7 +283,7 @@ select.cinput option{background:var(--bg);color:#fff;}
 <div class="sdrop" id="sdrop-bsmkt"><button type="button" class="sdrop-btn" id="bsmkt-btn">-- Select market --</button><div class="sdrop-panel"><div class="sdrop-search"><input type="text" id="bsmkt-q" placeholder="Search markets..." autocomplete="off"></div><div class="sdrop-list" id="bsmkt-list"></div></div></div>
 <input type="hidden" id="bsmkt">
 </div>
-<div class="fg"><label>Side</label><select id="bs-side"><option value="YES">YES</option><option value="NO">NO</option></select></div>
+<div class="fg"><label>Side</label><select id="bs-side" onchange="bsSideChange()"><option value="YES">YES</option><option value="NO">NO</option></select></div>
 <div class="fg"><label>Price (sell level)</label><input type="number" id="bs-price" autocomplete="off" step="1" min="5" max="96" placeholder="e.g. 39 → B38/S39"></div>
 <div class="fg"><label>Position %</label><input type="number" id="bs-pct" value="100" min="1" max="100" step="1"></div>
 <div class="status-line" id="bss" style="color:var(--muted)">Idle</div>
@@ -823,6 +823,7 @@ function sdInit(wrId,hidId,btnId,listId,qId){var wr=document.getElementById(wrId
 function sdRender(listId,items,hidId,btnId){var list=document.getElementById(listId),hid=document.getElementById(hidId);if(!list||!hid)return;if(!items.length){list.innerHTML='<div class="sdrop-empty">No markets found</div>';return;}list.innerHTML=items.map(function(m){var t=esc((m.question||m.event_title).substring(0,55))+' ['+esc(String(m.yes_asset_id))+']';var sel=hid.value==m.yes_asset_id?' sel':'';return '<div class="sdrop-item'+sel+'" data-v="'+m.yes_asset_id+'" title="'+t+'">'+t+'</div>';}).join('');list.querySelectorAll('.sdrop-item').forEach(function(el){el.addEventListener('click',function(){sdSelect(hidId,btnId,this.getAttribute('data-v'),this.textContent);});});}
 function sdSelect(hidId,btnId,val,txt){document.getElementById(hidId).value=val;document.getElementById(btnId).textContent=txt;document.querySelectorAll('.sdrop').forEach(function(d){d.classList.remove('open');});if(val){SA=val;if(hidId==='smkt'){_obNoSide=(document.getElementById('ms-side').value==='NO');}if(hidId==='bsmkt'){_obNoSide=(document.getElementById('bs-side').value==='NO');}sob(val);if(hidId==='tmkt'){mtFetchTicker();mtLoadHistory();}}}
 function msSideChange(){_obNoSide=(document.getElementById("ms-side").value==="NO");renderOkxOb();}
+function bsSideChange(){_obNoSide=(document.getElementById("bs-side").value==="NO");renderOkxOb();}
 document.addEventListener('click',function(){document.querySelectorAll('.sdrop').forEach(function(d){d.classList.remove('open');});});
 
 async function loadMkts(){try{var r=await api('/api/markets');if(!r.ok){al('ERROR','Markets: '+r.status);return;}var d=await r.json();_mkts=d.markets||[];_mktMap={};_mkts.forEach(function(m){_mktMap[m.yes_asset_id]=m;});sdRender('mkt-list',_mkts,'mkt','mkt-btn');sdRender('smkt-list',_mkts,'smkt','smkt-btn');sdRender('bsmkt-list',_mkts,'bsmkt','bsmkt-btn');sdRender('pmkt-list',_mkts,'pmkt','pmkt-btn');sdRender('tmkt-list',_mkts,'tmkt','tmkt-btn');al('INFO','Loaded '+_mkts.length+' markets');}catch(e){al('ERROR','Failed to load markets');}}
