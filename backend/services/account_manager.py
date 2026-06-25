@@ -138,7 +138,7 @@ class AccountInstance:
             reference_price=reference_price,
         )
         if result.get("ok"):
-            self.poly_monitor.set_strategy_context(strategy_type, price_cents, params.get("asset_id", "") if params else "")
+            self.poly_monitor.set_strategy_context(strategy_type, price_cents, params.get("asset_id", "") if params else "", mode=params.get("mode", "classic") if params else "classic")
 
     async def _stop_all_strategies(self):
         """Stop all running strategies (called by monitor on trigger)."""
