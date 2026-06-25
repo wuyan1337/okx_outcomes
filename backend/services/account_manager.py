@@ -64,6 +64,7 @@ class AccountInstance:
                 "asset_id": self.strategy_s.state.asset_id,
                 "side": self.strategy_s.state.side,
                 "price_cents": self.strategy_s.state.price_a,
+                "mode": self.strategy_s.state.mode or "classic",
             }
         elif self.strategy_d.state.running or self.strategy_d.state.yes_asset_id:
             return {
