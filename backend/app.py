@@ -1221,7 +1221,7 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
                 depth_threshold=float(monitor.get("depth_threshold", 10000)),
             )
             if r and r.get("ok"):
-                inst.poly_monitor.set_strategy_context("manual-s", int(sell_price_val) if mode == "bid-sell" else int(price), asset_id)
+                inst.poly_monitor.set_strategy_context("manual-s", int(sell_price_val) if mode == "bid-sell" else int(price), asset_id, mode=mode)
         except Exception as e:
             import logging; import sys
             logging.getLogger(__name__).warning(f"Monitor start error: {e}")

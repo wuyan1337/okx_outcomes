@@ -52,6 +52,7 @@ class PolyMonitor:
         self.on_trigger_callback = None  # Called when triggered to stop strategies
         self.auto_rebalance = None       # AutoRebalance instance (set by AccountInstance)
         self._strategy_type = ""         # "manual-s" or "manual-d" (set on start)
+        self._strategy_mode = "classic"   # "classic" or "bid-sell"
         self._old_price_cents = 0        # Strategy price when monitor started
 
     @property
@@ -83,11 +84,12 @@ class PolyMonitor:
         logger.info(f"[PolyMonitor] Started for {self.account_id}, ref_price={self.state.reference_price}")
         return {"ok": True, "reference_price": self.state.reference_price}
 
-    def set_strategy_context(self, strategy_type: str, price_cents: int, asset_id: str = ""):
+    def set_strategy_context(self, strategy_type: str, price_cents: int, asset_id: str = "", mode: str = "classic"):
         """Called by start flow to record what strategy is running."""
         self._strategy_type = strategy_type
         self._old_price_cents = price_cents
         self._strategy_asset_id = asset_id
+        self._strategy_mode = mode
 
     async def stop(self):
         """Stop monitoring."""
@@ -243,6 +245,14 @@ class PolyMonitor:
             return
 
         # CONDITION B: Price rose (bid > reference)
+        # In bid-sell mode, ROSE means our sell is MORE likely to fill — skip trigger
+        if self._strategy_mode == bid-sell and current_bid > ref + 0.005:
+            logger.info(
+                f[PolyMonitor] Bid rose {ref:.3f}- 
+                fbut bid-sell mode: sell safer, ignoring
+            )
+            return
+
         # Only trigger if depth at new best bid >= threshold
         if current_bid > ref + 0.005:
             threshold = self.state.depth_threshold
