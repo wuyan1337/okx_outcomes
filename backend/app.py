@@ -836,6 +836,7 @@ async def account_manual_place(account_id: str, request: Request, user: str = De
             price=price_str,
             size=size_str,
             tif=tif,
+            reduce_only=(side.lower() == "sell"),
         )
         if isinstance(result, dict) and str(result.get("code", "")) == "0":
             return {"ok": True, "result": result}
