@@ -792,7 +792,7 @@ async function stopMonitor(){
 // Monitor stops when strategy stops - no independent stop
 al('INFO','Monitor will stop when you stop the strategy.');
 }
-function _activeMonPrefix(){if(MR)return'md-mon-';if(MSR)return'ms-mon-';return null;}
+function _activeMonPrefix(){if(MR)return'md-mon-';if(BSR)return'bs-mon-';if(MSR)return'ms-mon-';return null;}
 
 function startMonitorOb(prefix,tokenId){stopMonitorOb();_monitorInterval=setInterval(async function(){
 try{var r=await gapi('/api/poly/book?token_id='+tokenId);var d=await r.json();
