@@ -288,8 +288,8 @@ class ManualStrategyS:
 
                 size_str = f"{new_fill:.10f}".rstrip("0").rstrip(".")
                 # Minimum order check: price * size must >= 1 xp
-                # sell_notional check removed - OKX handles min order validation
-                if False:  # disabled - let OKX reject if needed
+                sell_notional = (sell_cents / 100.0) * new_fill
+                if sell_notional < 1.0:
                     # Accumulate - don't post undersized sell, wait for more fills
                     self.log(f"Sell too small: {new_fill:.0f} x {sell_cents}\u00a2 = {sell_notional:.2f} xp < 1 xp, deferring")
                     continue
