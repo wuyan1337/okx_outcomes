@@ -276,13 +276,8 @@ class ManualStrategyS:
                 if new_fill < 0.01:
                     continue
 
-                # Derive sell price from actual buy order price (like Manual-D)
-                buy_price_str = o.get("price", "")
-                if buy_price_str:
-                    buy_cents = round(float(buy_price_str) * 100)
-                    sell_cents = buy_cents + 1
-                else:
-                    sell_cents = self.state.sell_price
+                # Use configured sell price
+                sell_cents = self.state.sell_price
                 sell_price = self._cents_to_price_str(sell_cents)
                 label = "Yes" if self.state.side == "yes" else "No"
 
