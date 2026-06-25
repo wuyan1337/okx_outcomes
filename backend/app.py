@@ -395,6 +395,7 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         "sniper_selected_outcome": getattr(inst.sniper.state, "selected_outcome", "") if inst.sniper.running else "",
         "manual_s_price": getattr(inst.strategy_s.state, "price_a", None) if inst.strategy_s.running else None,
         "manual_s_sell_price": getattr(inst.strategy_s.state, "sell_price", None) if inst.strategy_s.running else None,
+        "manual_s_mode": getattr(inst.strategy_s.state, "mode", "classic") if inst.strategy_s.running else None,
         "manual_s_side": getattr(inst.strategy_s.state, "side", None) if inst.strategy_s.running else None,
         "manual_s_asset_id": getattr(inst.strategy_s.state, "asset_id", None) if inst.strategy_s.running else None,
         "manual_s_yes_asset_id": getattr(inst.strategy_s.state, "yes_asset_id", None) if inst.strategy_s.running else None,
@@ -962,8 +963,9 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
             if not poly_bids:
                 return JSONResponse(status_code=400, content={"ok": False, "error": "No Poly bids found"})
             poly_best_bid = float(poly_bids[0].get("price", 0))
-            if abs(poly_best_bid - sell_price_decimal) > 0.02:
-                return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly best bid ({poly_best_bid:.4f}) too far from sell price ({sell_price_decimal:.4f})"})
+            poly_check_price = sell_price_decimal if mode == 'bid-sell' else price_decimal
+            if abs(poly_best_bid - poly_check_price) > 0.02:
+                return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly best bid ({poly_best_bid:.4f}) too far from price ({poly_check_price:.4f})"})
         except Exception as e:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly book check: {e}"})
 
@@ -1158,15 +1160,19 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
         return JSONResponse(status_code=400, content={"ok": False, "error": "no_asset_id is required"})
     # Monitor validation if enabled
     monitor = body.get("monitor")
+    mode = body.get("mode", "classic")
     sell_price_val = float(body.get("sell_price", 0)) or (float(price) + 1)
     price_decimal = float(price) / 100.0 if float(price) >= 1 else float(price)
     sell_price_decimal = sell_price_val / 100.0 if sell_price_val >= 1 else sell_price_val
+    # Monitor reference: bid-sell watches sell level, classic watches buy level
+    monitor_ref = sell_price_decimal if mode == "bid-sell" else price_decimal
     is_no_side = side.upper() == "NO"
     if monitor and monitor.get("poly_token_id"):
         poly_token_id = monitor["poly_token_id"]
         # Check OKX best bid near strategy sell price (monitor watches sell level)
         # OKX only has YES orderbook; for NO side, YES bid should be ~(1-NO_price)
-        okx_expected = (1.0 - sell_price_decimal) if is_no_side else sell_price_decimal
+        okx_check_price = sell_price_decimal if mode == 'bid-sell' else price_decimal
+        okx_expected = (1.0 - okx_check_price) if is_no_side else okx_check_price
         try:
             okx_book = await inst.client.get_orderbook(asset_id, depth=5)
             okx_bids = []
@@ -1192,13 +1198,14 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
             if not poly_bids:
                 return JSONResponse(status_code=400, content={"ok": False, "error": "No Poly bids found"})
             poly_best_bid = float(poly_bids[0].get("price", 0))
-            if abs(poly_best_bid - sell_price_decimal) > 0.02:
-                return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly best bid ({poly_best_bid:.4f}) too far from sell price ({sell_price_decimal:.4f})"})
+            poly_check_price = sell_price_decimal if mode == 'bid-sell' else price_decimal
+            if abs(poly_best_bid - poly_check_price) > 0.02:
+                return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly best bid ({poly_best_bid:.4f}) too far from price ({poly_check_price:.4f})"})
         except Exception as e:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly book check: {e}"})
 
     try:
-        await inst.strategy_s.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price), sell_price=float(body.get("sell_price", 0)), side=side, position_pct=int(body.get("position_pct", 100)))
+        await inst.strategy_s.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price), sell_price=float(body.get("sell_price", 0)), mode=body.get("mode", "classic"), side=side, position_pct=int(body.get("position_pct", 100)))
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -1207,11 +1214,11 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
         try:
             r = await inst.poly_monitor.start(
                 poly_token_id=monitor["poly_token_id"],
-                reference_price=sell_price_decimal,
+                reference_price=monitor_ref,
                 depth_threshold=float(monitor.get("depth_threshold", 10000)),
             )
             if r and r.get("ok"):
-                inst.poly_monitor.set_strategy_context("manual-s", int(sell_price_val), asset_id)
+                inst.poly_monitor.set_strategy_context("manual-s", int(sell_price_val) if mode == "bid-sell" else int(price), asset_id)
         except Exception as e:
             import logging; import sys
             logging.getLogger(__name__).warning(f"Monitor start error: {e}")
