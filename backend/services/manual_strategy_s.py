@@ -44,6 +44,8 @@ class ManualStateS:
     consecutive_failures: int = 0
     notified_fills: Set[str] = field(default_factory=set)  # order IDs already notified
     position_pct: int = 100  # % of available balance to deploy
+    scan_interval: int = 10  # seconds between main loop scans
+    stabilize_secs: int = 10  # seconds for rebalance stabilization
     logs: list = field(default_factory=list)
 
 
@@ -100,7 +102,7 @@ class ManualStrategyS:
         logger.info(msg)
 
     async def start(self, market_id: str, yes_asset_id: str, no_asset_id: str,
-                    side: str, price_a: float, sell_price: float = 0, mode: str = "classic", size: int = 0, position_pct: int = 100):
+                    side: str, price_a: float, sell_price: float = 0, mode: str = "classic", size: int = 0, position_pct: int = 100, scan_interval: int = 10, stabilize_secs: int = 10):
         """Start single-side strategy."""
         if self.state.running:
             return
@@ -126,6 +128,8 @@ class ManualStrategyS:
         self.state.sell_price = int(sell_price) if sell_price > 0 else a + 1
         self.state.mode = mode
         self.state.position_pct = max(1, min(100, position_pct))
+        self.state.scan_interval = max(3, min(120, scan_interval))
+        self.state.stabilize_secs = max(5, min(120, stabilize_secs))
         self.state.consecutive_failures = 0
 
         import time as _time
@@ -204,7 +208,7 @@ class ManualStrategyS:
         try:
             await self._deploy_balance()
             while self.state.running:
-                await asyncio.sleep(10)
+                await asyncio.sleep(self.state.scan_interval)
                 if not self.state.running:
                     break
                 # Fetch both closed AND open orders to catch partial fills
