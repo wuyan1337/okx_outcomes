@@ -387,6 +387,8 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         strategy = "manual-s"
     return {
         "manual_running": inst.strategy_d.running,
+        "manual_d_scan_interval": getattr(inst.strategy_d.state, "scan_interval", 10) if inst.strategy_d.running else 10,
+        "manual_d_stabilize_secs": getattr(inst.strategy_d.state, "stabilize_secs", 10) if inst.strategy_d.running else 10,
         "manual_s_running": inst.strategy_s.running,
         "sniper_running": inst.sniper.running,
         "sniper_status": inst.sniper.state.status if inst.sniper.running else "stopped",
