@@ -53,7 +53,6 @@ class PolyMonitor:
         self.auto_rebalance = None       # AutoRebalance instance (set by AccountInstance)
         self._strategy_type = ""         # "manual-s" or "manual-d" (set on start)
         self._strategy_mode = "classic"   # "classic" or "bid-sell"
-        self._strategy_mode = "classic"   # "classic" or "bid-sell"
         self._old_price_cents = 0        # Strategy price when monitor started
 
     @property
@@ -214,8 +213,11 @@ class PolyMonitor:
            Trigger immediately - no depth check needed.
         B) Price ROSE (current_bid > ref): someone is buying aggressively.
            Only trigger if depth at new best bid >= threshold (confirms real move).
+           For bid-sell mode: ROSE also triggers (need to rebalance up to capture higher spread).
         """
-        ref = self.state.reference_price
+        # Truncate both to cents (ignore 3rd decimal from Poly)
+        current_bid = int(current_bid * 100) / 100.0
+        ref = int(self.state.reference_price * 100) / 100.0
         if ref <= 0:
             return
 
@@ -247,14 +249,7 @@ class PolyMonitor:
             return
 
         # CONDITION B: Price rose (bid > reference)
-        # In bid-sell mode, ROSE means our sell is MORE likely to fill - skip trigger
-        if self._strategy_mode == "bid-sell" and current_bid > ref + 0.005:
-            logger.info(
-                f"[PolyMonitor] Bid rose {ref:.3f}->{current_bid:.3f} "
-                f"but bid-sell mode: sell safer at higher bid, ignoring"
-            )
-            return
-
+        # Both classic and bid-sell trigger on ROSE (bid-sell needs to rebalance up)
         # Only trigger if depth at new best bid >= threshold
         if current_bid > ref + 0.005:
             threshold = self.state.depth_threshold
