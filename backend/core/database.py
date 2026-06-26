@@ -91,6 +91,8 @@ PROXY_NODES = {
     "SG1": {"label": "SG1 (Singapore)", "host": "13.213.17.198", "port": 9111},
     "K1": {"label": "K1 (Korea)", "host": "13.125.182.63", "port": 9111},
     "JP3": {"label": "JP3 (Tokyo3)", "host": "3.112.202.198", "port": 9111},
+    "JP4": {"label": "JP4 (AWS Tokyo)", "host": "127.0.0.1", "port": 9114},
+    "JP5": {"label": "JP5 (AWS Tokyo)", "host": "127.0.0.1", "port": 9115},
 }
 
 
