@@ -65,6 +65,8 @@ class AccountInstance:
                 "side": self.strategy_s.state.side,
                 "price_cents": self.strategy_s.state.price_a,
                 "mode": self.strategy_s.state.mode or "classic",
+                "stabilize_secs": self.strategy_s.state.stabilize_secs,
+                "scan_interval": self.strategy_s.state.scan_interval,
             }
         elif self.strategy_d.state.running or self.strategy_d.state.yes_asset_id:
             return {
@@ -75,6 +77,8 @@ class AccountInstance:
                 "asset_id": self.strategy_d.state.yes_asset_id,
                 "side": "yes",
                 "price_cents": self.strategy_d.state.price_a,
+                "stabilize_secs": self.strategy_d.state.stabilize_secs,
+                "scan_interval": self.strategy_d.state.scan_interval,
             }
         return {}
 
@@ -86,6 +90,8 @@ class AccountInstance:
 
         if strategy_type == "manual-s":
             pct = self.strategy_s.state.position_pct if self.strategy_s.state.position_pct else 100
+            scan_int = self.strategy_s.state.scan_interval if hasattr(self.strategy_s.state, 'scan_interval') else 10
+            stab_secs = self.strategy_s.state.stabilize_secs if hasattr(self.strategy_s.state, 'stabilize_secs') else 10
             mode = self.strategy_s.state.mode or "classic"
             old_spread = self.strategy_s.state.sell_price - self.strategy_s.state.price_a if self.strategy_s.state.sell_price > 0 else 1
 
@@ -110,15 +116,21 @@ class AccountInstance:
                 sell_price=float(new_sell),
                 mode=mode,
                 position_pct=pct,
+                scan_interval=scan_int,
+                stabilize_secs=stab_secs,
             )
         elif strategy_type == "manual-d":
             pct = self.strategy_d.state.position_pct if self.strategy_d.state.position_pct else 100
+            scan_int = self.strategy_d.state.scan_interval if hasattr(self.strategy_d.state, 'scan_interval') else 10
+            stab_secs = self.strategy_d.state.stabilize_secs if hasattr(self.strategy_d.state, 'stabilize_secs') else 10
             await self.strategy_d.start(
                 market_id=params["market_id"],
                 yes_asset_id=params["yes_asset_id"],
                 no_asset_id=params["no_asset_id"],
                 price_a=float(new_price_cents),
                 position_pct=pct,
+                scan_interval=scan_int,
+                stabilize_secs=stab_secs,
             )
 
     async def _restart_monitor(self, reference_price: float, poly_token_id: str):
