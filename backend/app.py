@@ -403,6 +403,8 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         "manual_s_asset_id": getattr(inst.strategy_s.state, "asset_id", None) if inst.strategy_s.running else None,
         "manual_s_yes_asset_id": getattr(inst.strategy_s.state, "yes_asset_id", None) if inst.strategy_s.running else None,
         "manual_s_position_pct": getattr(inst.strategy_s.state, "position_pct", 100) if inst.strategy_s.running else 100,
+        "manual_s_scan_interval": getattr(inst.strategy_s.state, "scan_interval", 10) if inst.strategy_s.running else 10,
+        "manual_s_stabilize_secs": getattr(inst.strategy_s.state, "stabilize_secs", 10) if inst.strategy_s.running else 10,
 
         "strategy": strategy or "none",
         "running": inst.strategy_d.running or inst.strategy_s.running or inst.sniper.running,
@@ -973,7 +975,7 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly book check: {e}"})
 
     try:
-        await inst.strategy_d.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price))
+        await inst.strategy_d.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price), position_pct=int(body.get("position_pct", 100)), scan_interval=int(body.get("scan_interval", 10)), stabilize_secs=int(body.get("stabilize_secs", 10)))
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -1208,7 +1210,7 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly book check: {e}"})
 
     try:
-        await inst.strategy_s.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price), sell_price=float(body.get("sell_price", 0)), mode=body.get("mode", "classic"), side=side, position_pct=int(body.get("position_pct", 100)))
+        await inst.strategy_s.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price), sell_price=float(body.get("sell_price", 0)), mode=body.get("mode", "classic"), side=side, position_pct=int(body.get("position_pct", 100)), scan_interval=int(body.get("scan_interval", 10)), stabilize_secs=int(body.get("stabilize_secs", 10)))
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
