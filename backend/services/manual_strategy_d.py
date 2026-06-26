@@ -46,6 +46,8 @@ class ManualStateD:
     total_profit: float = 0.0
     consecutive_failures: int = 0
     position_pct: int = 100
+    scan_interval: int = 10  # seconds between main loop scans
+    stabilize_secs: int = 10  # seconds for rebalance stabilization
     logs: list = field(default_factory=list)
     notified_fills: Set[str] = field(default_factory=set)  # order IDs already notified
 
@@ -104,7 +106,7 @@ class ManualStrategyD:
         logger.info(msg)
 
     async def start(self, market_id: str, yes_asset_id: str, no_asset_id: str,
-                    price_a: float, size: int = 0, position_pct: int = 100):
+                    price_a: float, size: int = 0, position_pct: int = 100, scan_interval: int = 10, stabilize_secs: int = 10):
         """Start the spread strategy."""
         if self.state.running:
             return
@@ -121,6 +123,8 @@ class ManualStrategyD:
         self.state.no_asset_id = no_asset_id
         self.state.price_a = a
         self.state.position_pct = max(1, min(100, position_pct))
+        self.state.scan_interval = max(3, min(120, scan_interval))
+        self.state.stabilize_secs = max(5, min(120, stabilize_secs))
         self.state.price_b = 99 - a
         self.state.sell_a = a + 1
         self.state.sell_b = 100 - a
@@ -260,7 +264,7 @@ class ManualStrategyD:
             await self._deploy_balance()
 
             while self.state.running:
-                await asyncio.sleep(10)
+                await asyncio.sleep(self.state.scan_interval)
                 if not self.state.running:
                     break
 
