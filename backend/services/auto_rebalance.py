@@ -159,11 +159,15 @@ class AutoRebalance:
             # where sells were cancelled but the underlying position still exists)
             await self._reconcile_with_position(old_price_cents)
 
+            # Get stabilize_secs from strategy params (per-strategy configurable)
+            params_pre = self.get_strategy_params() if self.get_strategy_params else {}
+            stabilize_secs = params_pre.get("stabilize_secs", 10)
+
             # Step 1: Notify start
-            await self._notify(f"🔄 Auto-Rebalance 开始观察 (5s)\nTrigger: {trigger_reason}")
+            await self._notify(f"🔄 Auto-Rebalance 开始观察 ({stabilize_secs}s)\nTrigger: {trigger_reason}")
 
             # Step 2: Wait for stable price
-            new_price_decimal = await self._wait_for_stable_price(poly_token_id)
+            new_price_decimal = await self._wait_for_stable_price(poly_token_id, stabilize_secs=stabilize_secs)
             if new_price_decimal is None:
                 await self._notify("❌ Auto-Rebalance 失败: 观察期内价格未稳定，需手动处理")
                 self._rebalancing = False
@@ -318,13 +322,15 @@ class AutoRebalance:
         except Exception as e:
             logger.warning(f"[Rebalance] reconcile_with_position error: {e}")
 
-    async def _wait_for_stable_price(self, poly_token_id: str) -> Optional[float]:
-        """Poll Poly every 5s. Need 12 consecutive readings at same price (within tolerance).
+    async def _wait_for_stable_price(self, poly_token_id: str, stabilize_secs: int = 10) -> Optional[float]:
+        """Poll Poly every 5s. Need consecutive readings at same price (within tolerance).
+        stabilize_secs controls how many seconds of stable price needed.
         Returns stable price as decimal, or None if not stabilized within max attempts."""
         import aiohttp
 
         consecutive = 0
         stable_price = None
+        stabilize_count = max(1, stabilize_secs // STABILIZE_INTERVAL)  # e.g. 10s / 5s = 2 consecutive
         max_total_checks = 36  # 3 minutes max (36 * 5s)
 
         for _ in range(max_total_checks):
@@ -358,7 +364,7 @@ class AutoRebalance:
                 stable_price = current_bid
                 consecutive = 1
 
-            if consecutive >= STABILIZE_COUNT:
+            if consecutive >= stabilize_count:
                 return stable_price
 
         return None  # Did not stabilize
