@@ -502,7 +502,7 @@ class PolySniperOld:
             await self._notify(f"\u26a0\ufe0f \u6302\u5356\u5f02\u5e38: {e}")
 
         # Start holding loop (timeout monitoring)
-        asyncio.create_task(self._holding_loop())
+        self._hold_task = asyncio.create_task(self._holding_loop())
 
     async def _execute_buy(self, side: str, poly_new_price: float, initial_price: float = 0.0):
         """Buy on OKX immediately. LEGACY — kept for compatibility but new flow uses _execute_buy_immediate + _post_sell_at_price."""
