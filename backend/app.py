@@ -550,6 +550,8 @@ async def stop_strategy(account_id: str, user: str = Depends(verify_auth)):
         await inst.strategy_s.stop()
     if inst.sniper.running:
         await inst.sniper.stop()
+    if inst.sniper_old.running:
+        await inst.sniper_old.stop()
     # Always stop monitor when strategy stops (monitor is bound to strategy)
     if inst.poly_monitor.running or inst.poly_monitor.state.enabled:
         await inst.poly_monitor.stop()
@@ -571,6 +573,8 @@ async def account_cancel_all(account_id: str, user: str = Depends(verify_auth)):
             await inst.strategy_d.stop()
         if inst.sniper.running:
             await inst.sniper.stop()
+        if inst.sniper_old.running:
+            await inst.sniper_old.stop()
         if inst.poly_monitor.running:
             await inst.poly_monitor.stop()
 
@@ -912,6 +916,8 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
         return JSONResponse(status_code=400, content={"ok": False, "error": "Manual-S is running. Stop it first."})
     if inst.sniper.running:
         return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper is running. Stop it first."})
+    if inst.sniper_old.running:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper-Old is running. Stop it first."})
     body = await request.json()
     asset_id = body.get("asset_id", "")
     price = body.get("price", 0)
@@ -1075,8 +1081,8 @@ async def sniper_start(account_id: str, request: Request, user: str = Depends(ve
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
-    if inst.strategy_s.running or inst.strategy_d.running:
-        return {"ok": False, "error": "Cannot run sniper while MD/MS is active"}
+    if inst.strategy_s.running or inst.strategy_d.running or inst.sniper_old.running:
+        return {"ok": False, "error": "Cannot run sniper while another strategy is active"}
     body = await request.json()
     result = await inst.sniper.start(
         yes_token_id=body.get("yes_token_id", ""),
@@ -1118,8 +1124,8 @@ async def sniper_old_start(account_id: str, request: Request, user: str = Depend
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
-    if inst.strategy_s.running or inst.strategy_d.running:
-        return {"ok": False, "error": "Cannot run sniper-old while MD/MS is active"}
+    if inst.strategy_s.running or inst.strategy_d.running or inst.sniper.running:
+        return {"ok": False, "error": "Cannot run sniper-old while another strategy is active"}
     body = await request.json()
     result = await inst.sniper_old.start(
         yes_token_id=body.get("yes_token_id", ""),
@@ -1187,6 +1193,8 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
         return JSONResponse(status_code=400, content={"ok": False, "error": "Manual-D is running. Stop it first."})
     if inst.sniper.running:
         return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper is running. Stop it first."})
+    if inst.sniper_old.running:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper-Old is running. Stop it first."})
     body = await request.json()
     asset_id = body.get("asset_id", "")
     price = body.get("price", 0)
