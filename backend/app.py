@@ -656,6 +656,8 @@ async def account_flash_close(account_id: str, user: str = Depends(verify_auth))
             await inst.strategy_d.stop()
         if inst.sniper.running:
             await inst.sniper.stop()
+        if inst.sniper_old.running:
+            await inst.sniper_old.stop()
         if inst.poly_monitor.running:
             await inst.poly_monitor.stop()
 
