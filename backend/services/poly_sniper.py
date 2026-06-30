@@ -23,7 +23,7 @@ POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 @dataclass
 class SniperConfig:
     threshold_cents: int = 40       # Jump threshold in cents
-    ask_levels: int = 99             # How many ask levels to eat
+    buy_limit_cents: int = 50    # Max buy price in cents
     position_pct: int = 100         # Balance percentage to use
     timeout_secs: int = 120         # Seconds before forced exit
     settle_ms: int = 0           # Ms to wait for price to stabilize after jump
@@ -92,7 +92,7 @@ class PolySniper:
 
     async def start(self, yes_token_id: str, no_token_id: str,
                     yes_asset_id: str, no_asset_id: str, market_id: str,
-                    threshold_cents: int = 40, ask_levels: int = 99,
+                    threshold_cents: int = 40, buy_limit_cents: int = 50,
                     position_pct: int = 100, timeout_secs: int = 120,
                     settle_ms: int = 0, window_ms: int = 50,
                     poly_url: str = "", selected_outcome: str = ""):
@@ -101,7 +101,7 @@ class PolySniper:
             return {"ok": False, "error": "Already running"}
 
         self.config.threshold_cents = threshold_cents
-        self.config.ask_levels = ask_levels
+        self.config.buy_limit_cents = buy_limit_cents
         self.config.position_pct = position_pct
         self.config.timeout_secs = timeout_secs
         self.config.settle_ms = settle_ms
@@ -923,7 +923,7 @@ class PolySniper:
             } if self.state.settling else None,
             "config": {
                 "threshold_cents": self.config.threshold_cents,
-                "ask_levels": self.config.ask_levels,
+                "buy_limit_cents": self.config.buy_limit_cents,
                 "position_pct": self.config.position_pct,
                 "timeout_secs": self.config.timeout_secs,
                 "settle_ms": self.config.settle_ms,
