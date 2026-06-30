@@ -542,7 +542,7 @@ class PolySniper:
             return
 
         # Take levels from SNAPSHOT, only those cheaper than poly price
-        levels = [l for l in snapshot_asks[:self.config.ask_levels] if float(l[0]) < poly_new_price]
+        levels = [l for l in snapshot_asks if float(l[0]) < poly_new_price]
         if not levels:
             self.log(f"No asks below poly price {poly_new_price:.3f}, skipping")
             await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: \u65e0\u6df1\u5ea6")
