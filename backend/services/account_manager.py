@@ -14,6 +14,7 @@ from .manual_strategy_s import ManualStrategyS
 from .poly_monitor import PolyMonitor
 from .auto_rebalance import AutoRebalance
 from .poly_sniper import PolySniper
+from .poly_sniper_old import PolySniperOld
 from .notifier import TelegramNotifier
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,8 @@ class AccountInstance:
         # Sniper
         self.sniper = PolySniper(client, account_id=account_id)
         self.sniper.account_name = name
+        self.sniper_old = PolySniperOld(client, account_id=account_id)
+        self.sniper_old.account_name = name
         self.strategy_d.auto_rebalance = self.auto_rebalance
         if notifier:
             self.strategy_d.notifier = notifier
@@ -52,6 +55,7 @@ class AccountInstance:
             self.poly_monitor.notifier = notifier
             self.auto_rebalance.notifier = notifier
             self.sniper.notifier = notifier
+            self.sniper_old.notifier = notifier
 
     def _get_strategy_params(self) -> dict:
         """Return current strategy params for auto-rebalance."""
@@ -175,6 +179,8 @@ class AccountInstance:
             await self.poly_monitor.stop()
         if self.sniper.running:
             await self.sniper.stop()
+        if self.sniper_old.running:
+            await self.sniper_old.stop()
         # Cancel ALL open orders on shutdown to prevent orphaned positions
         try:
             await self.client.cancel_all()
@@ -214,6 +220,8 @@ class AccountInstance:
             self.poly_monitor.client = self.client
         if hasattr(self, 'sniper') and self.sniper:
             self.sniper.client = self.client
+        if hasattr(self, 'sniper_old') and self.sniper_old:
+            self.sniper_old.client = self.client
 
 class AccountManager:
     """Manages all account instances."""
