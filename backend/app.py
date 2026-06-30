@@ -386,7 +386,12 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
     if inst.strategy_d.running:
         strategy = "manual"
     elif inst.strategy_s.running:
-        strategy = "manual-s"
+        mode = getattr(inst.strategy_s.state, "mode", "classic")
+        strategy = "bid-sell" if mode == "bid-sell" else "manual-s"
+    elif inst.sniper.running:
+        strategy = "sniper"
+    elif inst.sniper_old.running:
+        strategy = "sniper-old"
     return {
         "manual_running": inst.strategy_d.running,
         "manual_d_scan_interval": getattr(inst.strategy_d.state, "scan_interval", 10) if inst.strategy_d.running else 10,
