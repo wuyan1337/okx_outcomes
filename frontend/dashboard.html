@@ -863,7 +863,7 @@ function msSideChange(){_obNoSide=(document.getElementById("ms-side").value==="N
 function bsSideChange(){_obNoSide=(document.getElementById("bs-side").value==="NO");renderOkxOb();}
 document.addEventListener('click',function(){document.querySelectorAll('.sdrop').forEach(function(d){d.classList.remove('open');});});
 
-async function loadMkts(){try{var r=await api('/api/markets');if(!r.ok){al('ERROR','Markets: '+r.status);return;}var d=await r.json();_mkts=d.markets||[];_mktMap={};_mkts.forEach(function(m){_mktMap[m.yes_asset_id]=m;});sdRender('mkt-list',_mkts,'mkt','mkt-btn');sdRender('smkt-list',_mkts,'smkt','smkt-btn');sdRender('bsmkt-list',_mkts,'bsmkt','bsmkt-btn');sdRender('pmkt-list',_mkts,'pmkt','pmkt-btn');sdRender('tmkt-list',_mkts,'tmkt','tmkt-btn');al('INFO','Loaded '+_mkts.length+' markets');}catch(e){al('ERROR','Failed to load markets');}}
+async function loadMkts(){try{var r=await api('/api/markets');if(!r.ok){al('ERROR','Markets: '+r.status);return;}var d=await r.json();_mkts=d.markets||[];_mktMap={};_mkts.forEach(function(m){_mktMap[m.yes_asset_id]=m;});sdRender('mkt-list',_mkts,'mkt','mkt-btn');sdRender('smkt-list',_mkts,'smkt','smkt-btn');sdRender('bsmkt-list',_mkts,'bsmkt','bsmkt-btn');sdRender('pmkt-list',_mkts,'pmkt','pmkt-btn');sdRender('tmkt-list',_mkts,'tmkt','tmkt-btn');sdRender('somkt-list',_mkts,'somkt','somkt-btn');al('INFO','Loaded '+_mkts.length+' markets');}catch(e){al('ERROR','Failed to load markets');}}
 
 sdInit('sdrop-mkt','mkt','mkt-btn','mkt-list','mkt-q');
 sdInit('sdrop-smkt','smkt','smkt-btn','smkt-list','smkt-q');
