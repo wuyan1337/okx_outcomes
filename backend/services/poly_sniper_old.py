@@ -328,10 +328,11 @@ class PolySniperOld:
                 self.log(f"Settled: {side.upper()} final={final_price:.3f} (from {initial_price:.3f})")
                 # If price reverted below buy cost, stop immediately
                 if final_price <= self.state.buy_price:
-                    self.log(f"Settled price {final_price:.3f} <= buy cost {self.state.buy_price:.2f}, stopping")
-                    await self._notify(f"🚨 settle价 {final_price:.3f} ≤ 成本 {self.state.buy_price:.2f}, 已停止")
-                    self._running = False
-                    self.state.status = "stopped"
+                    self.log(f"Settled price {final_price:.3f} <= buy cost {self.state.buy_price:.2f}, selling at best bid")
+                    asset_id = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
+                    label = "YES" if side == "yes" else "NO"
+                    await self._notify(f"⚠️ settle价 {final_price:.3f} ≤ 成本 {self.state.buy_price:.2f}, 市价出")
+                    await self._handle_timeout(asset_id, label)
                     return
                 # Post sell at settled price
                 await self._post_sell_at_price(final_price)
@@ -756,22 +757,20 @@ class PolySniperOld:
         try:
             book = await self.client.get_orderbook(asset_id, depth=5)
             if str(book.get("code", "")) != "0":
-                await self._notify(f"🚨 超时+无法获取orderbook, 已停止")
-                self.state.status = "stopped"
-                self._running = False
+                await self._notify(f"⚠️ 超时+无法获取orderbook, 继续监控")
+                self._reset_to_monitoring()
                 return
 
             bids = book.get("data", [{}])[0].get("bids", [])
             if not bids:
-                await self._notify(f"🚨 超时+OKX无bid, 已停止")
-                self.state.status = "stopped"
-                self._running = False
+                await self._notify(f"⚠️ 超时+OKX无bid, 继续监控")
+                self._reset_to_monitoring()
                 return
 
             best_bid = float(bids[0][0])
 
-            if best_bid >= self.state.buy_price:
-                # Check how much of sell order already filled (partial fills)
+            # Always attempt to sell at best bid regardless of profit/loss
+            if True:
                 remaining = self.state.buy_size
                 if self.state.sell_order_id:
                     try:
@@ -803,11 +802,7 @@ class PolySniperOld:
                                 if bids2:
                                     best_bid = float(bids2[0][0])
                                     if best_bid < self.state.buy_price:
-                                        self.log(f"Retry {attempt+1}/5: bid={best_bid:.2f} < cost, cannot exit")
-                                        await self._notify(f"🚨 bid={best_bid:.2f} < 成本{self.state.buy_price:.2f}, 已停止")
-                                        self.state.status = "stopped"
-                                        self._running = False
-                                        return
+                                        self.log(f"Retry {attempt+1}/5: bid={best_bid:.2f} < cost, selling at loss")
                         except Exception:
                             pass
                         self.log(f"Retry {attempt+1}/5: trying @{best_bid:.2f}")
@@ -845,25 +840,16 @@ class PolySniperOld:
                         return
                     self.log(f"Attempt {attempt+1}/5: 0 fill")
 
-                # All 5 attempts failed
-                self.log("Timeout: 5 attempts all 0 fill")
-                await self._notify("🚨 超时卖出5次均无成交, 已停止")
-                self.state.status = "stopped"
-                self._running = False
-            else:
-                # Cannot breakeven
-                self.log(f"Cannot breakeven: bid={best_bid:.2f} < cost={self.state.buy_price:.2f}")
-                await self._notify(
-                    f"🚨 bid={best_bid:.2f} < 成本{self.state.buy_price:.2f}, 已停止"
-                )
-                self.state.status = "stopped"
-                self._running = False
+                # All 5 attempts failed — resume monitoring
+                self.log("Timeout: 5 attempts all 0 fill, resuming monitoring")
+                await self._notify("⚠️ 卖出5次均无成交, 继续监控")
+                self._reset_to_monitoring()
+
 
         except Exception as e:
             self.log(f"Timeout handling error: {e}")
-            await self._notify(f"🚨 超时处理异常: {e}, 已停止")
-            self.state.status = "stopped"
-            self._running = False
+            await self._notify(f"⚠️ 超时处理异常: {e}, 继续监控")
+            self._reset_to_monitoring()
 
     def _reset_to_monitoring(self):
         """Reset state back to monitoring."""
