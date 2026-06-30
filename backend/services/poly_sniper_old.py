@@ -23,7 +23,7 @@ POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 @dataclass
 class SniperOldConfig:
     threshold_cents: int = 40       # Jump threshold in cents
-    ask_levels: int = 1             # How many ask levels to eat
+    ask_levels: int = 5             # How many ask levels to eat
     position_pct: int = 100         # Balance percentage to use
     timeout_secs: int = 120         # Seconds before forced exit
     settle_ms: int = 1000           # Ms to wait for price to stabilize after jump
@@ -92,7 +92,7 @@ class PolySniperOld:
 
     async def start(self, yes_token_id: str, no_token_id: str,
                     yes_asset_id: str, no_asset_id: str, market_id: str,
-                    threshold_cents: int = 40, ask_levels: int = 1,
+                    threshold_cents: int = 40, ask_levels: int = 5,
                     position_pct: int = 100, timeout_secs: int = 120,
                     settle_ms: int = 1000, window_ms: int = 500,
                     poly_url: str = "", selected_outcome: str = ""):
