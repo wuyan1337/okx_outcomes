@@ -551,7 +551,7 @@ async function confirmDeleteAcct(){if(!confirm('Delete this account? This will f
 
 
 // Tabs
-function stab(n){_activeTab=n;document.querySelectorAll('#view-acct .tab').forEach(function(t){t.className=parseInt(t.getAttribute('data-tab'))===n?'tab active':'tab';});for(var i=0;i<5;i++){var el=document.getElementById('t'+i);if(el)el.className=i===n?'tc active':'tc';}
+function stab(n){_activeTab=n;document.querySelectorAll('#view-acct .tab').forEach(function(t){t.className=parseInt(t.getAttribute('data-tab'))===n?'tab active':'tab';});for(var i=0;i<6;i++){var el=document.getElementById('t'+i);if(el)el.className=i===n?'tc active':'tc';}
 _activeTab=n;
 /* Clear non-running tabs' selections */
 if(n!==0&&!MR&&!MSR&&!PR){document.getElementById('mkt').value='';document.getElementById('mkt-btn').textContent='-- Select market --';document.getElementById('mp').value='';document.getElementById('cn').textContent='NO price = 99 - a = --';resetMonitor('md-mon-');}
