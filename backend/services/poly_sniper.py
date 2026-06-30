@@ -346,9 +346,9 @@ class PolySniper:
 
     # ─── Execution ───
 
-    async def _execute_buy_immediate(self, side: str, asset_id: str, snapshot_asks: list,
+    async def _execute_buy_immediate(self, side: str, asset_id: str,
                                       prev_bid: float, current_bid: float) -> bool:
-        """Buy on OKX immediately using snapshot asks. Returns True if filled."""
+        """Buy on OKX at buy_limit price. GTC sweeps all asks <= limit."""
         self.state.status = "holding"
         label = "YES" if side == "yes" else "NO"
         jump_c = round((current_bid - prev_bid) * 100)
@@ -356,19 +356,17 @@ class PolySniper:
             f"\u26a1 {label} \u8df3\u4ef7: {prev_bid:.3f}\u2192{current_bid:.3f} (+{jump_c}\u00a2)"
         )
 
-        # Take levels from SNAPSHOT, but only those cheaper than poly price
-        levels = [l for l in snapshot_asks[:self.config.ask_levels] if float(l[0]) < current_bid]
-        if not levels:
-            self.log(f"No asks below poly price {current_bid:.3f}, skipping")
-            await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: \u65e0\u6df1\u5ea6")
+        buy_limit = self.config.buy_limit_cents / 100.0
+        # Sanity: buy_limit must be below poly price (otherwise no profit margin)
+        if buy_limit >= current_bid:
+            self.log(f"Buy limit {buy_limit:.2f} >= poly {current_bid:.3f}, no arb margin, skipping")
+            await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: limit\u2265poly\u4ef7")
             self.state.status = "monitoring"
             return False
-        max_price = float(levels[-1][0])
-        total_ask_size = sum(float(lvl[1]) for lvl in levels)
 
-        self.log(f"Executing immediate buy: ask levels={len(levels)}, max_price={max_price:.2f}")
+        self.log(f"Executing buy: limit={buy_limit:.2f}, poly={current_bid:.3f}")
 
-        # Calculate buy size
+        # Calculate buy size from balance
         try:
             bal_resp = await self.client.get_balance()
             available = 0.0
@@ -379,11 +377,10 @@ class PolySniper:
                         break
 
             budget = available * (self.config.position_pct / 100.0)
-            max_units = int(budget / max_price)
-            buy_size = min(max_units, int(total_ask_size))
+            buy_size = int(budget / buy_limit)
 
             if buy_size < 1:
-                self.log(f"Insufficient balance or size too small: avail={available}, budget={budget}")
+                self.log(f"Insufficient balance: avail={available}, budget={budget}, limit={buy_limit}")
                 await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: \u4f59\u989d\u4e0d\u8db3")
                 self.state.status = "monitoring"
                 return False
@@ -394,8 +391,8 @@ class PolySniper:
             self.state.status = "monitoring"
             return False
 
-        # Place IOC buy order
-        price_str = f"{max_price:.2f}"
+        # Place GTC limit buy — sweeps all asks <= buy_limit
+        price_str = f"{buy_limit:.2f}"
         try:
             resp = await self.client.place_order(
                 asset_id=asset_id,
@@ -420,12 +417,10 @@ class PolySniper:
 
         # Check fill - poll open+closed orders (GTC may partially fill)
         filled_size = 0.0
-        fill_price = max_price
-        _found_oid = ""
+        fill_price = buy_limit
         for _attempt in range(4):
             await asyncio.sleep(1)
             try:
-                # Check both closed and open orders for fills
                 for _status in ("closed", "open"):
                     orders = await self.client.get_orders(status=_status)
                     if str(orders.get("code", "")) == "0":
@@ -437,8 +432,7 @@ class PolySniper:
                                 float(o.get("filledSize", "0") or "0") > 0):
                                 filled_size = float(o.get("filledSize", "0") or "0")
                                 filled_amt = float(o.get("filledAmount", "0") or "0")
-                                fill_price = filled_amt / filled_size if filled_amt > 0 else max_price
-                                _found_oid = o.get("id", "") or o.get("oid", "")
+                                fill_price = filled_amt / filled_size if filled_amt > 0 else buy_limit
                                 break
                     if filled_size > 0:
                         break
@@ -454,7 +448,7 @@ class PolySniper:
             pass
 
         if filled_size < 1:
-            self.log("Buy order got 0 fill — no liquidity")
+            self.log("Buy order got 0 fill — no liquidity below limit")
             await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: \u65e0\u6df1\u5ea6")
             self.state.status = "monitoring"
             return False
