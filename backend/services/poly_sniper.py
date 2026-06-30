@@ -26,8 +26,8 @@ class SniperConfig:
     ask_levels: int = 1             # How many ask levels to eat
     position_pct: int = 100         # Balance percentage to use
     timeout_secs: int = 120         # Seconds before forced exit
-    settle_ms: int = 1000           # Ms to wait for price to stabilize after jump
-    window_ms: int = 500            # Rolling window for cumulative jump detection
+    settle_ms: int = 0           # Ms to wait for price to stabilize after jump
+    window_ms: int = 50            # Rolling window for cumulative jump detection
 
 
 @dataclass
@@ -94,7 +94,7 @@ class PolySniper:
                     yes_asset_id: str, no_asset_id: str, market_id: str,
                     threshold_cents: int = 40, ask_levels: int = 1,
                     position_pct: int = 100, timeout_secs: int = 120,
-                    settle_ms: int = 1000, window_ms: int = 500,
+                    settle_ms: int = 0, window_ms: int = 50,
                     poly_url: str = "", selected_outcome: str = ""):
         """Start sniper monitoring."""
         if self._running:
