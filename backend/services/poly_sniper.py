@@ -315,7 +315,13 @@ class PolySniper:
                 self.state.settling = False
                 self.log(f"Settled: {side.upper()} final={final_price:.3f} (from {initial_price:.3f})")
                 # If price reverted below buy cost, stop immediately
-                if final_price <= self.state.buy_price:                    self.log(f"Settled price {final_price:.3f} <= buy cost {self.state.buy_price:.2f}, selling at best bid")                    asset_id = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id                    label = "YES" if side == "yes" else "NO"                    await self._notify(f"u26a0ufe0f settleu4ef7 {final_price:.3f} u2264 u6210u672c {self.state.buy_price:.2f}, u5e02u4ef7u51fa")                    await self._handle_timeout(asset_id, label)                    return
+                if final_price <= self.state.buy_price:
+                    self.log(f"Settled price {final_price:.3f} <= buy cost {self.state.buy_price:.2f}, selling at best bid")
+                    asset_id = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
+                    label = "YES" if side == "yes" else "NO"
+                    await self._notify(f"⚠️ settle价 {final_price:.3f} ≤ 成本 {self.state.buy_price:.2f}, 市价出")
+                    await self._handle_timeout(asset_id, label)
+                    return
                 # Post sell at settled price
                 await self._post_sell_at_price(final_price)
                 return
