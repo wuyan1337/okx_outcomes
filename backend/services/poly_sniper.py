@@ -287,21 +287,9 @@ class PolySniper:
         if jump_cents >= self.config.threshold_cents:
             self._price_window[side] = []  # Reset window after trigger
             self.log(f"JUMP detected: {side.upper()} {window_low:.3f} → {current_bid:.3f} (+{jump_cents}¢) within {self.config.window_ms}ms, buying immediately...")
-            # IMMEDIATELY snapshot OKX orderbook and BUY before it catches up
+            # BUY at buy_limit price immediately
             okx_asset = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
-            snapshot_asks = await self._snapshot_okx_asks(okx_asset)
-            if not snapshot_asks:
-                self.log("OKX snapshot failed — no asks, skipping")
-                return
-            snapshot_best_ask = float(snapshot_asks[0][0])
-            # Sanity: if OKX already caught up (best ask >= poly new price), no arb
-            if snapshot_best_ask >= current_bid:
-                self.log(f"OKX already caught up: ask={snapshot_best_ask:.2f} >= poly={current_bid:.3f}, skipping")
-                return
-            self.log(f"OKX snapshot: best ask={snapshot_best_ask:.2f} (poly={current_bid:.3f}, spread={round((current_bid - snapshot_best_ask)*100)}¢)")
-
-            # BUY FIRST — execute immediately at snapshot prices
-            bought = await self._execute_buy_immediate(side, okx_asset, snapshot_asks, window_low, current_bid)
+            bought = await self._execute_buy_immediate(side, okx_asset, window_low, current_bid)
             if not bought:
                 return
 
