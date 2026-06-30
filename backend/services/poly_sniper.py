@@ -357,12 +357,6 @@ class PolySniper:
         )
 
         buy_limit = self.config.buy_limit_cents / 100.0
-        # Sanity: buy_limit must be below poly price (otherwise no profit margin)
-        if buy_limit >= current_bid:
-            self.log(f"Buy limit {buy_limit:.2f} >= poly {current_bid:.3f}, no arb margin, skipping")
-            await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: limit\u2265poly\u4ef7")
-            self.state.status = "monitoring"
-            return False
 
         self.log(f"Executing buy: limit={buy_limit:.2f}, poly={current_bid:.3f}")
 
