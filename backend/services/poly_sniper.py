@@ -146,7 +146,7 @@ class PolySniper:
 
         self._running = True
         self._task = asyncio.create_task(self._monitor_loop())
-        self.log(f"Started: threshold={threshold_cents}¢, levels={ask_levels}, pct={position_pct}%, settle={settle_ms}ms, window={window_ms}ms")
+        self.log(f"Started: threshold={threshold_cents}¢, buy_limit={buy_limit_cents}¢, pct={position_pct}%, settle={settle_ms}ms, window={window_ms}ms")
         return {"ok": True}
 
     async def stop(self):
