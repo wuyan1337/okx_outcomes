@@ -430,31 +430,43 @@ class PolySniper:
             self.state.status = "monitoring"
             return False
 
-        # Check fill - poll closed orders (IOC settles on-chain, may take 1-3s)
+        # Check fill - poll open+closed orders (GTC may partially fill)
         filled_size = 0.0
         fill_price = max_price
+        _found_oid = ""
         for _attempt in range(4):
             await asyncio.sleep(1)
             try:
-                orders = await self.client.get_orders(status="closed")
-                if str(orders.get("code", "")) == "0":
-                    for o in orders.get("data", {}).get("list", []):
-                        if _buy_client_oid and o.get("clientOrderId") != _buy_client_oid:
-                            continue
-                        if (o.get("assetId") == asset_id and
-                            o.get("side", "").upper() == "BUY" and
-                            float(o.get("filledSize", "0") or "0") > 0):
-                            filled_size = float(o.get("filledSize", "0") or "0")
-                            filled_amt = float(o.get("filledAmount", "0") or "0")
-                            fill_price = filled_amt / filled_size if filled_amt > 0 else max_price
-                            break
+                # Check both closed and open orders for fills
+                for _status in ("closed", "open"):
+                    orders = await self.client.get_orders(status=_status)
+                    if str(orders.get("code", "")) == "0":
+                        for o in orders.get("data", {}).get("list", []):
+                            if _buy_client_oid and o.get("clientOrderId") != _buy_client_oid:
+                                continue
+                            if (o.get("assetId") == asset_id and
+                                o.get("side", "").upper() == "BUY" and
+                                float(o.get("filledSize", "0") or "0") > 0):
+                                filled_size = float(o.get("filledSize", "0") or "0")
+                                filled_amt = float(o.get("filledAmount", "0") or "0")
+                                fill_price = filled_amt / filled_size if filled_amt > 0 else max_price
+                                _found_oid = o.get("id", "") or o.get("oid", "")
+                                break
+                    if filled_size > 0:
+                        break
                 if filled_size > 0:
                     break
             except Exception as e:
                 self.log(f"Fill check error: {e}")
 
+        # Cancel any remaining open portion of the GTC buy
+        try:
+            await self.client.cancel_all([])
+        except Exception:
+            pass
+
         if filled_size < 1:
-            self.log("IOC order got 0 fill \u2014 OKX already moved or no liquidity")
+            self.log("Buy order got 0 fill — no liquidity")
             await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: \u65e0\u6df1\u5ea6")
             self.state.status = "monitoring"
             return False
