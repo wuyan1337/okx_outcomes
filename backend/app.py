@@ -1110,6 +1110,49 @@ async def sniper_status(account_id: str, user: str = Depends(verify_auth)):
     return inst.sniper.get_state()
 
 
+@app.post("/api/accounts/{account_id}/sniper-old/start")
+async def sniper_old_start(account_id: str, request: Request, user: str = Depends(verify_auth)):
+    inst = manager.get_instance(account_id)
+    if not inst:
+        raise HTTPException(404, "Account not found")
+    if inst.strategy_s.running or inst.strategy_d.running:
+        return {"ok": False, "error": "Cannot run sniper-old while MD/MS is active"}
+    body = await request.json()
+    result = await inst.sniper_old.start(
+        yes_token_id=body.get("yes_token_id", ""),
+        no_token_id=body.get("no_token_id", ""),
+        yes_asset_id=body.get("yes_asset_id", ""),
+        no_asset_id=body.get("no_asset_id", ""),
+        market_id=body.get("market_id", ""),
+        threshold_cents=int(body.get("threshold_cents", 40)),
+        ask_levels=int(body.get("ask_levels", 5)),
+        position_pct=int(body.get("position_pct", 100)),
+        timeout_secs=int(body.get("timeout_secs", 120)),
+        settle_ms=int(body.get("settle_ms", 1000)),
+        window_ms=int(body.get("window_ms", 500)),
+        poly_url=body.get("poly_url", ""),
+        selected_outcome=body.get("selected_outcome", ""),
+    )
+    return result
+
+
+@app.post("/api/accounts/{account_id}/sniper-old/stop")
+async def sniper_old_stop(account_id: str, user: str = Depends(verify_auth)):
+    inst = manager.get_instance(account_id)
+    if not inst:
+        raise HTTPException(404, "Account not found")
+    await inst.sniper_old.stop()
+    return {"ok": True}
+
+
+@app.get("/api/accounts/{account_id}/sniper-old/status")
+async def sniper_old_status(account_id: str, user: str = Depends(verify_auth)):
+    inst = manager.get_instance(account_id)
+    if not inst:
+        raise HTTPException(404, "Account not found")
+    return inst.sniper_old.get_state()
+
+
 
 
 @app.post("/api/accounts/{account_id}/monitor/stop")
