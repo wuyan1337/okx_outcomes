@@ -414,7 +414,7 @@ class PolySniper:
                 side="buy",
                 price=price_str,
                 size=str(buy_size),
-                tif="ioc",
+                tif="gtc",
             )
             _buy_client_oid = resp.get("_clientOrderId", "") if isinstance(resp, dict) else ""
             if str(resp.get("code", "")) != "0":
