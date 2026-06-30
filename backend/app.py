@@ -139,6 +139,8 @@ async def get_status(user: str = Depends(verify_auth)):
             running_strategy = "Bid-Sell" if mode == "bid-sell" else "Manual-S"
         elif inst.sniper.running:
             running_strategy = "Sniper"
+        elif inst.sniper_old.running:
+            running_strategy = "Sniper-Old"
         # Get per-account stats for cards
         acct_orders = 0
         acct_positions = 0
@@ -167,7 +169,7 @@ async def get_status(user: str = Depends(verify_auth)):
             "id": inst.account_id,
             "name": inst.name,
             "proxy_node": inst.proxy_node,
-            "running": inst.strategy_d.running or inst.strategy_s.running or inst.sniper.running,
+            "running": inst.strategy_d.running or inst.strategy_s.running or inst.sniper.running or inst.sniper_old.running,
             "strategy": running_strategy,
             "orders": acct_orders,
             "positions": acct_positions,
@@ -391,6 +393,7 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         "manual_d_stabilize_secs": getattr(inst.strategy_d.state, "stabilize_secs", 10) if inst.strategy_d.running else 10,
         "manual_s_running": inst.strategy_s.running,
         "sniper_running": inst.sniper.running,
+        "sniper_old_running": inst.sniper_old.running,
         "sniper_status": inst.sniper.state.status if inst.sniper.running else "stopped",
         "sniper_yes_token": getattr(inst.sniper.state, "yes_token_id", "") if inst.sniper.running else "",
         "sniper_no_token": getattr(inst.sniper.state, "no_token_id", "") if inst.sniper.running else "",
@@ -409,7 +412,7 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         "manual_s_stabilize_secs": getattr(inst.strategy_s.state, "stabilize_secs", 10) if inst.strategy_s.running else 10,
 
         "strategy": strategy or "none",
-        "running": inst.strategy_d.running or inst.strategy_s.running or inst.sniper.running,
+        "running": inst.strategy_d.running or inst.strategy_s.running or inst.sniper.running or inst.sniper_old.running,
         "cycles": inst.strategy_d.cycles + inst.strategy_s.cycles,
         "last_heartbeat": getattr(inst.client, 'last_heartbeat', None),
         "manual_asset_id": inst.strategy_d.state.yes_asset_id if inst.strategy_d.state.running else (inst.strategy_s.state.yes_asset_id if inst.strategy_s.state.running else ''),
