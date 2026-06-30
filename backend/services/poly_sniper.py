@@ -368,8 +368,13 @@ class PolySniper:
             f"\u26a1 {label} \u8df3\u4ef7: {prev_bid:.3f}\u2192{current_bid:.3f} (+{jump_c}\u00a2)"
         )
 
-        # Take N levels from SNAPSHOT (pre-jump prices)
-        levels = snapshot_asks[:self.config.ask_levels]
+        # Take levels from SNAPSHOT, but only those cheaper than poly price
+        levels = [l for l in snapshot_asks[:self.config.ask_levels] if float(l[0]) < current_bid]
+        if not levels:
+            self.log(f"No asks below poly price {current_bid:.3f}, skipping")
+            await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: \u65e0\u6df1\u5ea6")
+            self.state.status = "monitoring"
+            return False
         max_price = float(levels[-1][0])
         total_ask_size = sum(float(lvl[1]) for lvl in levels)
 
