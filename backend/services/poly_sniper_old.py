@@ -23,7 +23,7 @@ POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 @dataclass
 class SniperOldConfig:
     threshold_cents: int = 40       # Jump threshold in cents
-    ask_levels: int = 5             # How many ask levels to eat
+    ask_levels: int = 99            # How many ask levels to eat (99=all)
     position_pct: int = 100         # Balance percentage to use
     timeout_secs: int = 120         # Seconds before forced exit
     settle_ms: int = 1000           # Ms to wait for price to stabilize after jump
@@ -92,7 +92,7 @@ class PolySniperOld:
 
     async def start(self, yes_token_id: str, no_token_id: str,
                     yes_asset_id: str, no_asset_id: str, market_id: str,
-                    threshold_cents: int = 40, ask_levels: int = 5,
+                    threshold_cents: int = 40, ask_levels: int = 99,
                     position_pct: int = 100, timeout_secs: int = 120,
                     settle_ms: int = 1000, window_ms: int = 500,
                     poly_url: str = "", selected_outcome: str = ""):
@@ -369,8 +369,8 @@ class PolySniperOld:
             f"\u26a1 {label} \u8df3\u4ef7: {prev_bid:.3f}\u2192{current_bid:.3f} (+{jump_c}\u00a2)"
         )
 
-        # Take N levels from SNAPSHOT (pre-jump prices)
-        levels = snapshot_asks[:self.config.ask_levels]
+        # Take N levels from SNAPSHOT, only those cheaper than poly price
+        levels = [l for l in snapshot_asks[:self.config.ask_levels] if float(l[0]) < current_bid]
         max_price = float(levels[-1][0])
         total_ask_size = sum(float(lvl[1]) for lvl in levels)
 
@@ -543,8 +543,8 @@ class PolySniperOld:
             self.state.status = "monitoring"
             return
 
-        # Take N levels from SNAPSHOT (pre-jump prices)
-        levels = snapshot_asks[:self.config.ask_levels]
+        # Take N levels from SNAPSHOT, only those cheaper than poly price
+        levels = [l for l in snapshot_asks[:self.config.ask_levels] if float(l[0]) < current_bid]
         # Max price = highest ask level from snapshot
         max_price = float(levels[-1][0])
         # Total available size across snapshot levels
