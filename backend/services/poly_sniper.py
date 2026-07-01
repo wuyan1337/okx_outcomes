@@ -77,6 +77,7 @@ class PolySniper:
         self._running = False
         self._ws_calibrated = {"yes": False, "no": False}
         self._price_window: Dict[str, list] = {"yes": [], "no": []}  # [(timestamp, price), ...]
+        self._baseline: Dict[str, float] = {"yes": 0.0, "no": 0.0}  # Tracks high watermark per side
 
     @property
     def running(self) -> bool:
@@ -108,6 +109,7 @@ class PolySniper:
         self.config.window_ms = window_ms
 
         self._price_window = {"yes": [], "no": []}
+        self._baseline = {"yes": 0.0, "no": 0.0}
         self.state = SniperState(
             status="monitoring",
             yes_token_id=yes_token_id,
@@ -271,7 +273,12 @@ class PolySniper:
         # Skip first WS update per side (calibration — avoids false trigger from stale REST data)
         if not self._ws_calibrated.get(side, False):
             self._ws_calibrated[side] = True
+            self._baseline[side] = current_bid  # Set initial baseline
             return
+
+        # Update baseline (high watermark — only goes up)
+        if current_bid > self._baseline[side]:
+            self._baseline[side] = current_bid
 
         # Rolling window jump detection: check if price moved >= threshold within window_ms
         now = time.monotonic()
@@ -286,6 +293,11 @@ class PolySniper:
         jump_cents = round((current_bid - window_low) * 100)
         if jump_cents >= self.config.threshold_cents:
             self._price_window[side] = []  # Reset window after trigger
+            # Bounce filter: if current price is far below baseline, this is a dead cat bounce during crash
+            baseline = self._baseline[side]
+            if baseline > 0 and current_bid < baseline * 0.7:
+                self.log(f"BOUNCE SKIP: {side.upper()} {window_low:.3f}→{current_bid:.3f} (+{jump_cents}¢) but current {current_bid:.3f} < baseline {baseline:.3f}*0.7={baseline*0.7:.3f}")
+                return
             self.log(f"JUMP detected: {side.upper()} {window_low:.3f} → {current_bid:.3f} (+{jump_cents}¢) within {self.config.window_ms}ms, buying immediately...")
             # BUY at buy_limit price immediately
             okx_asset = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
