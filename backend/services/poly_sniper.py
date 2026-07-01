@@ -474,7 +474,7 @@ class PolySniper:
         self.state.sell_target = sell_price_raw
 
         sell_price_str = f"{sell_price_raw:.{decimals}f}"
-        sell_size_str = f"{filled_size:.10f}".rstrip("0").rstrip(".")
+        sell_size_str = str(int(filled_size))
         try:
             sell_resp = await self.client.place_order(
                 asset_id=asset_id,
@@ -654,7 +654,7 @@ class PolySniper:
         await self._notify(f"✅ 已买入 {label} @{fill_price:.2f} x{int(filled_size)}")
 
         sell_price_str = f"{sell_price_raw:.{decimals}f}"
-        sell_size_str = f"{filled_size:.10f}".rstrip("0").rstrip(".")
+        sell_size_str = str(int(filled_size))
         try:
             sell_resp = await self.client.place_order(
                 asset_id=asset_id,
@@ -788,7 +788,7 @@ class PolySniper:
                     self._reset_to_monitoring()
                     return
                 # Try up to 5 times to exit remaining at best bid
-                size_str = f"{remaining:.10f}".rstrip("0").rstrip(".")
+                size_str = str(int(remaining))
                 for attempt in range(5):
                     # Re-scan orderbook for fresh best bid (except first attempt)
                     if attempt > 0:
@@ -817,14 +817,20 @@ class PolySniper:
                         self.log(f"Timeout exit order failed (attempt {attempt+1}): {msg}")
                         continue
 
-                    # Verify fill
-                    exit_oid = exit_resp.get("data", {}).get("oid", "") or exit_resp.get("data", {}).get("orderId", "")
-                    await asyncio.sleep(0.5)
+                    # Verify fill — place_order doesn't return oid, use clientOrderId
+                    _exit_coid = exit_resp.get("_clientOrderId", "") if isinstance(exit_resp, dict) else ""
+                    await asyncio.sleep(1.5)
                     exit_filled = 0.0
                     try:
-                        eo = await self.client.get_order(exit_oid)
-                        if str(eo.get("code", "")) == "0":
-                            exit_filled = float(eo.get("data", {}).get("filledSize", "0") or "0")
+                        for _sf in ("closed", "open"):
+                            ords = await self.client.get_orders(status=_sf)
+                            if str(ords.get("code", "")) == "0":
+                                for _o in ords.get("data", {}).get("list", []):
+                                    if _exit_coid and _o.get("clientOrderId") == _exit_coid:
+                                        exit_filled = float(_o.get("filledSize", "0") or "0")
+                                        break
+                            if exit_filled > 0:
+                                break
                     except Exception:
                         pass
 
