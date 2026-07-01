@@ -755,14 +755,16 @@ class PolySniper:
         try:
             book = await self.client.get_orderbook(asset_id, depth=5)
             if str(book.get("code", "")) != "0":
-                await self._notify(f"⚠️ 超时+无法获取orderbook, 继续监控")
-                self._reset_to_monitoring()
+                await self._notify(f"🚨 超时+无法获取orderbook, 已停止等待人工介入")
+                self.state.status = "stopped"
+                self._running = False
                 return
 
             bids = book.get("data", [{}])[0].get("bids", [])
             if not bids:
-                await self._notify(f"⚠️ 超时+OKX无bid, 继续监控")
-                self._reset_to_monitoring()
+                await self._notify(f"🚨 超时+OKX无bid, 已停止等待人工介入")
+                self.state.status = "stopped"
+                self._running = False
                 return
 
             best_bid = float(bids[0][0])
@@ -844,16 +846,18 @@ class PolySniper:
                         return
                     self.log(f"Attempt {attempt+1}/5: 0 fill")
 
-                # All 5 attempts failed — resume monitoring
-                self.log("Timeout: 5 attempts all 0 fill, resuming monitoring")
-                await self._notify("⚠️ 卖出5次均无成交, 继续监控")
-                self._reset_to_monitoring()
+                # All 5 attempts failed — stop for manual intervention
+                self.log("Timeout: 5 attempts all 0 fill, stopping")
+                await self._notify("🚨 卖出5次均无成交, 已停止等待人工介入")
+                self.state.status = "stopped"
+                self._running = False
 
 
         except Exception as e:
             self.log(f"Timeout handling error: {e}")
-            await self._notify(f"⚠️ 超时处理异常: {e}, 继续监控")
-            self._reset_to_monitoring()
+            await self._notify(f"🚨 超时处理异常: {e}, 已停止等待人工介入")
+            self.state.status = "stopped"
+            self._running = False
 
     def _reset_to_monitoring(self):
         """Reset state back to monitoring."""
