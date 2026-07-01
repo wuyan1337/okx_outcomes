@@ -299,8 +299,18 @@ class PolySniper:
                 self.log(f"BOUNCE SKIP: {side.upper()} {window_low:.3f}→{current_bid:.3f} (+{jump_cents}¢) but current {current_bid:.3f} < baseline {baseline:.3f}*0.7={baseline*0.7:.3f}")
                 return
             self.log(f"JUMP detected: {side.upper()} {window_low:.3f} → {current_bid:.3f} (+{jump_cents}¢) within {self.config.window_ms}ms, buying immediately...")
-            # BUY at buy_limit price immediately
+            # Snapshot OKX orderbook to check if arb still exists
             okx_asset = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
+            snapshot_asks = await self._snapshot_okx_asks(okx_asset)
+            if not snapshot_asks:
+                self.log("OKX snapshot failed — no asks, skipping")
+                return
+            snapshot_best_ask = float(snapshot_asks[0][0])
+            if snapshot_best_ask >= current_bid:
+                self.log(f"OKX already caught up: ask={snapshot_best_ask:.2f} >= poly={current_bid:.3f}, skipping")
+                return
+            self.log(f"OKX snapshot: best ask={snapshot_best_ask:.2f} (poly={current_bid:.3f}, spread={round((current_bid - snapshot_best_ask)*100)}¢)")
+            # BUY at buy_limit price
             bought = await self._execute_buy_immediate(side, okx_asset, window_low, current_bid)
             if not bought:
                 return
