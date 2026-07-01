@@ -948,21 +948,27 @@ var _polyYesToken='',_polyNoToken='';
 
 // ─── Sniper Old ───
 var _soPolyYesToken='',_soPolyNoToken='';
+var _soPolyTimer=null;
 async function onSoPolyInput(){
 var url=document.getElementById('so-pi').value.trim();
-if(!url)return;
-var slug=url.split('/event/')[1]||url.split('/market/')[1]||'';
-if(slug)slug=slug.split('/')[0].split('?')[0];
-if(!slug)return;
-try{var r=await fetch('https://gamma-api.polymarket.com/events?slug='+slug);
-if(r.ok){var evts=await r.json();if(evts&&evts.length){var mkts=evts[0].markets||[];
-var sel=document.getElementById('so-poly-sel');sel.innerHTML='<option value="">-- Select --</option>';
-mkts.forEach(function(m){
-var opt=document.createElement('option');opt.value=m.clobTokenIds?JSON.parse(m.clobTokenIds)[0]:'';
-opt.textContent=m.question||m.groupItemTitle||'?';opt.dataset.yes=m.clobTokenIds?JSON.parse(m.clobTokenIds)[0]:'';
-opt.dataset.no=m.clobTokenIds?JSON.parse(m.clobTokenIds)[1]||'':'';sel.appendChild(opt);});
+if(!url){document.getElementById('so-poly-sel-wrap').style.display='none';return;}
+if(_soPolyTimer)clearTimeout(_soPolyTimer);
+_soPolyTimer=setTimeout(async function(){
+try{var r=await gapi('/api/poly/resolve?url='+encodeURIComponent(url));var d=await r.json();
+if(d.ok&&d.tokens&&d.tokens.length){
+var sel=document.getElementById('so-poly-sel');sel.innerHTML='<option value="">-- Select outcome --</option>';
+d.tokens.forEach(function(t){
+var opt=document.createElement('option');opt.value=t.token_id;
+opt.textContent=t.outcome;opt.dataset.yes=t.token_id;opt.dataset.no='';
+sel.appendChild(opt);});
+for(var i=1;i<sel.options.length;i++){var txt=sel.options[i].textContent;
+if(/ - Yes$/i.test(txt)){var base=txt.replace(/ - Yes$/i,'');
+for(var j=1;j<sel.options.length;j++){if(sel.options[j].textContent===base+' - No'){sel.options[i].dataset.no=sel.options[j].value;sel.options[j].dataset.yes=sel.options[i].value;break;}}}}
 document.getElementById('so-poly-sel-wrap').style.display='';
-}}}catch(e){console.error(e);}
+if(d.tokens.length===2&&!d.is_event){sel.selectedIndex=1;onSoPolySel();}
+}else{document.getElementById('so-poly-sel-wrap').style.display='none';}}
+catch(e){console.error(e);document.getElementById('so-poly-sel-wrap').style.display='none';}
+},600);
 }
 function onSoPolySel(){
 var sel=document.getElementById('so-poly-sel');var opt=sel.options[sel.selectedIndex];
