@@ -20,6 +20,7 @@ from .core.database import (
 )
 from .services.account_manager import AccountManager
 from .services.notifier import TelegramNotifier
+from .services.size_utils import normalize_size_str
 
 # Configure application-level logging so notifier/strategy messages appear in journalctl
 logging.basicConfig(
@@ -394,8 +395,8 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         strategy = "sniper-old"
     return {
         "manual_running": inst.strategy_d.running,
-        "manual_d_scan_interval": getattr(inst.strategy_d.state, "scan_interval", 10) if inst.strategy_d.running else 10,
-        "manual_d_stabilize_secs": getattr(inst.strategy_d.state, "stabilize_secs", 10) if inst.strategy_d.running else 10,
+        "manual_d_scan_interval": getattr(inst.strategy_d.state, "scan_interval", 0.3) if inst.strategy_d.running else 0.3,
+        "manual_d_stabilize_secs": getattr(inst.strategy_d.state, "stabilize_secs", 0.3) if inst.strategy_d.running else 0.3,
         "manual_s_running": inst.strategy_s.running,
         "sniper_running": inst.sniper.running,
         "sniper_old_running": inst.sniper_old.running,
@@ -413,8 +414,8 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         "manual_s_asset_id": getattr(inst.strategy_s.state, "asset_id", None) if inst.strategy_s.running else None,
         "manual_s_yes_asset_id": getattr(inst.strategy_s.state, "yes_asset_id", None) if inst.strategy_s.running else None,
         "manual_s_position_pct": getattr(inst.strategy_s.state, "position_pct", 100) if inst.strategy_s.running else 100,
-        "manual_s_scan_interval": getattr(inst.strategy_s.state, "scan_interval", 10) if inst.strategy_s.running else 10,
-        "manual_s_stabilize_secs": getattr(inst.strategy_s.state, "stabilize_secs", 10) if inst.strategy_s.running else 10,
+        "manual_s_scan_interval": getattr(inst.strategy_s.state, "scan_interval", 0.3) if inst.strategy_s.running else 0.3,
+        "manual_s_stabilize_secs": getattr(inst.strategy_s.state, "stabilize_secs", 0.3) if inst.strategy_s.running else 0.3,
 
         "strategy": strategy or "none",
         "running": inst.strategy_d.running or inst.strategy_s.running or inst.sniper.running or inst.sniper_old.running,
@@ -462,7 +463,7 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
     # If monitor enabled, verify BOTH OKX and Poly bid == strategy price
     if monitor and monitor.get("poly_token_id"):
         poly_token_id = monitor["poly_token_id"]
-        depth_threshold = float(monitor.get("depth_threshold", 10000))
+        depth_threshold = float(monitor.get("depth_threshold", 3000))
 
         # Check OKX orderbook: best bid must match strategy price
         try:
@@ -529,7 +530,7 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
             result = await inst.poly_monitor.start(
                 poly_token_id=monitor["poly_token_id"],
                 reference_price=price_decimal,
-                depth_threshold=float(monitor.get("depth_threshold", 10000)),
+                depth_threshold=float(monitor.get("depth_threshold", 3000)),
             )
             if result.get("ok"):
                 inst.poly_monitor.set_strategy_context(strategy_type, int(price_f), yes_asset_id)
@@ -711,7 +712,7 @@ async def account_flash_close(account_id: str, user: str = Depends(verify_auth))
                             asset_id=trade_aid,
                             side="sell",
                             price=best_bid,
-                            size=str(int(float(size))),
+                            size=normalize_size_str(size),
                             tif="ioc",
                         )
                         if str(resp.get("code", "")) == "0":
@@ -849,7 +850,7 @@ async def account_manual_place(account_id: str, request: Request, user: str = De
         price_str = f"{price_f:.2f}" if 4 <= cents <= 96 else f"{price_f:.3f}"
     except (ValueError, TypeError):
         return JSONResponse(status_code=400, content={"ok": False, "error": f"Invalid price: {price}"})
-    size_str = str(int(float(size)))
+    size_str = normalize_size_str(size)
     import logging; import sys
     print(f"[MANUAL PLACE] asset_id={asset_id} side={side.lower()} price={price_str} size={size_str} tif={tif}")
     try:
@@ -959,7 +960,7 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
     price_decimal = float(price) / 100.0 if float(price) >= 1 else float(price)
     if monitor and monitor.get("poly_token_id"):
         poly_token_id = monitor["poly_token_id"]
-        depth_threshold = float(monitor.get("depth_threshold", 10000))
+        depth_threshold = float(monitor.get("depth_threshold", 3000))
         # Check OKX best bid == strategy price
         try:
             okx_book = await inst.client.get_orderbook(asset_id, depth=5)
@@ -993,7 +994,7 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly book check: {e}"})
 
     try:
-        await inst.strategy_d.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price), position_pct=int(body.get("position_pct", 100)), scan_interval=int(body.get("scan_interval", 10)), stabilize_secs=int(body.get("stabilize_secs", 10)))
+        await inst.strategy_d.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price), position_pct=int(body.get("position_pct", 100)), scan_interval=float(body.get("scan_interval", 0.3)), stabilize_secs=float(body.get("stabilize_secs", 0.3)))
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -1003,7 +1004,7 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
             r = await inst.poly_monitor.start(
                 poly_token_id=monitor["poly_token_id"],
                 reference_price=price_decimal,
-                depth_threshold=float(monitor.get("depth_threshold", 10000)),
+                depth_threshold=float(monitor.get("depth_threshold", 3000)),
             )
             if r and r.get("ok"):
                 inst.poly_monitor.set_strategy_context("manual-d", int(price), asset_id)
@@ -1042,7 +1043,7 @@ async def account_monitor_start(account_id: str, request: Request, user: str = D
     body = await request.json()
     poly_token_id = body.get("poly_token_id", "")
     reference_price = float(body.get("reference_price", 0))
-    depth_threshold = float(body.get("depth_threshold", 10000))
+    depth_threshold = float(body.get("depth_threshold", 3000))
     if not poly_token_id:
         return JSONResponse(status_code=400, content={"ok": False, "error": "poly_token_id required"})
     result = await inst.poly_monitor.start(poly_token_id, reference_price, depth_threshold)
@@ -1101,8 +1102,8 @@ async def sniper_start(account_id: str, request: Request, user: str = Depends(ve
         buy_limit_cents=int(body.get("buy_limit_cents", 50)),
         position_pct=int(body.get("position_pct", 100)),
         timeout_secs=int(body.get("timeout_secs", 120)),
-        settle_ms=int(body.get("settle_ms", 1000)),
-        window_ms=int(body.get("window_ms", 500)),
+        settle_ms=int(body.get("settle_ms", 0)),
+        window_ms=int(body.get("window_ms", 150)),
         poly_url=body.get("poly_url", ""),
         selected_outcome=body.get("selected_outcome", ""),
     )
@@ -1144,8 +1145,8 @@ async def sniper_old_start(account_id: str, request: Request, user: str = Depend
         ask_levels=int(body.get("ask_levels", 5)),
         position_pct=int(body.get("position_pct", 100)),
         timeout_secs=int(body.get("timeout_secs", 120)),
-        settle_ms=int(body.get("settle_ms", 1000)),
-        window_ms=int(body.get("window_ms", 500)),
+        settle_ms=int(body.get("settle_ms", 0)),
+        window_ms=int(body.get("window_ms", 150)),
         poly_url=body.get("poly_url", ""),
         selected_outcome=body.get("selected_outcome", ""),
     )
@@ -1273,7 +1274,7 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly book check: {e}"})
 
     try:
-        await inst.strategy_s.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price), sell_price=float(body.get("sell_price", 0)), mode=body.get("mode", "classic"), side=side, position_pct=int(body.get("position_pct", 100)), scan_interval=int(body.get("scan_interval", 10)), stabilize_secs=int(body.get("stabilize_secs", 10)))
+        await inst.strategy_s.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price), sell_price=float(body.get("sell_price", 0)), mode=body.get("mode", "classic"), side=side, position_pct=int(body.get("position_pct", 100)), scan_interval=float(body.get("scan_interval", 0.3)), stabilize_secs=float(body.get("stabilize_secs", 0.3)))
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -1283,7 +1284,7 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
             r = await inst.poly_monitor.start(
                 poly_token_id=monitor["poly_token_id"],
                 reference_price=monitor_ref,
-                depth_threshold=float(monitor.get("depth_threshold", 10000)),
+                depth_threshold=float(monitor.get("depth_threshold", 3000)),
             )
             if r and r.get("ok"):
                 inst.poly_monitor.set_strategy_context("manual-s", int(sell_price_val) if mode == "bid-sell" else int(price), asset_id, mode=mode)

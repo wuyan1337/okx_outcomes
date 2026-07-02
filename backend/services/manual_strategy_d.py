@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from ..core.client import OKXOutcomesClient
+from .size_utils import normalize_size_str
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +47,8 @@ class ManualStateD:
     total_profit: float = 0.0
     consecutive_failures: int = 0
     position_pct: int = 100
-    scan_interval: int = 10  # seconds between main loop scans
-    stabilize_secs: int = 10  # seconds for rebalance stabilization
+    scan_interval: float = 0.3  # seconds between main loop scans
+    stabilize_secs: float = 0.3  # seconds for rebalance stabilization
     logs: list = field(default_factory=list)
     notified_fills: Set[str] = field(default_factory=set)  # order IDs already notified
 
@@ -106,7 +107,7 @@ class ManualStrategyD:
         logger.info(msg)
 
     async def start(self, market_id: str, yes_asset_id: str, no_asset_id: str,
-                    price_a: float, size: int = 0, position_pct: int = 100, scan_interval: int = 10, stabilize_secs: int = 10):
+                    price_a: float, size: int = 0, position_pct: int = 100, scan_interval: float = 0.3, stabilize_secs: float = 0.3):
         """Start the spread strategy."""
         if self.state.running:
             return
@@ -123,8 +124,8 @@ class ManualStrategyD:
         self.state.no_asset_id = no_asset_id
         self.state.price_a = a
         self.state.position_pct = max(1, min(100, position_pct))
-        self.state.scan_interval = max(3, min(120, scan_interval))
-        self.state.stabilize_secs = max(5, min(120, stabilize_secs))
+        self.state.scan_interval = max(0.3, min(120.0, float(scan_interval)))
+        self.state.stabilize_secs = max(0.3, min(120.0, float(stabilize_secs)))
         self.state.price_b = 99 - a
         self.state.sell_a = a + 1
         self.state.sell_b = 100 - a
@@ -211,7 +212,7 @@ class ManualStrategyD:
                 emoji = "\U0001f7e2" if side == "BUY" else "\U0001f534"
                 label = "Yes" if asset_id == self.state.yes_asset_id else "No"
                 asyncio.create_task(self.notifier.send(
-                    f"[{self.account_name}] {emoji} <b>{side} {label}</b> @{price} x{int(new_fill)} \u6210\u4ea4"
+                    f"[{self.account_name}] {emoji} <b>{side} {label}</b> @{price} x{normalize_size_str(new_fill)} \u6210\u4ea4"
                 ))
         except Exception as e:
             self.log(f"notify_all_fills error: {e}", "WARN")
@@ -485,11 +486,11 @@ class ManualStrategyD:
                     self.state.posted_sells.discard(oid)
                     pass  # keep in tracked to prevent re-notify
                 label = "Yes" if asset_id == self.state.yes_asset_id else "No"
-                self.log(f"\U0001f4b0 Sell {label} \u6210\u4ea4 x{new_sell_fill:.0f} @{price} | +{profit:.2f} xp")
+                self.log(f"\U0001f4b0 Sell {label} \u6210\u4ea4 x{normalize_size_str(new_sell_fill)} @{price} | +{profit:.2f} xp")
                 if self.notifier:
                     import asyncio
                     asyncio.create_task(self.notifier.send(
-                        f"[{self.account_name}] \U0001f4b0 Sell {label} \u6210\u4ea4 x{int(new_sell_fill)} @{price} | +{profit:.2f} xp"
+                        f"[{self.account_name}] \U0001f4b0 Sell {label} \u6210\u4ea4 x{normalize_size_str(new_sell_fill)} @{price} | +{profit:.2f} xp"
                     ))
         except Exception as e:
             self.log(f"\u68c0\u67e5sell\u6210\u4ea4\u5f02\u5e38: {e}", "WARN")

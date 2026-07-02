@@ -11,6 +11,7 @@ import logging
 import time
 from typing import Optional, Dict
 from dataclasses import dataclass, field
+from .size_utils import normalize_size_str, size_to_float
 
 import aiohttp
 
@@ -27,7 +28,7 @@ class SniperConfig:
     position_pct: int = 100         # Balance percentage to use
     timeout_secs: int = 120         # Seconds before forced exit
     settle_ms: int = 0           # Ms to wait for price to stabilize after jump
-    window_ms: int = 50            # Rolling window for cumulative jump detection
+    window_ms: int = 150            # Rolling window for cumulative jump detection
 
 
 @dataclass
@@ -95,7 +96,7 @@ class PolySniper:
                     yes_asset_id: str, no_asset_id: str, market_id: str,
                     threshold_cents: int = 40, buy_limit_cents: int = 50,
                     position_pct: int = 100, timeout_secs: int = 120,
-                    settle_ms: int = 0, window_ms: int = 50,
+                    settle_ms: int = 0, window_ms: int = 150,
                     poly_url: str = "", selected_outcome: str = ""):
         """Start sniper monitoring."""
         if self._running:
@@ -394,7 +395,7 @@ class PolySniper:
                         break
 
             budget = available * (self.config.position_pct / 100.0)
-            buy_size = int(budget / buy_limit)
+            buy_size = size_to_float(budget / buy_limit)
 
             if buy_size < 1:
                 self.log(f"Insufficient balance: avail={available}, budget={budget}, limit={buy_limit}")
@@ -415,7 +416,7 @@ class PolySniper:
                 asset_id=asset_id,
                 side="buy",
                 price=price_str,
-                size=str(buy_size),
+                size=normalize_size_str(buy_size),
                 tif="gtc",
             )
             _buy_client_oid = resp.get("_clientOrderId", "") if isinstance(resp, dict) else ""
@@ -499,8 +500,8 @@ class PolySniper:
         self.state.hold_start = time.monotonic()
         self.state.hold_start_epoch_ms = int(time.time() * 1000)
 
-        self.log(f"Bought {label} @{fill_price:.2f} x{filled_size:.0f}")
-        await self._notify(f"\u2705 \u5df2\u4e70\u5165 {label} @{fill_price:.2f} x{int(filled_size)}")
+        self.log(f"Bought {label} @{fill_price:.2f} x{normalize_size_str(filled_size)}")
+        await self._notify(f"\u2705 \u5df2\u4e70\u5165 {label} @{fill_price:.2f} x{normalize_size_str(filled_size)}")
         return True
 
     async def _post_sell_at_price(self, poly_new_price: float):
@@ -518,7 +519,7 @@ class PolySniper:
         self.state.sell_target = sell_price_raw
 
         sell_price_str = f"{sell_price_raw:.{decimals}f}"
-        sell_size_str = str(int(filled_size))
+        sell_size_str = normalize_size_str(filled_size)
         try:
             sell_resp = await self.client.place_order(
                 asset_id=asset_id,
@@ -530,7 +531,7 @@ class PolySniper:
             if str(sell_resp.get("code", "")) == "0":
                 self.state.sell_order_id = sell_resp.get("data", {}).get("oid", "") or sell_resp.get("data", {}).get("orderId", "")
                 self.log(f"Posted sell @{sell_price_str} x{sell_size_str}")
-                await self._notify(f"\ud83d\udce4 \u5df2\u6302 Sell {label} @{sell_price_str} x{int(filled_size)}")
+                await self._notify(f"\ud83d\udce4 \u5df2\u6302 Sell {label} @{sell_price_str} x{normalize_size_str(filled_size)}")
             else:
                 msg = sell_resp.get("message", sell_resp.get("msg", ""))
                 self.log(f"Sell post failed: {msg}")
@@ -609,8 +610,8 @@ class PolySniper:
                         break
 
             budget = available * (self.config.position_pct / 100.0)
-            max_units = int(budget / max_price)
-            buy_size = min(max_units, int(total_ask_size))
+            max_units = size_to_float(budget / max_price)
+            buy_size = min(max_units, size_to_float(total_ask_size))
 
             if buy_size < 1:
                 self.log(f"Insufficient balance or size too small: avail={available}, budget={budget}")
@@ -631,7 +632,7 @@ class PolySniper:
                 asset_id=asset_id,
                 side="buy",
                 price=price_str,
-                size=str(buy_size),
+                size=normalize_size_str(buy_size),
                 tif="gtc",
             )
             _buy_client_oid = resp.get("_clientOrderId", "") if isinstance(resp, dict) else ""
@@ -694,11 +695,11 @@ class PolySniper:
         self.state.hold_start = time.monotonic()
         self.state.hold_start_epoch_ms = int(time.time() * 1000)
 
-        self.log(f"Bought {label} @{fill_price:.2f} x{filled_size:.0f}")
-        await self._notify(f"✅ 已买入 {label} @{fill_price:.2f} x{int(filled_size)}")
+        self.log(f"Bought {label} @{fill_price:.2f} x{normalize_size_str(filled_size)}")
+        await self._notify(f"✅ 已买入 {label} @{fill_price:.2f} x{normalize_size_str(filled_size)}")
 
         sell_price_str = f"{sell_price_raw:.{decimals}f}"
-        sell_size_str = str(int(filled_size))
+        sell_size_str = normalize_size_str(filled_size)
         try:
             sell_resp = await self.client.place_order(
                 asset_id=asset_id,
@@ -710,7 +711,7 @@ class PolySniper:
             if str(sell_resp.get("code", "")) == "0":
                 self.state.sell_order_id = sell_resp.get("data", {}).get("oid", "") or sell_resp.get("data", {}).get("orderId", "")
                 self.log(f"Posted sell @{sell_price_str} x{sell_size_str}")
-                await self._notify(f"📤 已挂 Sell {label} @{sell_price_str} x{int(filled_size)}")
+                await self._notify(f"📤 已挂 Sell {label} @{sell_price_str} x{normalize_size_str(filled_size)}")
             else:
                 msg = sell_resp.get("message", sell_resp.get("msg", ""))
                 self.log(f"Sell post failed: {msg}")
@@ -765,10 +766,10 @@ class PolySniper:
 
                     if sell_filled >= self.state.buy_size * 0.95:
                         profit = sell_filled * (self.state.sell_target - self.state.buy_price)
-                        self.log(f"Sell filled @{self.state.sell_target:.2f} x{sell_filled:.0f} | +{profit:.2f} xp")
+                        self.log(f"Sell filled @{self.state.sell_target:.2f} x{normalize_size_str(sell_filled)} | +{profit:.2f} xp")
                         await self._notify(
                             f"💰 Sell {label} 成交 @{self.state.sell_target:.2f} "
-                            f"x{int(sell_filled)} | +{profit:.2f} xp"
+                            f"x{normalize_size_str(sell_filled)} | +{profit:.2f} xp"
                         )
                         self._reset_to_monitoring()
                         return
@@ -834,7 +835,7 @@ class PolySniper:
                     self._reset_to_monitoring()
                     return
                 # Try up to 5 times to exit remaining at best bid
-                size_str = str(int(remaining))
+                size_str = normalize_size_str(remaining)
                 for attempt in range(5):
                     # Re-scan orderbook for fresh best bid (except first attempt)
                     if attempt > 0:
@@ -882,9 +883,9 @@ class PolySniper:
 
                     if exit_filled >= 1:
                         profit = exit_filled * (best_bid - self.state.buy_price)
-                        self.log(f"Timeout exit @{best_bid:.2f} x{exit_filled:.0f} | +{profit:.2f} xp")
+                        self.log(f"Timeout exit @{best_bid:.2f} x{normalize_size_str(exit_filled)} | +{profit:.2f} xp")
                         await self._notify(
-                            f"⏰ 超时出 @{best_bid:.2f} x{int(exit_filled)} | +{profit:.2f} xp"
+                            f"⏰ 超时出 @{best_bid:.2f} x{normalize_size_str(exit_filled)} | +{profit:.2f} xp"
                         )
                         self._reset_to_monitoring()
                         return

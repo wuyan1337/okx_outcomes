@@ -608,7 +608,7 @@ function mtMax(dir){if(dir==='buy'){var price=0;if(_mtMode==='market'){price=par
 
 async function mtBuy(){var aid=mtGetAssetId();if(!aid){al('ERROR','Select a market first');return;}var size=document.getElementById('mt-buy-size').value;if(!size||parseInt(size)<1){al('ERROR','Enter size');return;}var btn=document.getElementById('mt-buy-btn');btn.disabled=true;try{var price,tif;if(_mtMode==='market'){var askEl=document.getElementById('mt-ask').textContent;price=parseFloat(askEl);if(!price||isNaN(price)){al('ERROR','No ask price');return;}tif='ioc';}else{price=parseInt(document.getElementById('mt-lmt-price').value);if(!price){al('ERROR','Enter price');return;}tif='gtc';}var r=await api('/api/accounts/'+currentAcctId+'/manual/place',{method:'POST',body:JSON.stringify({asset_id:aid,side:'BUY',price:String(price),size:String(parseInt(size)),tif:tif})});var d=await r.json();if(d.ok){al('INFO','Buy sent: '+size+' @ '+price+'\u00a2');mtRefresh();mtFetchPosition();}else{al('ERROR',d.error||'Buy failed');}}catch(e){al('ERROR',e.message);}finally{btn.disabled=false;}}
 
-async function mtSell(){var aid=mtGetAssetId();if(!aid){al('ERROR','Select a market first');return;}var size=parseInt(document.getElementById('mt-sell-size').value);if(!size||size<1){al('ERROR','Enter sell size');return;}if(size>_mtPosSize){al('ERROR','Size exceeds position ('+_mtPosSize+')');return;}var yaid=mtGetYesAssetId();var btn=document.getElementById('mt-sell-btn');btn.disabled=true;try{var price,tif;if(_mtMode==='market'){var bidEl=document.getElementById('mt-bid').textContent;price=parseFloat(bidEl);if(!price||isNaN(price)){al('ERROR','No bid price');return;}tif='ioc';}else{price=parseInt(document.getElementById('mt-sell-lmt-price').value);if(!price){al('ERROR','Enter sell price');return;}tif='gtc';}var r=await api('/api/accounts/'+currentAcctId+'/manual/place',{method:'POST',body:JSON.stringify({asset_id:aid,side:'SELL',price:String(price),size:String(size),tif:tif})});var d=await r.json();if(d.ok){al('INFO','Sell sent: '+size+' @ '+price+'\u00a2');mtRefresh();mtFetchPosition();}else{al('ERROR',d.error||'Sell failed');}}catch(e){al('ERROR',e.message);}finally{btn.disabled=false;}}
+async function mtSell(){var aid=mtGetAssetId();if(!aid){al('ERROR','Select a market first');return;}var size=document.getElementById('mt-sell-size').value.trim();if(!size||Number(size)<=0){al('ERROR','Enter sell size');return;}if(size>_mtPosSize){al('ERROR','Size exceeds position ('+_mtPosSize+')');return;}var yaid=mtGetYesAssetId();var btn=document.getElementById('mt-sell-btn');btn.disabled=true;try{var price,tif;if(_mtMode==='market'){var bidEl=document.getElementById('mt-bid').textContent;price=parseFloat(bidEl);if(!price||isNaN(price)){al('ERROR','No bid price');return;}tif='ioc';}else{price=parseInt(document.getElementById('mt-sell-lmt-price').value);if(!price){al('ERROR','Enter sell price');return;}tif='gtc';}var r=await api('/api/accounts/'+currentAcctId+'/manual/place',{method:'POST',body:JSON.stringify({asset_id:aid,side:'SELL',price:String(price),size:String(size),tif:tif})});var d=await r.json();if(d.ok){al('INFO','Sell sent: '+size+' @ '+price+'\u00a2');mtRefresh();mtFetchPosition();}else{al('ERROR',d.error||'Sell failed');}}catch(e){al('ERROR',e.message);}finally{btn.disabled=false;}}
 
 function mtSellInstant(assetId,size,yesAssetId){var url='/api/accounts/'+currentAcctId+'/ticker?asset_id='+assetId;if(yesAssetId&&yesAssetId!==assetId)url+='&yes_asset_id='+yesAssetId;api(url).then(function(r){return r.json();}).then(function(d){if(!d.best_bid){al('ERROR','No bid available');return;}api('/api/accounts/'+currentAcctId+'/manual/place',{method:'POST',body:JSON.stringify({asset_id:assetId,side:'SELL',price:String(d.best_bid),size:String(size),tif:'ioc'})}).then(function(r){return r.json();}).then(function(rd){if(rd.ok){al('INFO','Instant sell: '+size+' @ '+d.best_bid+'\u00a2');mtRefresh();mtFetchPosition();}else{al('ERROR',rd.error||'Sell failed');}});}).catch(function(e){al('ERROR',e.message);});}
 
@@ -646,7 +646,7 @@ if(d.config){var _snt=document.getElementById('sn-thresh'),_snp=document.getElem
 // State
 if(d.status==='monitoring'){dot.className='sn-dot monitoring';st.textContent='Monitoring';det.textContent='';timer.style.display='none';}
 else if(d.status==='settling'&&d.settling){dot.className='sn-dot settling';st.textContent='Settling';det.textContent=d.settling.side.toUpperCase()+' '+d.settling.initial.toFixed(3)+'→'+d.settling.current.toFixed(3);timer.style.display='none';}
-else if(d.status==='holding'&&d.holding){dot.className='sn-dot holding';st.textContent='Holding';det.textContent=d.holding.side.toUpperCase()+' @'+d.holding.buy_price.toFixed(2)+' x'+Math.round(d.holding.buy_size)+' → sell @'+d.holding.sell_target.toFixed(2);timer.style.display='';var pct=Math.min(d.holding.elapsed/(d.config.timeout_secs||10)*100,100);barFill.style.width=pct+'%';barFill.className='sn-bar-fill '+(pct<60?'ok':pct<85?'warn':'danger');timerTxt.textContent=d.holding.elapsed+'s / '+d.config.timeout_secs+'s';}
+else if(d.status==='holding'&&d.holding){dot.className='sn-dot holding';st.textContent='Holding';det.textContent=d.holding.side.toUpperCase()+' @'+d.holding.buy_price.toFixed(2)+' x'+String(d.holding.buy_size)+' → sell @'+d.holding.sell_target.toFixed(2);timer.style.display='';var pct=Math.min(d.holding.elapsed/(d.config.timeout_secs||10)*100,100);barFill.style.width=pct+'%';barFill.className='sn-bar-fill '+(pct<60?'ok':pct<85?'warn':'danger');timerTxt.textContent=d.holding.elapsed+'s / '+d.config.timeout_secs+'s';}
 else if(d.status==='stopped'){dot.className='sn-dot stopped';st.textContent='Stopped';det.textContent='';timer.style.display='none';PR=false;var btn=document.getElementById('pb');if(btn){btn.className='btn-go';btn.textContent='Start Sniper';}}
 else{dot.className='sn-dot idle';st.textContent=d.status||'Idle';det.textContent='';timer.style.display='none';prices.style.display='none';}
 }).catch(function(){});}
@@ -656,7 +656,7 @@ var dot=document.getElementById('so-dot'),st=document.getElementById('so-state')
 if(!dot)return;
 if(d.config){var _t=document.getElementById('so-thresh'),_p=document.getElementById('so-pct'),_to=document.getElementById('so-timeout'),_s=document.getElementById('so-settle'),_w=document.getElementById('so-window');if(_t&&document.activeElement!==_t)_t.value=d.config.threshold_cents;if(_p&&document.activeElement!==_p)_p.value=d.config.position_pct;if(_to&&document.activeElement!==_to)_to.value=d.config.timeout_secs;if(_s&&document.activeElement!==_s)_s.value=d.config.settle_ms;if(_w&&document.activeElement!==_w)_w.value=d.config.window_ms||500;}
 if(d.status==='monitoring'){dot.className='sn-dot monitoring';st.textContent='Monitoring';det.textContent='';}
-else if(d.status==='holding'&&d.holding){dot.className='sn-dot holding';st.textContent='Holding';det.textContent=d.holding.side.toUpperCase()+' @'+d.holding.buy_price.toFixed(2)+' x'+Math.round(d.holding.buy_size)+' → sell @'+d.holding.sell_target.toFixed(2);}
+else if(d.status==='holding'&&d.holding){dot.className='sn-dot holding';st.textContent='Holding';det.textContent=d.holding.side.toUpperCase()+' @'+d.holding.buy_price.toFixed(2)+' x'+String(d.holding.buy_size)+' → sell @'+d.holding.sell_target.toFixed(2);}
 else if(d.status==='stopped'){dot.className='sn-dot stopped';st.textContent='Stopped';det.textContent='';SOR=false;document.getElementById('sob').className='btn-go';document.getElementById('sob').textContent='Start Sniper Old';}
 else{dot.className='sn-dot idle';st.textContent=d.status||'Idle';det.textContent='';}
 }).catch(function(){});}
@@ -931,7 +931,7 @@ async function tgSniper(){
         threshold_cents:parseInt(document.getElementById('sn-thresh').value)||10,
         buy_limit_cents:parseInt(document.getElementById('sn-limit').value)||50,
         position_pct:parseInt(document.getElementById('sn-pct').value)||100,
-        timeout_secs:parseInt(document.getElementById('sn-timeout').value)||10,settle_ms:parseInt(document.getElementById('sn-settle').value)||0,window_ms:parseInt(document.getElementById('sn-window').value)||50,
+        timeout_secs:parseInt(document.getElementById('sn-timeout').value)||10,settle_ms:parseInt(document.getElementById('sn-settle').value)||0,window_ms:parseInt(document.getElementById('sn-window').value)||150,
         poly_url:document.getElementById('pi').value.trim(),
         selected_outcome:selectedText,
       };
@@ -990,8 +990,8 @@ market_id:mktInfo.market_id||'',
 threshold_cents:parseInt(document.getElementById('so-thresh').value)||10,
 position_pct:parseInt(document.getElementById('so-pct').value)||100,
 timeout_secs:parseInt(document.getElementById('so-timeout').value)||10,
-settle_ms:parseInt(document.getElementById('so-settle').value)||1000,
-window_ms:parseInt(document.getElementById('so-window').value)||500,
+settle_ms:parseInt(document.getElementById('so-settle').value)||0,
+window_ms:parseInt(document.getElementById('so-window').value)||150,
 poly_url:document.getElementById('so-pi').value,
 selected_outcome:(document.getElementById('so-poly-sel').options[document.getElementById('so-poly-sel').selectedIndex]||{}).textContent||''
 };
