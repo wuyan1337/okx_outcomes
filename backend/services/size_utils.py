@@ -39,3 +39,18 @@ def size_to_float(value) -> float:
         return float(normalize_size_str(value))
     except Exception:
         return 0.0
+
+def normalize_buy_size_str(value) -> str:
+    """OKX buy order sizes must be whole shares; floor to int string.
+
+    Sell/close sizes should use normalize_size_str() to preserve the actual
+    filled decimal size. This helper is only for initial BUY sizing derived
+    from budget/orderbook depth.
+    """
+    try:
+        d = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return "0"
+    if d <= 0:
+        return "0"
+    return str(int(d))

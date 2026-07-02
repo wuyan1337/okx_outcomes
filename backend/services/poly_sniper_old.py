@@ -11,7 +11,7 @@ import logging
 import time
 from typing import Optional, Dict
 from dataclasses import dataclass, field
-from .size_utils import normalize_size_str, size_to_float
+from .size_utils import normalize_size_str, normalize_buy_size_str, size_to_float
 
 import aiohttp
 
@@ -422,7 +422,7 @@ class PolySniperOld:
                 asset_id=asset_id,
                 side="buy",
                 price=price_str,
-                size=normalize_size_str(buy_size),
+                size=normalize_buy_size_str(buy_size),
                 tif="ioc",
             )
             _buy_client_oid = resp.get("_clientOrderId", "") if isinstance(resp, dict) else ""
@@ -629,7 +629,7 @@ class PolySniperOld:
                 asset_id=asset_id,
                 side="buy",
                 price=price_str,
-                size=normalize_size_str(buy_size),
+                size=normalize_buy_size_str(buy_size),
                 tif="ioc",
             )
             _buy_client_oid = resp.get("_clientOrderId", "") if isinstance(resp, dict) else ""
