@@ -765,6 +765,7 @@ class PolySniperOld:
 
     async def _market_exit(self, asset_id: str, label: str, reason: str = "market"):
         """Exit immediately at current OKX best bid using IOC sell."""
+        self.state._market_exit_reason = reason
         self.log(f"Market exit ({reason}) — selling at best bid")
         await self._handle_timeout(asset_id, label)
 
@@ -867,8 +868,10 @@ class PolySniperOld:
                     if exit_filled >= 1:
                         profit = exit_filled * (best_bid - self.state.buy_price)
                         self.log(f"Timeout exit @{best_bid:.2f} x{normalize_size_str(exit_filled)} | +{profit:.2f} xp")
+                        exit_reason = getattr(self.state, "_market_exit_reason", "timeout")
+                        prefix = "⏰ 超时出" if exit_reason == "timeout" else "⚡ 市价出"
                         await self._notify(
-                            f"⏰ 超时出 @{best_bid:.2f} x{normalize_size_str(exit_filled)} | +{profit:.2f} xp"
+                            f"{prefix} @{best_bid:.2f} x{normalize_size_str(exit_filled)} | +{profit:.2f} xp"
                         )
                         self._reset_to_monitoring()
                         return
@@ -896,6 +899,8 @@ class PolySniperOld:
         self.state.sell_target = 0.0
         self.state.sell_order_id = ""
         self.state.hold_start = 0.0
+        if hasattr(self.state, "_market_exit_reason"):
+            delattr(self.state, "_market_exit_reason")
         self.log("Resumed monitoring")
 
     # ─── Helpers ───
