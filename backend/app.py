@@ -362,18 +362,42 @@ async def account_markets(account_id: str, user: str = Depends(verify_auth)):
         return {"markets": [], "error": str(e)}
 
 
+def _invert_okx_book(book: dict) -> dict:
+    """OKX exposes only YES pm-books; synthesize NO by inverting YES book."""
+    bids = []
+    asks = []
+    for a in book.get("asks", []) or []:
+        if not a:
+            continue
+        row = list(a)
+        row[0] = f"{1 - float(a[0]):.2f}"
+        bids.append(row)
+    for b in book.get("bids", []) or []:
+        if not b:
+            continue
+        row = list(b)
+        row[0] = f"{1 - float(b[0]):.2f}"
+        asks.append(row)
+    bids.sort(key=lambda x: float(x[0]), reverse=True)
+    asks.sort(key=lambda x: float(x[0]))
+    return {"bids": bids, "asks": asks}
+
+
 @app.get("/api/accounts/{account_id}/orderbook")
-async def account_orderbook(account_id: str, asset_id: str, user: str = Depends(verify_auth)):
+async def account_orderbook(account_id: str, asset_id: str, yes_asset_id: str = "", user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
     try:
-        data = await inst.client.get_orderbook(asset_id, depth=10)
+        query_asset = yes_asset_id or asset_id
+        invert = bool(yes_asset_id and yes_asset_id != asset_id)
+        data = await inst.client.get_orderbook(query_asset, depth=10)
         if isinstance(data, dict) and "data" in data:
             book = data["data"]
             if isinstance(book, list) and len(book) > 0:
-                return {"bids": book[0].get("bids", []), "asks": book[0].get("asks", [])}
-        return {"bids": [], "asks": []}
+                raw = {"bids": book[0].get("bids", []), "asks": book[0].get("asks", [])}
+                return _invert_okx_book(raw) if invert else raw
+        return {"bids": [], "asks": [], "raw": data if isinstance(data, dict) else None}
     except Exception as e:
         return {"bids": [], "asks": [], "error": str(e)}
 
@@ -407,6 +431,13 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         "sniper_no_asset": getattr(inst.sniper.state, "no_asset_id", "") if inst.sniper.running else "",
         "sniper_poly_url": getattr(inst.sniper.state, "poly_url", "") if inst.sniper.running else "",
         "sniper_selected_outcome": getattr(inst.sniper.state, "selected_outcome", "") if inst.sniper.running else "",
+        "sniper_old_status": inst.sniper_old.state.status if inst.sniper_old.running else "stopped",
+        "sniper_old_yes_token": getattr(inst.sniper_old.state, "yes_token_id", "") if inst.sniper_old.running else "",
+        "sniper_old_no_token": getattr(inst.sniper_old.state, "no_token_id", "") if inst.sniper_old.running else "",
+        "sniper_old_yes_asset": getattr(inst.sniper_old.state, "yes_asset_id", "") if inst.sniper_old.running else "",
+        "sniper_old_no_asset": getattr(inst.sniper_old.state, "no_asset_id", "") if inst.sniper_old.running else "",
+        "sniper_old_poly_url": getattr(inst.sniper_old.state, "poly_url", "") if inst.sniper_old.running else "",
+        "sniper_old_selected_outcome": getattr(inst.sniper_old.state, "selected_outcome", "") if inst.sniper_old.running else "",
         "manual_s_price": getattr(inst.strategy_s.state, "price_a", None) if inst.strategy_s.running else None,
         "manual_s_sell_price": getattr(inst.strategy_s.state, "sell_price", None) if inst.strategy_s.running else None,
         "manual_s_mode": getattr(inst.strategy_s.state, "mode", "classic") if inst.strategy_s.running else None,
