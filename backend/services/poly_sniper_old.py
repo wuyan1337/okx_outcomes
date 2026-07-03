@@ -307,11 +307,7 @@ class PolySniperOld:
                 self.log("OKX snapshot failed — no asks, skipping")
                 return
             snapshot_best_ask = float(snapshot_asks[0][0])
-            # Sanity: if OKX already caught up (best ask >= poly new price), no arb
-            if snapshot_best_ask >= current_bid:
-                self.log(f"OKX already caught up: ask={snapshot_best_ask:.2f} >= poly={current_bid:.3f}, skipping")
-                return
-            self.log(f"OKX snapshot: best ask={snapshot_best_ask:.2f} (poly={current_bid:.3f}, spread={round((current_bid - snapshot_best_ask)*100)}¢)")
+            self.log(f"OKX snapshot: best ask={snapshot_best_ask:.2f} (poly={current_bid:.3f})")
 
             # BUY FIRST — execute immediately at snapshot prices
             bought = await self._execute_buy_immediate(side, okx_asset, snapshot_asks, window_low, current_bid)
@@ -347,16 +343,21 @@ class PolySniperOld:
                     await self._notify(f"⚠️ settle价 {final_price:.3f} ≤ 成本 {self.state.buy_price:.2f}, 市价出")
                     await self._handle_timeout(asset_id, label)
                     return
-                # Post sell at settled price
-                await self._post_sell_at_price(final_price)
+                # Old mode: do not post a GTC sell at Poly/snapshot premium.
+                # Exit immediately with IOC at current OKX best bid (marketable sell).
+                asset_id = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
+                label = "YES" if side == "yes" else "NO"
+                await self._market_exit(asset_id, label, reason="settled")
                 return
             # Check every 50ms
             await asyncio.sleep(0.05)
-        # If stopped during settling — still need to post sell at whatever we have
+        # If stopped during settling — exit at current OKX best bid.
         if self.state.buy_size > 0 and self.state.status == "holding":
             self.state.settling = False
-            # Use current settle_price as best available
-            await self._post_sell_at_price(self.state.settle_price)
+            side = self.state.settle_side or self.state.holding_side
+            asset_id = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
+            label = "YES" if side == "yes" else "NO"
+            await self._market_exit(asset_id, label, reason="settle-stopped")
 
     async def _snapshot_okx_asks(self, asset_id: str) -> list:
         """Instantly grab OKX asks at trigger moment."""
@@ -382,17 +383,18 @@ class PolySniperOld:
             f"\u26a1 {label} \u8df3\u4ef7: {prev_bid:.3f}\u2192{current_bid:.3f} (+{jump_c}\u00a2)"
         )
 
-        # Take N levels from SNAPSHOT, only those cheaper than poly price
-        levels = [l for l in snapshot_asks[:self.config.ask_levels] if float(l[0]) < current_bid]
+        # Take first N levels from SNAPSHOT. Do not filter by Poly price:
+        # Old mode uses snapshot liquidity to get in, then exits via IOC sell.
+        levels = snapshot_asks[:self.config.ask_levels]
         if not levels:
-            self.log(f"No asks below poly price {current_bid:.3f}, skipping")
+            self.log("No snapshot ask levels, skipping")
             await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: \u65e0\u6df1\u5ea6")
             self.state.status = "monitoring"
             return False
         max_price = float(levels[-1][0])
         total_ask_size = sum(float(lvl[1]) for lvl in levels)
 
-        self.log(f"Executing immediate buy: ask levels={len(levels)}, max_price={max_price:.2f}")
+        self.log(f"Executing immediate buy: ask levels={len(levels)}, max_price={max_price:.2f}, poly={current_bid:.3f}")
 
         # Calculate buy size
         try:
@@ -588,10 +590,11 @@ class PolySniperOld:
             self.state.status = "monitoring"
             return
 
-        # Take N levels from SNAPSHOT, only those cheaper than poly price
-        levels = [l for l in snapshot_asks[:self.config.ask_levels] if float(l[0]) < poly_new_price]
+        # Take first N levels from SNAPSHOT. Do not filter by Poly price:
+        # Old mode exits via IOC sell instead of relying on premium GTC sell.
+        levels = snapshot_asks[:self.config.ask_levels]
         if not levels:
-            self.log(f"No asks below poly price {poly_new_price:.3f}, skipping")
+            self.log("No snapshot ask levels, skipping")
             await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: \u65e0\u6df1\u5ea6")
             self.state.status = "monitoring"
             return
@@ -686,49 +689,17 @@ class PolySniperOld:
             self.state.status = "monitoring"
             return
 
-        # Buy success
+        # Buy success — immediately exit via IOC sell at current OKX best bid.
         self.state.holding_side = side
         self.state.buy_price = fill_price
         self.state.buy_size = filled_size
-        # Post sell at Poly new price (ensure above cost)
-        # Price tick: 0.01 for 0.04-0.96, 0.001 outside that range
-        tick = 0.001 if (poly_new_price < 0.04 or poly_new_price > 0.96) else 0.01
-        decimals = 3 if tick == 0.001 else 2
-        sell_price_raw = round(poly_new_price, decimals)
-        if sell_price_raw <= fill_price:
-            sell_price_raw = round(fill_price + tick, decimals)
-
-        self.state.sell_target = sell_price_raw
+        self.state.sell_target = 0.0
         self.state.hold_start = time.monotonic()
         self.state.hold_start_epoch_ms = int(time.time() * 1000)
 
         self.log(f"Bought {label} @{fill_price:.2f} x{normalize_size_str(filled_size)}")
         await self._notify(f"✅ 已买入 {label} @{fill_price:.2f} x{normalize_size_str(filled_size)}")
-
-        sell_price_str = f"{sell_price_raw:.{decimals}f}"
-        sell_size_str = normalize_size_str(filled_size)
-        try:
-            sell_resp = await self.client.place_order(
-                asset_id=asset_id,
-                side="sell",
-                price=sell_price_str,
-                size=sell_size_str,
-                tif="gtc",
-            )
-            if str(sell_resp.get("code", "")) == "0":
-                self.state.sell_order_id = sell_resp.get("data", {}).get("oid", "") or sell_resp.get("data", {}).get("orderId", "")
-                self.log(f"Posted sell @{sell_price_str} x{sell_size_str}")
-                await self._notify(f"📤 已挂 Sell {label} @{sell_price_str} x{normalize_size_str(filled_size)}")
-            else:
-                msg = sell_resp.get("message", sell_resp.get("msg", ""))
-                self.log(f"Sell post failed: {msg}")
-                await self._notify(f"⚠️ 挂卖失败: {msg}")
-        except Exception as e:
-            self.log(f"Sell order exception: {e}")
-            await self._notify(f"⚠️ 挂卖异常: {e}")
-
-        # Start holding monitor
-        self._hold_task = asyncio.create_task(self._holding_loop())
+        await self._market_exit(asset_id, label, reason="post-buy")
 
     # ─── Holding ───
 
@@ -792,9 +763,14 @@ class PolySniperOld:
         except asyncio.CancelledError:
             pass
 
+    async def _market_exit(self, asset_id: str, label: str, reason: str = "market"):
+        """Exit immediately at current OKX best bid using IOC sell."""
+        self.log(f"Market exit ({reason}) — selling at best bid")
+        await self._handle_timeout(asset_id, label)
+
     async def _handle_timeout(self, asset_id: str, label: str):
-        """Timeout: try to exit at best available price."""
-        self.log(f"Timeout ({self.config.timeout_secs}s) — attempting exit")
+        """Exit at best available OKX bid with IOC sell."""
+        self.log(f"Market/timeout exit ({self.config.timeout_secs}s config) — attempting IOC sell")
 
         # Cancel sell order
         if self.state.sell_order_id:
