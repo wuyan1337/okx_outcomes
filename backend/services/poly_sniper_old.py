@@ -744,10 +744,10 @@ class PolySniperOld:
 
                     if sell_filled >= self.state.buy_size * 0.95:
                         profit = sell_filled * (self.state.sell_target - self.state.buy_price)
-                        self.log(f"Sell filled @{self.state.sell_target:.2f} x{normalize_size_str(sell_filled)} | +{profit:.2f} xp")
+                        self.log(f"Sell filled @{self.state.sell_target:.2f} x{normalize_size_str(sell_filled)} | {profit:+.2f} xp")
                         await self._notify(
                             f"💰 Sell {label} 成交 @{self.state.sell_target:.2f} "
-                            f"x{normalize_size_str(sell_filled)} | +{profit:.2f} xp"
+                            f"x{normalize_size_str(sell_filled)} | {profit:+.2f} xp"
                         )
                         self._reset_to_monitoring()
                         return
@@ -814,8 +814,8 @@ class PolySniperOld:
                 if remaining < 1:
                     # Already fully sold via partial fills before cancel took effect
                     profit = self.state.buy_size * (self.state.sell_target - self.state.buy_price)
-                    self.log(f"Already sold via partial fills | +{profit:.2f} xp")
-                    await self._notify(f"💰 Sell {label} 成交 (partial) | +{profit:.2f} xp")
+                    self.log(f"Already sold via partial fills | {profit:+.2f} xp")
+                    await self._notify(f"💰 Sell {label} 成交 (partial) | {profit:+.2f} xp")
                     self._reset_to_monitoring()
                     return
                 # Try up to 5 times to exit remaining at best bid
@@ -867,11 +867,11 @@ class PolySniperOld:
 
                     if exit_filled >= 1:
                         profit = exit_filled * (best_bid - self.state.buy_price)
-                        self.log(f"Timeout exit @{best_bid:.2f} x{normalize_size_str(exit_filled)} | +{profit:.2f} xp")
+                        self.log(f"Timeout exit @{best_bid:.2f} x{normalize_size_str(exit_filled)} | {profit:+.2f} xp")
                         exit_reason = getattr(self.state, "_market_exit_reason", "timeout")
                         prefix = "⏰ 超时出" if exit_reason == "timeout" else "⚡ 市价出"
                         await self._notify(
-                            f"{prefix} @{best_bid:.2f} x{normalize_size_str(exit_filled)} | +{profit:.2f} xp"
+                            f"{prefix} @{best_bid:.2f} x{normalize_size_str(exit_filled)} | {profit:+.2f} xp"
                         )
                         self._reset_to_monitoring()
                         return
