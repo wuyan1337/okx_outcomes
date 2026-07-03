@@ -79,6 +79,7 @@ class PolySniper:
         self._ws_calibrated = {"yes": False, "no": False}
         self._price_window: Dict[str, list] = {"yes": [], "no": []}  # [(timestamp, price), ...]
         self._baseline: Dict[str, float] = {"yes": 0.0, "no": 0.0}  # Tracks high watermark per side
+        self._last_no_trigger_log: Dict[str, float] = {"yes": 0.0, "no": 0.0}  # Rate-limit no-trigger logs
 
     @property
     def running(self) -> bool:
@@ -111,6 +112,7 @@ class PolySniper:
 
         self._price_window = {"yes": [], "no": []}
         self._baseline = {"yes": 0.0, "no": 0.0}
+        self._last_no_trigger_log = {"yes": 0.0, "no": 0.0}
         self.state = SniperState(
             status="monitoring",
             yes_token_id=yes_token_id,
@@ -291,7 +293,20 @@ class PolySniper:
             window.pop(0)
         # Calculate cumulative jump: current price vs lowest price in window
         window_low = min(p for _, p in window)
-        jump_cents = round((current_bid - window_low) * 100)
+        jump_cents_raw = (current_bid - window_low) * 100
+        jump_cents = round(jump_cents_raw)
+        if jump_cents < self.config.threshold_cents:
+            # Explain non-actions without flooding logs: log near misses or once every ~2s per side.
+            last_log = self._last_no_trigger_log.get(side, 0.0)
+            near_miss = jump_cents >= max(1, self.config.threshold_cents - 3)
+            if near_miss or now - last_log >= 2.0:
+                self._last_no_trigger_log[side] = now
+                needed = self.config.threshold_cents - jump_cents
+                self.log(
+                    f"NO TRIGGER: {side.upper()} {window_low:.3f}→{current_bid:.3f} "
+                    f"(+{jump_cents_raw:.1f}¢/{jump_cents}¢) < threshold {self.config.threshold_cents}¢ "
+                    f"(need +{needed}¢, window={self.config.window_ms}ms, points={len(window)})"
+                )
         if jump_cents >= self.config.threshold_cents:
             self._price_window[side] = []  # Reset window after trigger
             # Bounce filter: if current price is far below baseline, this is a dead cat bounce during crash
