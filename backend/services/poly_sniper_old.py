@@ -374,13 +374,47 @@ class PolySniperOld:
             label = "YES" if side == "yes" else "NO"
             await self._market_exit(asset_id, label, reason="settle-stopped")
 
+
+    def _okx_query_asset(self, side_or_asset: str) -> str:
+        """OKX pm-books exists only for YES asset; NO book must be inferred from YES book."""
+        return self.state.yes_asset_id if side_or_asset == "no" or side_or_asset == self.state.no_asset_id else side_or_asset
+
+    def _invert_asks_from_yes_book(self, yes_bids: list) -> list:
+        """Synthetic NO asks = 1 - YES bids."""
+        out = []
+        for b in yes_bids or []:
+            if not b:
+                continue
+            row = list(b)
+            row[0] = f"{1 - float(b[0]):.2f}"
+            out.append(row)
+        out.sort(key=lambda x: float(x[0]))
+        return out
+
+    def _invert_bids_from_yes_book(self, yes_asks: list) -> list:
+        """Synthetic NO bids = 1 - YES asks."""
+        out = []
+        for a in yes_asks or []:
+            if not a:
+                continue
+            row = list(a)
+            row[0] = f"{1 - float(a[0]):.2f}"
+            out.append(row)
+        out.sort(key=lambda x: float(x[0]), reverse=True)
+        return out
+
     async def _snapshot_okx_asks(self, asset_id: str) -> list:
         """Instantly grab OKX asks at trigger moment."""
         try:
-            book = await self.client.get_orderbook(asset_id, depth=10)
+            query_asset = self._okx_query_asset(asset_id)
+            book = await self.client.get_orderbook(query_asset, depth=10)
             if str(book.get("code", "")) != "0":
+                self.log(f"OKX snapshot book error for {query_asset}: {book.get('msg','')}")
                 return []
-            asks = book.get("data", [{}])[0].get("asks", [])
+            data = book.get("data", [{}])[0]
+            if asset_id == self.state.no_asset_id:
+                return self._invert_asks_from_yes_book(data.get("bids", []))
+            asks = data.get("asks", [])
             return asks  # [[price, size], ...]
         except Exception as e:
             self.log(f"OKX snapshot error: {e}")
@@ -797,14 +831,15 @@ class PolySniperOld:
 
         # Check OKX best bid
         try:
-            book = await self.client.get_orderbook(asset_id, depth=5)
+            book = await self.client.get_orderbook(self._okx_query_asset(asset_id), depth=5)
             if str(book.get("code", "")) != "0":
                 await self._notify(f"🚨 超时+无法获取orderbook, 已停止等待人工介入")
                 self.state.status = "stopped"
                 self._running = False
                 return
 
-            bids = book.get("data", [{}])[0].get("bids", [])
+            _book_data = book.get("data", [{}])[0]
+            bids = self._invert_bids_from_yes_book(_book_data.get("asks", [])) if asset_id == self.state.no_asset_id else _book_data.get("bids", [])
             if not bids:
                 await self._notify(f"🚨 超时+OKX无bid, 已停止等待人工介入")
                 self.state.status = "stopped"
@@ -840,9 +875,10 @@ class PolySniperOld:
                     if attempt > 0:
                         await asyncio.sleep(1)
                         try:
-                            book2 = await self.client.get_orderbook(asset_id, depth=5)
+                            book2 = await self.client.get_orderbook(self._okx_query_asset(asset_id), depth=5)
                             if str(book2.get("code", "")) == "0":
-                                bids2 = book2.get("data", [{}])[0].get("bids", [])
+                                _book_data2 = book2.get("data", [{}])[0]
+                                bids2 = self._invert_bids_from_yes_book(_book_data2.get("asks", [])) if asset_id == self.state.no_asset_id else _book_data2.get("bids", [])
                                 if bids2:
                                     best_bid = float(bids2[0][0])
                                     if best_bid < self.state.buy_price:

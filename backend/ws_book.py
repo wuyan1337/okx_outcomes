@@ -34,6 +34,26 @@ def _sort_poly_book(bids, asks, limit=10):
 OKX_WS_PUBLIC = "wss://ws.okx.com:8443/ws/v5/public"
 
 
+def _invert_okx_book_arrays(bids, asks):
+    inv_bids = []
+    inv_asks = []
+    for a in asks or []:
+        if not a:
+            continue
+        row = list(a)
+        row[0] = f"{1 - float(a[0]):.2f}"
+        inv_bids.append(row)
+    for b in bids or []:
+        if not b:
+            continue
+        row = list(b)
+        row[0] = f"{1 - float(b[0]):.2f}"
+        inv_asks.append(row)
+    inv_bids.sort(key=lambda x: float(x[0]), reverse=True)
+    inv_asks.sort(key=lambda x: float(x[0]))
+    return inv_bids, inv_asks
+
+
 async def poly_ws_relay(ws_out: WebSocket, token_id: str, stop_event: asyncio.Event):
     """Connect to Polymarket WS and relay book updates to frontend."""
     url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -100,7 +120,7 @@ async def poly_ws_relay(ws_out: WebSocket, token_id: str, stop_event: asyncio.Ev
             retry_delay *= 2
 
 
-async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str, stop_event: asyncio.Event):
+async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str, stop_event: asyncio.Event, invert: bool = False):
     """Connect to OKX WS and relay pm-books5 updates to frontend."""
     retry_delay = 1
     while not stop_event.is_set():
@@ -123,11 +143,15 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str, stop_e
                                 snap = await snap_resp.json()
                                 if snap.get("code") == "0" and snap.get("data"):
                                     book = snap["data"][0]
+                                    bids = book.get("bids", [])[:10]
+                                    asks = book.get("asks", [])[:10]
+                                    if invert:
+                                        bids, asks = _invert_okx_book_arrays(bids, asks)
                                     await ws_out.send_json({
                                         "source": "okx",
                                         "ts": int(time.time() * 1000),
-                                        "bids": book.get("bids", [])[:10],
-                                        "asks": book.get("asks", [])[:10],
+                                        "bids": bids[:10],
+                                        "asks": asks[:10],
                                     })
                     except Exception:
                         pass
@@ -152,6 +176,8 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str, stop_e
                                     book = data["data"][0] if data["data"] else {}
                                     bids = book.get("bids", [])
                                     asks = book.get("asks", [])
+                                    if invert:
+                                        bids, asks = _invert_okx_book_arrays(bids, asks)
                                     out = {
                                         "source": "okx",
                                         "ts": int(time.time() * 1000),
@@ -172,7 +198,7 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str, stop_e
             retry_delay *= 2
 
 
-async def periodic_refresh(ws_out: WebSocket, poly_token: str, okx_asset: str, proxy_node: str, stop_event: asyncio.Event):
+async def periodic_refresh(ws_out: WebSocket, poly_token: str, okx_asset: str, proxy_node: str, stop_event: asyncio.Event, invert: bool = False):
     """Fallback: refresh via REST every 5s to keep data fresh when WS is quiet."""
     while not stop_event.is_set():
         await asyncio.sleep(3)
@@ -212,11 +238,15 @@ async def periodic_refresh(ws_out: WebSocket, poly_token: str, okx_asset: str, p
                                     data = await resp.json()
                                     if data.get("code") == "0" and data.get("data"):
                                         book = data["data"][0]
+                                        bids = book.get("bids", [])[:10]
+                                        asks = book.get("asks", [])[:10]
+                                        if invert:
+                                            bids, asks = _invert_okx_book_arrays(bids, asks)
                                         await ws_out.send_json({
                                             "source": "okx",
                                             "ts": int(time.time() * 1000),
-                                            "bids": book.get("bids", [])[:10],
-                                            "asks": book.get("asks", [])[:10],
+                                            "bids": bids[:10],
+                                            "asks": asks[:10],
                                         })
                     except Exception:
                         pass
@@ -242,6 +272,9 @@ def register_ws_routes(app, manager):
             sub = json.loads(raw)
             poly_token = sub.get("poly_token", "")
             okx_asset = sub.get("okx_asset", "")
+            yes_asset = sub.get("yes_asset", "")
+            invert_okx = bool(yes_asset and okx_asset and yes_asset != okx_asset)
+            okx_query_asset = yes_asset if invert_okx else okx_asset
 
             inst = manager.get_instance(account_id)
             proxy_node = inst.proxy_node if inst else "JP2"
@@ -252,11 +285,11 @@ def register_ws_routes(app, manager):
                 ))
             if okx_asset:
                 tasks.append(asyncio.create_task(
-                    okx_ws_relay(websocket, okx_asset, proxy_node, stop_event)
+                    okx_ws_relay(websocket, okx_query_asset, proxy_node, stop_event, invert_okx)
                 ))
             # Always add periodic refresh as fallback
             tasks.append(asyncio.create_task(
-                periodic_refresh(websocket, poly_token, okx_asset, proxy_node, stop_event)
+                periodic_refresh(websocket, poly_token, okx_query_asset, proxy_node, stop_event, invert_okx)
             ))
 
             if not tasks:
