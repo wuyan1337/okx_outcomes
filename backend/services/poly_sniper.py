@@ -611,13 +611,11 @@ class PolySniper:
             # Fallback: try live (shouldn't happen normally)
             self.log("No snapshot available, trying live orderbook")
             try:
-                book = await self.client.get_orderbook(asset_id, depth=10)
-                if str(book.get("code", "")) != "0":
-                    self.log(f"Orderbook error: {book.get('msg','')}")
+                snapshot_asks = await self._snapshot_okx_asks(asset_id)
+                if not snapshot_asks:
                     await self._notify(f"❌ 买入失败: OKX orderbook error")
                     self.state.status = "monitoring"
                     return
-                snapshot_asks = book.get("data", [{}])[0].get("asks", [])
             except Exception as e:
                 self.log(f"Orderbook fetch error: {e}")
                 await self._notify(f"❌ 买入失败: {e}")
