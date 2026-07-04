@@ -785,16 +785,44 @@ class PolySniper:
     # ─── Holding ───
 
     async def _holding_loop(self):
-        """Monitor sell order until filled or timeout."""
+        """Hold after buy: 1s Poly stoploss check, then timeout IOC exit."""
         try:
             asset_id = self.state.yes_asset_id if self.state.holding_side == "yes" else self.state.no_asset_id
+            token_id = self.state.yes_token_id if self.state.holding_side == "yes" else self.state.no_token_id
             label = "YES" if self.state.holding_side == "yes" else "NO"
 
             while self._running and self.state.status == "holding":
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.1)
+                elapsed = time.monotonic() - self.state.hold_start
 
-                # Check sell order fill status
-                # API doesn't return oid from place_order, so poll orders if no oid
+                # One-shot stoploss check after 1 second:
+                # If OKX average buy cost is ABOVE current Polymarket bid1, exit immediately
+                # using the same IOC best-bid sell path as timeout. Re-fetch Poly bid1 here
+                # instead of relying on the websocket cache, so the comparison is current.
+                if elapsed >= 1.0 and not getattr(self.state, "_stoploss_checked", False):
+                    self.state._stoploss_checked = True
+                    poly_bid1 = await self._get_poly_bid(token_id)
+                    if poly_bid1 is None:
+                        poly_bid1 = self.state.last_yes_bid if self.state.holding_side == "yes" else self.state.last_no_bid
+                        if poly_bid1:
+                            self.log(f"Stoploss 1s: Poly bid1 fetch failed, using cached {poly_bid1:.3f}")
+                    if poly_bid1 and self.state.buy_price > poly_bid1:
+                        self.log(
+                            f"Stoploss 1s: buy_avg={self.state.buy_price:.3f} > "
+                            f"Poly bid1={poly_bid1:.3f}, exiting at OKX best bid"
+                        )
+                        await self._notify(
+                            f"STOPLOSS 1s: buy_avg={self.state.buy_price:.3f} > "
+                            f"Poly bid1={poly_bid1:.3f}, IOC sell"
+                        )
+                        await self._market_exit(asset_id, label, reason="stoploss-1s")
+                        return
+                    if poly_bid1:
+                        self.log(f"Stoploss 1s OK: buy_avg={self.state.buy_price:.3f} <= Poly bid1={poly_bid1:.3f}")
+                    else:
+                        self.log("Stoploss 1s skipped: Poly bid1 unavailable")
+
+                # Check sell order fill status (legacy GTC sell compatibility; normally no sell_order_id in current flow)
                 try:
                     sell_filled = 0.0
                     if self.state.sell_order_id:
@@ -808,22 +836,8 @@ class PolySniper:
                                 self.state.sell_order_id = ""
                                 await self._handle_timeout(asset_id, label)
                                 return
-                    else:
-                        # No oid — scan SELL orders for this asset since hold_start
-                        hold_start_ms = getattr(self.state, 'hold_start_epoch_ms', int(time.time() * 1000))
-                        for status_filter in ("open", "closed"):
-                            orders_resp = await self.client.get_orders(status=status_filter)
-                            if str(orders_resp.get("code", "")) == "0":
-                                for o in orders_resp.get("data", {}).get("list", []):
-                                    if (o.get("assetId") == asset_id and
-                                        o.get("side", "").upper() == "SELL" and
-                                        int(o.get("createdAt", "0") or "0") >= hold_start_ms):
-                                        sell_filled += float(o.get("filledSize", "0") or "0")
-                                        found_oid = o.get("id", o.get("oid", ""))
-                                        if found_oid:
-                                            self.state.sell_order_id = found_oid
 
-                    if sell_filled >= self.state.buy_size * 0.95:
+                    if self.state.sell_order_id and sell_filled >= self.state.buy_size * 0.95:
                         profit = sell_filled * ((self.state.sell_target or 0.0) - self.state.buy_price)
                         self.log(f"Sell filled @{self.state.sell_target:.2f} x{normalize_size_str(sell_filled)} | +{profit:.2f} xp")
                         await self._notify(
@@ -835,10 +849,9 @@ class PolySniper:
                 except Exception as e:
                     self.log(f"Sell check error: {e}")
 
-                # Check timeout
-                elapsed = time.monotonic() - self.state.hold_start
+                # Timeout exit: market/IOC sell at current OKX best bid.
                 if elapsed >= self.config.timeout_secs:
-                    await self._handle_timeout(asset_id, label)
+                    await self._market_exit(asset_id, label, reason="timeout")
                     return
 
         except asyncio.CancelledError:
