@@ -27,7 +27,7 @@ class SniperConfig:
     buy_limit_cents: int = 50    # Max buy price in cents
     position_pct: int = 100         # Balance percentage to use
     timeout_secs: int = 120         # Seconds before forced exit
-    settle_ms: int = 0           # Ms to wait for price to stabilize after jump
+    settle_ms: int = 3000        # Ms to wait before force-exiting after buy
     window_ms: int = 150            # Rolling window for cumulative jump detection
 
 
@@ -97,7 +97,7 @@ class PolySniper:
                     yes_asset_id: str, no_asset_id: str, market_id: str,
                     threshold_cents: int = 40, buy_limit_cents: int = 50,
                     position_pct: int = 100, timeout_secs: int = 120,
-                    settle_ms: int = 0, window_ms: int = 150,
+                    settle_ms: int = 3000, window_ms: int = 150,
                     poly_url: str = "", selected_outcome: str = ""):
         """Start sniper monitoring."""
         if self._running:
@@ -258,12 +258,13 @@ class PolySniper:
         else:
             return
 
-        # If currently settling, update settle price to latest value
+        # If currently settling, update observed Poly price only.
+        # Timer is NOT extended by new ticks: Poly New exits after a fixed
+        # settle window (default 3s) regardless of final profit/loss.
         if self.state.settling and side == self.state.settle_side:
             if current_bid != self.state.settle_price:
                 self.state.settle_price = current_bid
-                self.state.settle_last_update = time.monotonic()
-                self.log(f"Settle update: {side.upper()} now {current_bid:.3f}")
+                self.log(f"Settle update: {side.upper()} now {current_bid:.3f} (timer not extended)")
             return
 
         # Ignore updates during settling for the other side
@@ -341,35 +342,35 @@ class PolySniper:
             asyncio.create_task(self._settle_then_sell())
 
     async def _settle_then_sell(self):
-        """After buying, wait for Poly price to stabilize, then post sell at final price."""
+        """Wait a fixed window, then exit immediately at OKX best bid."""
         settle_sec = self.config.settle_ms / 1000.0
         while self._running and self.state.settling:
             elapsed = time.monotonic() - self.state.settle_last_update
             if elapsed >= settle_sec:
-                # Price stable
                 final_price = self.state.settle_price
                 initial_price = self.state.settle_initial
                 side = self.state.settle_side
                 self.state.settling = False
-                self.log(f"Settled: {side.upper()} final={final_price:.3f} (from {initial_price:.3f})")
-                # If price reverted below buy cost, stop immediately
-                if final_price <= self.state.buy_price:
-                    self.log(f"Settled price {final_price:.3f} <= buy cost {self.state.buy_price:.2f}, selling at best bid")
-                    asset_id = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
-                    label = "YES" if side == "yes" else "NO"
-                    await self._notify(f"⚠️ settle价 {final_price:.3f} ≤ 成本 {self.state.buy_price:.2f}, 市价出")
-                    await self._handle_timeout(asset_id, label)
-                    return
-                # Post sell at settled price
-                await self._post_sell_at_price(final_price)
+                asset_id = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
+                label = "YES" if side == "yes" else "NO"
+                self.log(f"Settle window done: {side.upper()} final={final_price:.3f} (from {initial_price:.3f}), exiting at OKX best bid")
+                await self._notify(f"settle {int(self.config.settle_ms)}ms ended, exiting at OKX best bid: {label} final={final_price:.3f}")
+                await self._market_exit(asset_id, label, reason="settled")
                 return
-            # Check every 50ms
             await asyncio.sleep(0.05)
-        # If stopped during settling — still need to post sell at whatever we have
+        # If stopped during settling, still try to exit at OKX best bid.
         if self.state.buy_size > 0 and self.state.status == "holding":
             self.state.settling = False
-            # Use current settle_price as best available
-            await self._post_sell_at_price(self.state.settle_price)
+            side = self.state.settle_side or self.state.holding_side
+            asset_id = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
+            label = "YES" if side == "yes" else "NO"
+            await self._market_exit(asset_id, label, reason="settle-stopped")
+
+    async def _market_exit(self, asset_id: str, label: str, reason: str = "market"):
+        """Exit immediately at current OKX best bid using IOC sell."""
+        self.state._market_exit_reason = reason
+        self.log(f"Market exit ({reason}) - selling at best bid")
+        await self._handle_timeout(asset_id, label)
 
 
     def _okx_query_asset(self, side_or_asset: str) -> str:
@@ -962,6 +963,8 @@ class PolySniper:
         self.state.sell_target = 0.0
         self.state.sell_order_id = ""
         self.state.hold_start = 0.0
+        if hasattr(self.state, "_market_exit_reason"):
+            delattr(self.state, "_market_exit_reason")
         self.log("Resumed monitoring")
 
     # ─── Helpers ───
