@@ -332,13 +332,15 @@ class PolySniper:
             if not bought:
                 return
 
-            # THEN settle — watch Poly for final stable price to determine sell target
+            # THEN settle — fixed timer. After 1s, check Poly bid1 vs avg buy cost;
+            # if bid1 is below cost, market-exit immediately. Otherwise exit at 3s.
             self.state.settling = True
             self.state.settle_side = side
             self.state.settle_price = current_bid
             self.state.settle_initial = prev_bid
             self.state.settle_last_update = time.monotonic()
-            # Start settle timer task (will post sell when done)
+            self.state._stoploss_checked = False
+            # Start settle timer task (will market-exit, not post GTC sell)
             asyncio.create_task(self._settle_then_sell())
 
     async def _settle_then_sell(self):
@@ -346,13 +348,27 @@ class PolySniper:
         settle_sec = self.config.settle_ms / 1000.0
         while self._running and self.state.settling:
             elapsed = time.monotonic() - self.state.settle_last_update
+            side = self.state.settle_side
+            asset_id = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
+            label = "YES" if side == "yes" else "NO"
+            current_poly_bid1 = self.state.settle_price
+
+            # One-shot stoploss check exactly after the first second:
+            # if our OKX avg buy cost is above current Poly bid1, exit immediately.
+            if elapsed >= 1.0 and not getattr(self.state, "_stoploss_checked", False):
+                self.state._stoploss_checked = True
+                if self.state.buy_price > current_poly_bid1:
+                    self.state.settling = False
+                    self.log(f"Stoploss: buy_avg={self.state.buy_price:.3f} > Poly bid1={current_poly_bid1:.3f} after 1s, exiting at OKX best bid")
+                    await self._notify(f"STOPLOSS 1s: buy_avg={self.state.buy_price:.3f} > Poly bid1={current_poly_bid1:.3f}, exiting at OKX best bid")
+                    await self._market_exit(asset_id, label, reason="stoploss-1s")
+                    return
+                self.log(f"Stoploss check OK: buy_avg={self.state.buy_price:.3f} <= Poly bid1={current_poly_bid1:.3f}")
+
             if elapsed >= settle_sec:
                 final_price = self.state.settle_price
                 initial_price = self.state.settle_initial
-                side = self.state.settle_side
                 self.state.settling = False
-                asset_id = self.state.yes_asset_id if side == "yes" else self.state.no_asset_id
-                label = "YES" if side == "yes" else "NO"
                 self.log(f"Settle window done: {side.upper()} final={final_price:.3f} (from {initial_price:.3f}), exiting at OKX best bid")
                 await self._notify(f"settle {int(self.config.settle_ms)}ms ended, exiting at OKX best bid: {label} final={final_price:.3f}")
                 await self._market_exit(asset_id, label, reason="settled")
@@ -965,6 +981,8 @@ class PolySniper:
         self.state.hold_start = 0.0
         if hasattr(self.state, "_market_exit_reason"):
             delattr(self.state, "_market_exit_reason")
+        if hasattr(self.state, "_stoploss_checked"):
+            delattr(self.state, "_stoploss_checked")
         self.log("Resumed monitoring")
 
     # ─── Helpers ───
