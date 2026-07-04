@@ -894,16 +894,9 @@ class PolySniper:
                     await self._notify(f"💰 Sell {label} 成交 (partial) | +{profit:.2f} xp")
                     self._reset_to_monitoring()
                     return
-                # Try up to 5 times to exit remaining at best bid.
-                # IMPORTANT: partial fills must NOT clear state.  Keep reducing
-                # remaining and only reset when the whole position is sold.
-                total_exit_filled = 0.0
+                # Try up to 5 times to exit remaining at best bid
+                size_str = normalize_size_str(remaining)
                 for attempt in range(5):
-                    if remaining < 1:
-                        self.log("Timeout exit complete: no remaining position")
-                        self._reset_to_monitoring()
-                        return
-
                     # Re-scan orderbook for fresh best bid (except first attempt)
                     if attempt > 0:
                         await asyncio.sleep(1)
@@ -918,9 +911,8 @@ class PolySniper:
                                         self.log(f"Retry {attempt+1}/5: bid={best_bid:.2f} < cost, selling at loss")
                         except Exception:
                             pass
-                        self.log(f"Retry {attempt+1}/5: trying @{best_bid:.2f}, remaining={normalize_size_str(remaining)}")
+                        self.log(f"Retry {attempt+1}/5: trying @{best_bid:.2f}")
 
-                    size_str = normalize_size_str(remaining)
                     exit_resp = await self.client.place_order(
                         asset_id=asset_id,
                         side="sell",
@@ -951,33 +943,18 @@ class PolySniper:
                         pass
 
                     if exit_filled >= 1:
-                        exit_filled = min(exit_filled, remaining)
-                        remaining -= exit_filled
-                        total_exit_filled += exit_filled
-                        # Preserve remaining position in state until fully sold.
-                        self.state.buy_size = max(remaining, 0.0)
                         profit = exit_filled * (best_bid - self.state.buy_price)
-                        self.log(
-                            f"Timeout exit partial @{best_bid:.2f} x{normalize_size_str(exit_filled)} | "
-                            f"remaining={normalize_size_str(remaining)} | {profit:+.2f} xp"
-                        )
+                        self.log(f"Timeout exit @{best_bid:.2f} x{normalize_size_str(exit_filled)} | +{profit:.2f} xp")
                         await self._notify(
-                            f"⏰ 超时出(部分) @{best_bid:.2f} x{normalize_size_str(exit_filled)} | "
-                            f"剩余 {normalize_size_str(remaining)} | {profit:+.2f} xp"
+                            f"⏰ 超时出 @{best_bid:.2f} x{normalize_size_str(exit_filled)} | +{profit:.2f} xp"
                         )
-                        if remaining < 1:
-                            self.log(f"Timeout exit fully sold, total={normalize_size_str(total_exit_filled)}")
-                            await self._notify(f"✅ Timeout exit fully sold: x{normalize_size_str(total_exit_filled)}")
-                            self._reset_to_monitoring()
-                            return
-                        continue
+                        self._reset_to_monitoring()
+                        return
+                    self.log(f"Attempt {attempt+1}/5: 0 fill")
 
-                    self.log(f"Attempt {attempt+1}/5: 0 fill, remaining={normalize_size_str(remaining)}")
-
-                # All 5 attempts done but position remains — keep state stopped with remaining size.
-                self.state.buy_size = remaining
-                self.log(f"Timeout: exit incomplete after 5 attempts, remaining={normalize_size_str(remaining)}, stopping for manual intervention")
-                await self._notify(f"🚨 卖出未完成, 剩余 {normalize_size_str(remaining)}, 已停止等待人工介入")
+                # All 5 attempts failed — stop for manual intervention
+                self.log("Timeout: 5 attempts all 0 fill, stopping")
+                await self._notify("🚨 卖出5次均无成交, 已停止等待人工介入")
                 self.state.status = "stopped"
                 self._running = False
 
