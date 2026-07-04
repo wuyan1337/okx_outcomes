@@ -26,8 +26,8 @@ class SniperConfig:
     threshold_cents: int = 40       # Jump threshold in cents
     buy_limit_cents: int = 50    # Max buy price in cents
     position_pct: int = 100         # Balance percentage to use
-    timeout_secs: int = 120         # Seconds before forced exit
-    settle_ms: int = 3000        # Ms to wait before force-exiting after buy
+    timeout_secs: int = 3           # Seconds before forced exit
+    settle_ms: int = 0           # Ms to wait for price to stabilize after jump
     window_ms: int = 150            # Rolling window for cumulative jump detection
 
 
@@ -96,8 +96,8 @@ class PolySniper:
     async def start(self, yes_token_id: str, no_token_id: str,
                     yes_asset_id: str, no_asset_id: str, market_id: str,
                     threshold_cents: int = 40, buy_limit_cents: int = 50,
-                    position_pct: int = 100, timeout_secs: int = 120,
-                    settle_ms: int = 3000, window_ms: int = 150,
+                    position_pct: int = 100, timeout_secs: int = 3,
+                    settle_ms: int = 0, window_ms: int = 150,
                     poly_url: str = "", selected_outcome: str = ""):
         """Start sniper monitoring."""
         if self._running:
@@ -332,16 +332,11 @@ class PolySniper:
             if not bought:
                 return
 
-            # THEN settle — fixed timer. After 1s, check Poly bid1 vs avg buy cost;
-            # if bid1 is below cost, market-exit immediately. Otherwise exit at 3s.
-            self.state.settling = True
-            self.state.settle_side = side
-            self.state.settle_price = current_bid
-            self.state.settle_initial = prev_bid
-            self.state.settle_last_update = time.monotonic()
-            self.state._stoploss_checked = False
-            # Start settle timer task (will market-exit, not post GTC sell)
-            asyncio.create_task(self._settle_then_sell())
+            # Buy succeeded: do not settle and do not post GTC sell.
+            # Just hold for timeout_secs, then use the existing timeout/market-exit logic.
+            self.log(f"Holding for timeout={self.config.timeout_secs}s, then exiting via timeout logic")
+            self._hold_task = asyncio.create_task(self._holding_loop())
+            return
 
     async def _settle_then_sell(self):
         """Wait a fixed window, then exit immediately at OKX best bid."""
@@ -796,7 +791,7 @@ class PolySniper:
             label = "YES" if self.state.holding_side == "yes" else "NO"
 
             while self._running and self.state.status == "holding":
-                await asyncio.sleep(5)
+                await asyncio.sleep(0.5)
 
                 # Check sell order fill status
                 # API doesn't return oid from place_order, so poll orders if no oid
@@ -829,7 +824,7 @@ class PolySniper:
                                             self.state.sell_order_id = found_oid
 
                     if sell_filled >= self.state.buy_size * 0.95:
-                        profit = sell_filled * (self.state.sell_target - self.state.buy_price)
+                        profit = sell_filled * ((self.state.sell_target or 0.0) - self.state.buy_price)
                         self.log(f"Sell filled @{self.state.sell_target:.2f} x{normalize_size_str(sell_filled)} | +{profit:.2f} xp")
                         await self._notify(
                             f"💰 Sell {label} 成交 @{self.state.sell_target:.2f} "
@@ -894,7 +889,7 @@ class PolySniper:
                         pass
                 if remaining < 1:
                     # Already fully sold via partial fills before cancel took effect
-                    profit = self.state.buy_size * (self.state.sell_target - self.state.buy_price)
+                    profit = self.state.buy_size * ((self.state.sell_target or 0.0) - self.state.buy_price)
                     self.log(f"Already sold via partial fills | +{profit:.2f} xp")
                     await self._notify(f"💰 Sell {label} 成交 (partial) | +{profit:.2f} xp")
                     self._reset_to_monitoring()

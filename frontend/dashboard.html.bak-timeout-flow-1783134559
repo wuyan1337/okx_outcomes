@@ -1,0 +1,1007 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAMgAAADICAMAAACahl6sAAAAS1BMVEUWFhb///8XFxf+/v7y8vKsrKwpKSlra2sVFxZycnITExOkpKQlJSUZGRkbGxv6+vovLy/19fXf39/q6uqenp6zs7MfHx+WlpaSkpJfJZ/GAAADv0lEQVR4nO2dDXPbIAyGQY7dFRvctE26//9LJ0i2axMvKBm4wnuf68ddDgse24Sm0hljDHlP5itEl698O8tDIvpx5tSkCZHlV9sTWX71s8iSrD6RZb6KLLZYcziPsyCi8G5a4mKQyyINmFyOcXFWNCByNcaGRX4P86/DbU7kRpvVxvMwn0QaZyseV7P7hhZ9+dUwEPluNjR72hRZWOTbFOGPteI3MNX4yyWlUY/zIt/qZbhiMyLbwX33AAAAAPwnkHPBeZ9t5/mvNnfP+hQDkxME9jwAV+BPEU8uCAbouJ0P98QNJ/dsYBMc5X3z8NmIvVEGz6fN33HmuK1ne5+LG0fAF6+ACHk/DMPLkGFK35P41HluzFGnXNzY8XVu8AH4zA2vuzz79PNdHvjj02G3eR2cYC5lRcgMO9vZLovlVgd54J6b2zkftbO7wRSYJHxFXt4kGvFr7sVxaWQJO0siv72UuCI8jad9PN0Zkom9R4SvRzwsG7jbT5f/aHhMxA27fHfnTnt5h6OVaMRGu8FBBCIQgQhEIAIRiEAEIhCBCEQgAhGIQAQiEIEIRCACEYisJxKMSRkroYg88GhPaa5cyJixSsP4R5yRZazsHId1yKax/6Sdx5h4k5ycmLEqUClHnlgkn+uzKRnayzsc052VzyDOLEIF8tPenLK62QuS0oj9UXpFwjh3okmSsrqmROkD8WQXdRiToeJ7mZKI4ObqeLKXKIr1RGmOCG6t7t5bS5ScjnOECuTZydE09jLG/uNJzM/Y/iAKO1GB6qBYiRQ4TvZdyDsf6ClfynBmfiY65mt1uGMXOPaaFdfcl3+SLp3WPvMBJaZweSCiDYhoAyLagIg2IKINiGgDItqAiDYgog2IaAMi2oCINiCiDYhoAyLagIg2IKINiGgDItpQLlKvYMCbo3FhtYKBiiUcozBumRKOakU1vRVUgRUsqqlW5tSzx6plTrUKz5KI5OEVhQrPqpUC9lb0YJRipYDVijN7SY2pLVecWatc1h+687zKeRQql61VwMyTXRpUdyU2RCACEYhABCIQgQhEIAIRiEAEIhCBCEQgAhGIQAQiENmgSJ0H4KfUmyDRU+wB+LW2JDD9fDomH7nMlgTVNok4iB6LUnSTiDrbdryvvG1H1Y1UhhU3Uqm1tQ2l5mHFrW1qbTZkgnfk19tsqNr2T7GxpGLrvu2fzhexfTYj0uz2utdARBsQ0cZmRAAAAIAyUJmPyJURLOBtfDYRDLENEQlb8QAA3KaNdUTAZt5+NyOCdQSALfILqglnAy9AWdEAAAAASUVORK5CYII=">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Shinori</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0;}input[type=number]{-moz-appearance:textfield;}
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0a0f;--surface:#1c1825;--surface2:#241f2e;--border:#2e2840;--text:#ece8f4;--dim:#9b8fb8;--muted:#5c5270;--green:#34d399;--red:#f87171;--blue:#818cf8;--yellow:#fbbf24;--accent:#a78bfa;--font:'Inter',sans-serif;--mono:'JetBrains Mono',monospace}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--font);font-size:14px;overflow:hidden}
+header{display:flex;align-items:center;justify-content:space-between;padding:12px 24px;border-bottom:1px solid var(--border);background:var(--surface);height:52px}
+.logo{font-size:16px;font-weight:700;letter-spacing:1px;color:var(--accent);display:flex;align-items:center;gap:10px}
+.back-btn{width:32px;height:32px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:var(--surface2);border:1px solid var(--border);cursor:pointer;transition:all .15s;color:var(--dim)}
+.back-btn:hover{border-color:var(--accent);color:var(--text)}
+.back-btn svg{width:16px;height:16px}
+.hright{display:flex;align-items:center;gap:12px}
+.badge{display:flex;align-items:center;gap:6px;font-size:13px;font-family:var(--mono)}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot-g{background:var(--green);box-shadow:0 0 6px var(--green)}
+.dot-r{background:var(--red);box-shadow:0 0 6px var(--red)}
+.hbtn{background:var(--surface2);border:1px solid var(--border);color:var(--dim);font-family:var(--font);font-size:13px;padding:6px 14px;cursor:pointer;border-radius:6px;transition:all .15s}
+.hbtn:hover{border-color:var(--accent);color:var(--text)}
+.kpi{display:grid;grid-template-columns:repeat(4,1fr);border-bottom:1px solid var(--border);height:72px}
+.kpi-5{grid-template-columns:repeat(5,1fr)}
+.kpi-i{padding:14px 20px;border-right:1px solid var(--border);display:flex;flex-direction:column;justify-content:center}
+.kpi-i:last-child{border-right:none}
+.kpi-l{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;font-weight:500}
+.kpi-v{font-size:20px;font-weight:700;font-family:var(--mono)}
+.green{color:var(--green)}.red{color:var(--red)}
+.grid{display:grid;grid-template-columns:1.4fr 1fr;height:calc(100vh - 124px)}
+.col{display:flex;flex-direction:column;border-right:1px solid var(--border);overflow-y:auto}
+.col:last-child{border-right:none}
+.panel{padding:16px 20px;border-bottom:1px solid var(--border)}
+.panel:last-child{border-bottom:none}
+.ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.pt{font-size:12px;font-weight:600;letter-spacing:1.5px;color:var(--dim);text-transform:uppercase}
+.tabs{display:flex;gap:4px}
+.tab{padding:7px 14px;font-size:13px;font-weight:500;color:var(--muted);cursor:pointer;border-radius:6px;transition:all .15s;user-select:none}
+.tab.active{color:var(--text);background:var(--surface2)}
+.tab:hover{color:var(--text)}
+.tc{display:none}.tc.active{display:block}
+.fg{margin-bottom:14px}
+.fg label{display:block;font-size:12px;color:var(--dim);margin-bottom:6px;font-weight:500}
+.fg input,.fg select{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:14px;padding:10px 12px;outline:none;border-radius:6px;transition:border-color .15s}
+.fg input:focus,.fg select:focus{border-color:var(--accent)}
+input:-webkit-autofill,input:-webkit-autofill:hover,input:-webkit-autofill:focus{-webkit-box-shadow:0 0 0 1000px var(--bg) inset !important;-webkit-text-fill-color:var(--text) !important;transition:background-color 5000s ease-in-out 0s}
+.fg select{cursor:pointer;-webkit-appearance:none}
+.calc{background:var(--bg);border:1px solid var(--border);padding:10px 12px;font-size:14px;color:var(--blue);border-radius:6px;margin-bottom:12px;font-family:var(--mono)}
+.profit{color:var(--green);font-size:13px;margin-bottom:14px;font-weight:500}
+.btn-go{width:100%;padding:12px;background:var(--green);color:#000;font-family:var(--font);font-size:14px;font-weight:600;border:none;cursor:pointer;border-radius:6px;transition:opacity .15s}
+.btn-go:hover{opacity:.85}
+.btn-stop{width:100%;padding:12px;background:var(--red);color:#fff;font-family:var(--font);font-size:14px;font-weight:600;border:none;cursor:pointer;border-radius:6px;transition:opacity .15s}
+.btn-stop:hover{opacity:.85}
+.btn-cx{width:100%;padding:10px;background:transparent;border:1px solid var(--red);color:var(--red);font-family:var(--font);font-size:13px;font-weight:600;cursor:pointer;border-radius:6px;margin-top:10px;transition:all .15s}
+.btn-cx:hover{background:var(--red);color:#fff}
+.ob{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.ob h4{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;font-weight:600}
+.obr{display:flex;justify-content:space-between;padding:4px 0;font-size:13px;font-family:var(--mono)}
+.ob-bid .obp{color:var(--green)}.ob-ask .obp{color:var(--red)}.obs{color:var(--dim)}
+.btn-sm{padding:6px 12px;font-size:12px}
+.monitor-section{margin:16px 0;background:var(--surface2);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.monitor-toggle{display:flex;align-items:center;gap:8px;padding:10px 14px;cursor:pointer;font-size:13px;font-weight:600;color:var(--muted);transition:color .15s;user-select:none}
+.monitor-toggle:hover{color:var(--text)}
+.monitor-arrow{font-size:10px;transition:transform .2s;display:inline-block}
+.monitor-body{padding:0 14px 14px}
+.monitor-row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+.monitor-row .fg{margin:0;flex:1;min-width:140px}
+.monitor-row .fg.fg-sm{flex:0 0 120px;min-width:100px}
+.monitor-foot{display:flex;align-items:center;justify-content:space-between;margin-top:10px;gap:12px}
+.monitor-status{font-size:12px;font-family:var(--mono);display:flex;align-items:center;gap:6px}
+.monitor-status .dot-ind{width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0}
+.monitor-status .dot-ind.active{background:var(--green);box-shadow:0 0 6px var(--green)}
+.monitor-status .dot-ind.triggered{background:var(--red);box-shadow:0 0 6px var(--red)}
+table{width:100%;font-size:13px;border-collapse:collapse}
+th{text-align:left;color:var(--muted);font-weight:500;padding:6px 8px;border-bottom:1px solid var(--border);font-size:11px;text-transform:uppercase;letter-spacing:1px}
+td{padding:6px 8px;border-bottom:1px solid var(--surface2);font-family:var(--mono)}
+.buy{color:var(--green)}.sell{color:var(--red)}
+.cbtn{background:none;border:none;color:var(--red);cursor:pointer;font-size:14px;padding:2px 6px;border-radius:4px}.cbtn:hover{background:var(--surface2)}
+.log{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;height:180px;overflow-y:auto;font-size:12px;font-family:var(--mono);line-height:1.8}
+.log::-webkit-scrollbar{width:4px}.log::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+.sg{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;font-size:13px}
+.sk{color:var(--muted);font-weight:500}.sv{font-family:var(--mono)}.sv.on{color:var(--green)}.sv.off{color:var(--red)}
+.status-line{font-size:13px;margin-bottom:10px;font-family:var(--mono)}
+.sdrop{position:relative}
+.sdrop-btn{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:14px;padding:10px 12px;outline:none;border-radius:6px;cursor:pointer;text-align:left;transition:border-color .15s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sdrop-btn:focus,.sdrop.open .sdrop-btn{border-color:var(--accent)}
+.sdrop-panel{display:none;position:absolute;top:calc(100% + 4px);left:0;right:0;background:var(--surface);border:1px solid var(--border);border-radius:6px;z-index:100;max-height:260px;overflow:hidden;flex-direction:column;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+.sdrop.open .sdrop-panel{display:flex}
+.sdrop-search{padding:8px 10px;border-bottom:1px solid var(--border);background:var(--surface2)}
+.sdrop-search input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:13px;padding:7px 10px;outline:none;border-radius:4px}
+.sdrop-search input:focus{border-color:var(--accent)}
+.sdrop-search input::placeholder{color:var(--muted)}
+.sdrop-list{overflow-y:auto;max-height:200px;padding:4px 0}
+.sdrop-list::-webkit-scrollbar{width:4px}.sdrop-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+.sdrop-item{padding:8px 12px;font-size:13px;font-family:var(--mono);cursor:pointer;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background .1s}
+.sdrop-item:hover{background:var(--surface2);color:var(--text)}
+.sdrop-item.sel{color:var(--accent);background:var(--surface2)}
+.sdrop-empty{padding:12px;color:var(--muted);font-size:12px;text-align:center}
+/* Control panel cards */
+.ctrl-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:10px;padding:20px 24px;overflow-y:auto;height:calc(100vh - 124px);align-content:start}
+.ctrl-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:18px 20px;cursor:pointer;transition:all .2s;position:relative;overflow:hidden}
+.ctrl-card:hover{border-color:var(--accent);box-shadow:0 2px 12px rgba(167,139,250,.08)}
+.ctrl-card .c-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.ctrl-card .c-name{font-weight:600;font-size:15px}
+.ctrl-card .c-latency{font-size:10px;font-family:var(--mono);padding:2px 6px;border-radius:3px;background:var(--bg);color:var(--dim)}
+.ctrl-card .c-stats{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:4px}
+.ctrl-card .c-stat{display:flex;flex-direction:column;gap:1px}
+.ctrl-card .c-stat-l{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.3px}
+.ctrl-card .c-stat-v{font-size:14px;font-family:var(--mono);font-weight:500}
+.ctrl-card .c-status{position:absolute;top:0;left:0;width:3px;height:100%;background:var(--border);border-radius:8px 0 0 8px}
+.ctrl-card .c-status.running{background:var(--green)}
+.ctrl-actions{padding:12px 24px;display:flex;justify-content:center;gap:10px;border-top:1px solid var(--border)}
+.ctrl-btn{padding:10px 18px;font-size:13px;font-weight:600;border:none;cursor:pointer;border-radius:6px;font-family:var(--font)}
+.ctrl-btn-add{background:var(--accent);color:#000;padding:10px 24px;font-size:13px;letter-spacing:.5px}
+.ctrl-btn-add:hover{opacity:.85;transform:translateY(-1px)}
+/* Config toggle */
+.cfg-toggle{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:var(--muted);font-weight:500;letter-spacing:1px;text-transform:uppercase;margin-top:16px;padding-top:12px;border-top:1px solid var(--border)}
+.cfg-toggle:hover{color:var(--text)}
+.cfg-body{display:none;margin-top:12px}
+.cfg-body.open{display:block}
+.cfg-row{display:flex;gap:12px;margin-bottom:10px;align-items:center}
+.cfg-row label{width:90px;font-size:12px;color:var(--dim);font-weight:500;flex-shrink:0}
+.cfg-row input{flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:13px;padding:8px 10px;outline:none;border-radius:6px}
+.cfg-row input:focus{border-color:var(--accent)}
+/* Modal */
+.modal{position:fixed;inset:0;background:rgba(10,8,14,.88);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);z-index:9999;display:none;align-items:center;justify-content:center}
+.modal.show{display:flex}
+.modal-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:28px;width:480px;max-height:80vh;overflow-y:auto}
+.modal-box h2{font-size:15px;font-weight:600;color:var(--text);margin-bottom:20px}
+.sr{display:flex;align-items:center;margin-bottom:10px;gap:10px}
+.sr label{width:120px;font-size:12px;color:var(--dim);font-weight:500;flex-shrink:0}
+.sr input,.sr select{flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:13px;padding:8px 10px;outline:none;border-radius:6px}
+.sr input:focus{border-color:var(--accent)}
+.sa{display:flex;gap:10px;margin-top:18px}
+.sa button{padding:10px 20px;font-family:var(--font);font-size:13px;font-weight:600;border:none;cursor:pointer;border-radius:6px}
+.bsave{background:var(--green);color:#000}.bcancel{background:var(--surface2);color:var(--text)}
+.btest{background:var(--blue);color:#fff;font-size:12px;padding:6px 12px;border:none;cursor:pointer;font-family:var(--font);border-radius:4px}
+.bdel{background:var(--red);color:#fff}
+.fade-in{animation:fadeIn .2s ease-out}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.h-section{margin:12px 0 8px;padding-bottom:6px;border-bottom:1px solid var(--border);font-weight:600;color:var(--accent);font-size:12px}
+.h-row{display:flex;justify-content:space-between;padding:4px 0;font-size:12px;font-family:var(--mono)}
+#view-ctrl,#view-acct{display:none}
+@media(max-width:768px){.kpi,.kpi-5{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr;height:auto}.modal-box{width:95%}html,body{overflow:auto}.ctrl-grid{grid-template-columns:1fr}}
+
+.sn-panel{background:var(--bg2);border-radius:6px;padding:8px 10px;margin:8px 0;font-size:12px;line-height:1.6}
+.sn-row{display:flex;align-items:center;gap:6px}
+.sn-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.sn-dot.idle{background:var(--muted)}
+.sn-dot.monitoring{background:var(--green);box-shadow:0 0 6px var(--green);animation:pulse 2s infinite}
+.sn-dot.settling{background:#f59e0b;box-shadow:0 0 6px #f59e0b;animation:pulse 0.5s infinite}
+.sn-dot.holding{background:#3b82f6;box-shadow:0 0 6px #3b82f6}
+.sn-dot.stopped{background:var(--red);box-shadow:0 0 6px var(--red)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+.sn-state{font-weight:600;text-transform:uppercase;letter-spacing:0.5px}
+.sn-detail{color:var(--text);opacity:0.85;margin-left:auto;font-family:'JetBrains Mono',monospace;font-size:11px}
+.sn-prices{display:flex;gap:12px;margin-top:2px;padding-left:14px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)}
+.sn-timer{margin-top:4px;padding-left:14px;display:flex;align-items:center;gap:6px}
+.sn-bar{flex:1;height:3px;background:var(--bg);border-radius:2px;overflow:hidden;max-width:120px}
+.sn-bar-fill{height:100%;border-radius:2px;transition:width 1s linear}
+.sn-bar-fill.ok{background:var(--green)}
+.sn-bar-fill.warn{background:#f59e0b}
+.sn-bar-fill.danger{background:var(--red)}
+.sn-timer-text{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--muted)}
+select.cinput{-webkit-appearance:none;-moz-appearance:none;appearance:none;background:var(--bg);color:#fff;border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:13px;width:100%;cursor:pointer;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%23888' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;}
+select.cinput option{background:var(--bg);color:#fff;}
+
+.btn-group{display:flex;gap:0;}
+.btn-toggle{padding:4px 12px;border:1px solid var(--border);background:var(--card);color:var(--muted);cursor:pointer;font-size:12px;}
+.btn-toggle:first-child{border-radius:4px 0 0 4px;}
+.btn-toggle:last-child{border-radius:0 4px 4px 0;}
+.btn-toggle.active{background:var(--accent);color:#fff;border-color:var(--accent);}
+#mt-sell-modal{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(10,8,14,.85);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);display:none;align-items:center;justify-content:center;z-index:999;}
+#mt-sell-modal .modal-box{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:20px;min-width:300px;}
+
+.help-btn{width:24px;height:24px;border-radius:50%;background:rgba(124,92,252,.15);border:1px solid rgba(124,92,252,.4);color:#7c5cfc;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;text-decoration:none;cursor:pointer;transition:all .2s;align-self:center;margin-top:14px;flex-shrink:0}
+.help-btn:hover{background:rgba(124,92,252,.3);border-color:#7c5cfc;transform:scale(1.1)}
+</style>
+</head>
+<body>
+<!-- ═══ CONTROL PANEL ═══ -->
+<div id="view-ctrl">
+<header>
+<span class="logo">SHINORI</span>
+<div class="hright">
+<button class="hbtn" style="background:var(--accent);color:#000;border-color:var(--accent)" onclick="openAddAcct()">+ Add Account</button>
+<button class="hbtn" onclick="openHealth()">Health</button>
+<button class="hbtn" onclick="openGlobalSettings()">Settings</button>
+<button class="hbtn" onclick="doLogout()">Logout</button>
+</div>
+</header>
+<div class="kpi">
+<div class="kpi-i"><div class="kpi-l">Balance</div><div class="kpi-v" id="c-bal">--</div></div>
+<div class="kpi-i"><div class="kpi-l">Available</div><div class="kpi-v" id="c-avl">--</div></div>
+<div class="kpi-i"><div class="kpi-l">Orders</div><div class="kpi-v" id="c-ord">--</div></div>
+<div class="kpi-i"><div class="kpi-l">Positions</div><div class="kpi-v" id="c-pos">--</div></div>
+</div>
+<div class="ctrl-grid" id="acctGrid"><div style="color:var(--muted);padding:20px;font-size:13px">Loading...</div></div>
+
+</div>
+
+<!-- ═══ ACCOUNT VIEW ═══ -->
+<div id="view-acct">
+<header>
+<span class="logo">
+<div class="back-btn" onclick="window.location.hash='#/'" role="button" aria-label="Back to accounts" tabindex="0"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg></div>
+<span id="acctTitle">SHINORI</span>
+</span>
+<div class="hright">
+<div class="badge"><span class="dot dot-r" id="api-dot"></span><span id="api-st">OFFLINE</span></div>
+<span style="color:var(--muted);font-size:12px;font-family:var(--mono)" id="ts">--</span>
+<button class="hbtn" onclick="openHealth()">Health</button>
+<button class="hbtn" onclick="openAcctSettings()">Settings</button>
+<button class="hbtn" onclick="doLogout()">Logout</button>
+</div>
+</header>
+<div class="kpi kpi-5">
+<div class="kpi-i"><div class="kpi-l">Balance</div><div class="kpi-v" id="k-bal">--</div></div>
+<div class="kpi-i"><div class="kpi-l">Available</div><div class="kpi-v" id="k-avl">--</div></div>
+<div class="kpi-i"><div class="kpi-l">Orders</div><div class="kpi-v" id="k-ord">0</div></div>
+<div class="kpi-i"><div class="kpi-l">Positions</div><div class="kpi-v" id="k-pos">0</div></div>
+<div class="kpi-i"><div class="kpi-l">Engine</div><div class="kpi-v" id="k-eng">IDLE</div></div>
+</div>
+<div class="grid">
+<div class="col">
+<div class="panel" style="flex:1">
+<div class="ph"><span class="pt">Strategy</span>
+<div class="tabs">
+<div class="tab active" data-tab="0" onclick="stab(0)">Manual-D</div>
+<div class="tab" data-tab="1" onclick="stab(1)">Manual-S</div>
+<div class="tab" data-tab="4" onclick="stab(4)">Bid-Sell</div>
+<div class="tab" data-tab="2" onclick="stab(2)">Poly</div>
+<div class="tab" data-tab="5" onclick="stab(5)">Sniper Old</div>
+<div class="tab" data-tab="3" onclick="stab(3)">Manual</div>
+</div>
+</div>
+<!-- Manual-D -->
+<div class="tc active" id="t0">
+<div class="fg"><label>OKX Market</label>
+<div class="sdrop" id="sdrop-mkt"><button type="button" class="sdrop-btn" id="mkt-btn">-- Select market --</button><div class="sdrop-panel"><div class="sdrop-search"><input type="text" id="mkt-q" placeholder="Search markets..." autocomplete="off"></div><div class="sdrop-list" id="mkt-list"></div></div></div>
+<input type="hidden" id="mkt">
+</div>
+<div class="fg"><label>YES Price (a)</label><input type="number" id="mp" autocomplete="off" step="1" min="4" max="96" placeholder="e.g. 45" oninput="cc()"></div>
+<div class="calc" id="cn">NO price = 99 - a = --</div>
+
+<div class="fg"><label>Position %</label><input type="number" id="md-pct" value="100" min="1" max="100" step="1"></div>
+<div class="fg"><label>Scan Interval (s)</label><input type="number" id="md-scan-s" value="0.3" min="0.3" max="120" step="0.1"></div>
+<div class="status-line" id="ms" style="color:var(--muted)">Idle</div>
+<div class="monitor-section" id="md-mon-sec">
+<div class="monitor-toggle" onclick="toggleMonitor('md-mon-')"><span class="monitor-arrow" id="md-mon-arrow">&#9654;</span> POLY Monitor</div>
+<div class="monitor-body" id="md-mon-body" style="display:none">
+<div class="monitor-row"><div class="fg"><label>Poly URL</label><input type="text" id="md-mon-url" placeholder="https://polymarket.com/event/..." oninput="resolveMonitor('md-mon-')"></div><div class="fg fg-sm"><label>Threshold $</label><input type="number" id="md-mon-depth" value="3000" min="0" step="100"></div></div>
+<div class="fg" id="md-mon-sel-wrap" style="display:none"><label>Outcome</label><select id="md-mon-sel" onchange="onMonitorSel('md-mon-')"><option value="">-- Select --</option></select></div>
+<div class="monitor-row" style="margin-top:6px"><label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);cursor:pointer"><input type="checkbox" id="md-mon-rebal" onchange="toggleRebalance(this.checked)"> Auto-Rebalance</label><div class="fg fg-sm" style="margin-left:auto"><label>Stabilize (s)</label><input type="number" id="md-stab-s" value="0.3" min="0.3" max="120" step="0.1"></div></div>
+<div class="monitor-foot"><div class="monitor-status" id="md-mon-status"><span class="dot-ind"></span><span>Optional — select outcome to enable</span></div></div>
+</div></div>
+<button class="btn-go" id="mb" onclick="tgM()">Start Engine</button>
+</div>
+<!-- Manual-S -->
+<div class="tc" id="t1">
+<div class="fg"><label>OKX Market</label>
+<div class="sdrop" id="sdrop-smkt"><button type="button" class="sdrop-btn" id="smkt-btn">-- Select market --</button><div class="sdrop-panel"><div class="sdrop-search"><input type="text" id="smkt-q" placeholder="Search markets..." autocomplete="off"></div><div class="sdrop-list" id="smkt-list"></div></div></div>
+<input type="hidden" id="smkt">
+</div>
+<div class="fg"><label>Side</label><select id="ms-side" onchange="msSideChange()"><option value="YES">YES</option><option value="NO">NO</option></select></div>
+<div class="fg"><label>Price</label><input type="number" id="ms-price" autocomplete="off" step="1" min="4" max="96" placeholder="e.g. 45"></div>
+<div class="fg"><label>Position %</label><input type="number" id="ms-pct" value="100" min="1" max="100" step="1"></div>
+<div class="fg"><label>Scan Interval (s)</label><input type="number" id="ms-scan-s" value="0.3" min="0.3" max="120" step="0.1"></div>
+<div class="status-line" id="mss" style="color:var(--muted)">Idle</div>
+<div class="monitor-section" id="ms-mon-sec">
+<div class="monitor-toggle" onclick="toggleMonitor('ms-mon-')"><span class="monitor-arrow" id="ms-mon-arrow">&#9654;</span> POLY Monitor</div>
+<div class="monitor-body" id="ms-mon-body" style="display:none">
+<div class="monitor-row"><div class="fg"><label>Poly URL</label><input type="text" id="ms-mon-url" placeholder="https://polymarket.com/event/..." oninput="resolveMonitor('ms-mon-')"></div><div class="fg fg-sm"><label>Threshold $</label><input type="number" id="ms-mon-depth" value="3000" min="0" step="100"></div></div>
+<div class="fg" id="ms-mon-sel-wrap" style="display:none"><label>Outcome</label><select id="ms-mon-sel" onchange="onMonitorSel('ms-mon-')"><option value="">-- Select --</option></select></div>
+<div class="monitor-row" style="margin-top:6px"><label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);cursor:pointer"><input type="checkbox" id="ms-mon-rebal" onchange="toggleRebalance(this.checked)"> Auto-Rebalance</label><div class="fg fg-sm" style="margin-left:auto"><label>Stabilize (s)</label><input type="number" id="ms-stab-s" value="0.3" min="0.3" max="120" step="0.1"></div></div>
+<div class="monitor-foot"><div class="monitor-status" id="ms-mon-status"><span class="dot-ind"></span><span>Optional — select outcome to enable</span></div></div>
+</div></div>
+<button class="btn-go" id="msb" onclick="tgMS()">Start Manual-S</button>
+</div>
+<!-- Bid-Sell -->
+<div class="tc" id="t4">
+<div class="fg"><label>OKX Market</label>
+<div class="sdrop" id="sdrop-bsmkt"><button type="button" class="sdrop-btn" id="bsmkt-btn">-- Select market --</button><div class="sdrop-panel"><div class="sdrop-search"><input type="text" id="bsmkt-q" placeholder="Search markets..." autocomplete="off"></div><div class="sdrop-list" id="bsmkt-list"></div></div></div>
+<input type="hidden" id="bsmkt">
+</div>
+<div class="fg"><label>Side</label><select id="bs-side" onchange="bsSideChange()"><option value="YES">YES</option><option value="NO">NO</option></select></div>
+<div class="fg"><label>Price (sell level)</label><input type="number" id="bs-price" autocomplete="off" step="1" min="5" max="96" placeholder="e.g. 39 → B38/S39"></div>
+<div class="fg"><label>Position %</label><input type="number" id="bs-pct" value="100" min="1" max="100" step="1"></div>
+<div class="fg"><label>Scan Interval (s)</label><input type="number" id="bs-scan-s" value="0.3" min="0.3" max="120" step="0.1"></div>
+<div class="status-line" id="bss" style="color:var(--muted)">Idle</div>
+<div class="monitor-section" id="bs-mon-sec">
+<div class="monitor-toggle" onclick="toggleMonitor('bs-mon-')"><span class="monitor-arrow" id="bs-mon-arrow">&#9654;</span> POLY Monitor</div>
+<div class="monitor-body" id="bs-mon-body" style="display:none">
+<div class="monitor-row"><div class="fg"><label>Poly URL</label><input type="text" id="bs-mon-url" placeholder="https://polymarket.com/event/..." oninput="resolveMonitor('bs-mon-')"></div><div class="fg fg-sm"><label>Threshold $</label><input type="number" id="bs-mon-depth" value="3000" min="0" step="100"></div></div>
+<div class="fg" id="bs-mon-sel-wrap" style="display:none"><label>Outcome</label><select id="bs-mon-sel" onchange="onMonitorSel('bs-mon-')"><option value="">-- Select --</option></select></div>
+<div class="monitor-row" style="margin-top:6px"><label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);cursor:pointer"><input type="checkbox" id="bs-mon-rebal" onchange="toggleRebalance(this.checked)"> Auto-Rebalance</label><div class="fg fg-sm" style="margin-left:auto"><label>Stabilize (s)</label><input type="number" id="bs-stab-s" value="0.3" min="0.3" max="120" step="0.1"></div></div>
+<div class="monitor-foot"><div class="monitor-status" id="bs-mon-status"><span class="dot-ind"></span><span>Optional — select outcome to enable</span></div></div>
+</div></div>
+<button class="btn-go" id="bsb" onclick="tgBS()">Start Bid-Sell</button>
+</div>
+<!-- Poly Sniper -->
+<div class="tc" id="t2">
+<div class="fg"><label>OKX Market</label>
+<div class="sdrop" id="sdrop-pmkt"><button type="button" class="sdrop-btn" id="pmkt-btn">-- Select market --</button><div class="sdrop-panel"><div class="sdrop-search"><input type="text" id="pmkt-q" placeholder="Search markets..." autocomplete="off"></div><div class="sdrop-list" id="pmkt-list"></div></div></div>
+<input type="hidden" id="pmkt">
+</div>
+<div class="fg"><label>Polymarket URL</label><input type="text" id="pi" placeholder="https://polymarket.com/event/..." oninput="onPolyInput()"></div>
+<div class="fg" id="poly-sel-wrap" style="display:none"><label>Poly Outcome</label><select id="poly-sel" onchange="onPolySel()"><option value="">-- Select outcome --</option></select></div>
+<div class="monitor-row" style="margin-top:8px">
+<div class="fg fg-sm"><label>Threshold ¢</label><input type="number" id="sn-thresh" value="10" min="5" max="90" step="1"></div>
+<div class="fg fg-sm"><label>Buy Limit ¢</label><input type="number" id="sn-limit" value="50" min="1" max="95" step="1"></div>
+<div class="fg fg-sm"><label>Position %</label><input type="number" id="sn-pct" value="100" min="10" max="100" step="10"></div>
+<div class="fg fg-sm"><label>Timeout s</label><input type="number" id="sn-timeout" value="10" min="5" max="600" step="5"></div>
+<div class="fg fg-sm"><label>Settle ms</label><input type="number" id="sn-settle" value="3000" min="0" max="5000" step="100"></div>
+<div class="fg fg-sm"><label>Window ms</label><input type="number" id="sn-window" value="150" min="10" max="5000" step="100"></div>
+<a href="/sniper-help" target="_blank" class="help-btn" title="Parameter Guide">?</a>
+</div>
+<div class="sn-panel" id="sn-panel">
+<div class="sn-row"><span class="sn-dot idle" id="sn-dot"></span><span class="sn-state" id="sn-state">Idle</span><span class="sn-detail" id="sn-detail"></span></div>
+<div class="sn-prices" id="sn-prices" style="display:none"><span id="sn-yes">YES --</span><span id="sn-no">NO --</span></div>
+<div class="sn-timer" id="sn-timer" style="display:none"><div class="sn-bar"><div class="sn-bar-fill ok" id="sn-bar-fill"></div></div><span class="sn-timer-text" id="sn-timer-text"></span></div>
+</div>
+<div class="status-line" id="ps" style="display:none">Idle</div>
+<div id="sn-hold-info" style="display:none"></div>
+<button class="btn-go" id="pb" onclick="tgSniper()">Start Sniper</button>
+</div>
+<div class="tc" id="t5">
+<div class="fg"><label>OKX Market</label>
+<div class="sdrop" id="sdrop-somkt"><button type="button" class="sdrop-btn" id="somkt-btn">-- Select market --</button><div class="sdrop-panel"><div class="sdrop-search"><input type="text" id="somkt-q" placeholder="Search markets..." autocomplete="off"></div><div class="sdrop-list" id="somkt-list"></div></div></div>
+<input type="hidden" id="somkt">
+</div>
+<div class="fg"><label>Polymarket URL</label><input type="text" id="so-pi" placeholder="https://polymarket.com/event/..." oninput="onSoPolyInput()"></div>
+<div class="fg" id="so-poly-sel-wrap" style="display:none"><label>Poly Outcome</label><select id="so-poly-sel" onchange="onSoPolySel()"><option value="">-- Select outcome --</option></select></div>
+<div class="monitor-row" style="margin-top:8px">
+<div class="fg fg-sm"><label>Threshold ¢</label><input type="number" id="so-thresh" value="10" min="5" max="90" step="1"></div>
+<div class="fg fg-sm"><label>Position %</label><input type="number" id="so-pct" value="100" min="10" max="100" step="10"></div>
+<div class="fg fg-sm"><label>Timeout s</label><input type="number" id="so-timeout" value="10" min="5" max="600" step="5"></div>
+<div class="fg fg-sm"><label>Settle ms</label><input type="number" id="so-settle" value="0" min="0" max="5000" step="100"></div>
+<div class="fg fg-sm"><label>Window ms</label><input type="number" id="so-window" value="150" min="10" max="5000" step="100"></div>
+</div>
+<div class="sn-panel" id="so-panel">
+<div class="sn-row"><span class="sn-dot idle" id="so-dot"></span><span class="sn-state" id="so-state">Idle</span><span class="sn-detail" id="so-detail"></span></div>
+</div>
+<div class="status-line" id="so-ps" style="display:none">Idle</div>
+<button class="btn-go" id="sob" onclick="tgSniperOld()">Start Sniper Old</button>
+</div>
+<!-- Manual Trading -->
+<div class="tc" id="t3">
+<div class="fg"><label>Market</label>
+<div class="sdrop" id="sdrop-tmkt"><button type="button" class="sdrop-btn" id="tmkt-btn">-- Select market --</button><div class="sdrop-panel"><div class="sdrop-search"><input type="text" id="tmkt-q" placeholder="Search markets..." autocomplete="off"></div><div class="sdrop-list" id="tmkt-list"></div></div></div>
+<input type="hidden" id="tmkt">
+</div>
+<div class="fg"><label>Side</label>
+<div class="btn-group" id="mt-side-grp">
+<button type="button" class="btn-toggle active" id="mt-side-yes" onclick="mtSide('YES')">YES</button>
+<button type="button" class="btn-toggle" id="mt-side-no" onclick="mtSide('NO')">NO</button>
+</div></div>
+<div class="fg"><label>Mode</label>
+<div class="btn-group" id="mt-mode-grp">
+<button type="button" class="btn-toggle active" id="mt-mode-mkt" onclick="mtMode('market')">Market</button>
+<button type="button" class="btn-toggle" id="mt-mode-lmt" onclick="mtMode('limit')">Limit</button>
+</div></div>
+<!-- BUY Section -->
+<div style="margin-top:12px;padding:12px;background:var(--surface2);border-radius:8px;border:1px solid var(--border)">
+<div style="font-size:11px;color:var(--accent);font-weight:600;letter-spacing:1px;margin-bottom:10px">BUY</div>
+<div class="fg"><label>Best Ask</label><span id="mt-ask" style="color:var(--green)">--</span></div>
+<div id="mt-buy-limit-price" style="display:none"><div class="fg"><label>Price (¢)</label><input type="number" id="mt-lmt-price" autocomplete="off" step="1" min="4" max="96" placeholder="e.g. 12" oninput="mtCalcXp('buy')"></div></div>
+<div class="fg"><label>Size</label><div style="display:flex;gap:6px"><input type="number" id="mt-buy-size" autocomplete="off" step="1" min="1" placeholder="Quantity" oninput="mtCalcXp('buy')" style="flex:1"><button type="button" class="hbtn btn-sm" onclick="mtMax('buy')" style="padding:6px 10px;font-size:11px">MAX</button></div></div>
+<div class="fg"><label>XP Cost</label><input type="number" id="mt-buy-xp" autocomplete="off" step="0.01" min="0" placeholder="XP to spend" oninput="mtCalcSize('buy')"></div>
+<button class="btn-go" id="mt-buy-btn" onclick="mtBuy()">Buy @ --</button>
+</div>
+<!-- SELL Section -->
+<div style="margin-top:10px;padding:12px;background:var(--surface2);border-radius:8px;border:1px solid var(--border)">
+<div style="font-size:11px;color:var(--red);font-weight:600;letter-spacing:1px;margin-bottom:10px">SELL</div>
+<div style="font-size:12px;font-family:var(--mono);color:var(--dim);margin-bottom:10px" id="mt-sell-info">No position</div>
+<div class="fg"><label>Best Bid</label><span id="mt-bid" style="color:var(--red)">--</span></div>
+<div id="mt-sell-limit-price" style="display:none"><div class="fg"><label>Price (¢)</label><input type="number" id="mt-sell-lmt-price" autocomplete="off" step="1" min="4" max="96" placeholder="e.g. 45" oninput="mtCalcXp('sell')"></div></div>
+<div class="fg"><label>Size</label><div style="display:flex;gap:6px"><input type="number" id="mt-sell-size" autocomplete="off" step="any" min="0" placeholder="Quantity" oninput="mtCalcXp('sell')" style="flex:1" disabled><button type="button" class="hbtn btn-sm" onclick="mtMax('sell')" style="padding:6px 10px;font-size:11px" id="mt-sell-max-btn" disabled>MAX</button></div></div>
+<div class="fg"><label>XP Value</label><input type="number" id="mt-sell-xp" autocomplete="off" step="0.01" min="0" placeholder="XP received" oninput="mtCalcSize('sell')" disabled></div>
+<button class="btn-stop" id="mt-sell-btn" onclick="mtSell()" disabled>Sell @ --</button>
+</div>
+
+<div class="ph" style="margin-top:16px"><span class="pt">Positions</span><span class="badge" id="mt-pos-ct">0</span></div>
+<div class="tbl-wrap">
+<table class="tbl"><thead><tr><th>Market</th><th>Side</th><th>Qty</th><th>Avg</th><th>Value</th><th>Status</th><th>Action</th></tr></thead>
+<tbody id="mt-pos-tb"><tr><td colspan="7" style="color:var(--muted)">Loading...</td></tr></tbody></table>
+</div>
+
+<div class="ph" style="margin-top:16px"><span class="pt">Trade History</span></div>
+<div class="tbl-wrap" style="max-height:200px;overflow-y:auto">
+<table class="tbl"><thead><tr><th>Time</th><th>Market</th><th>Side</th><th>Token</th><th>Price</th><th>Qty</th><th>Total</th></tr></thead>
+<tbody id="mt-hist-tb"><tr><td colspan="7" style="color:var(--muted)">Loading...</td></tr></tbody></table>
+</div>
+</div>
+
+<!-- Monitor (independent) -->
+
+</div>
+<!-- Poly Orderbook -->
+<div class="panel" id="poly-ob-panel">
+<div class="ph"><span class="pt">POLY Order Book</span><span style="font-size:12px;color:var(--muted);font-family:var(--mono)" id="pob-status">Select a market</span></div>
+<div class="ob">
+<div class="ob-bid"><h4>Bids</h4><div id="pob-b"><div class="obr" style="color:var(--muted)">--</div></div></div>
+<div class="ob-ask"><h4>Asks</h4><div id="pob-a"><div class="obr" style="color:var(--muted)">--</div></div></div>
+</div>
+</div>
+<!-- OKX Orderbook -->
+<div class="panel" id="okx-ob-panel">
+<div class="ph"><span class="pt">OKX Order Book</span><span style="font-size:12px;color:var(--muted);font-family:var(--mono)" id="ob-id">Select a market</span></div>
+<div class="ob">
+<div class="ob-bid"><h4>Bids</h4><div id="ob-b"><div class="obr" style="color:var(--muted)">--</div></div></div>
+<div class="ob-ask"><h4>Asks</h4><div id="ob-a"><div class="obr" style="color:var(--muted)">--</div></div></div>
+</div>
+</div>
+</div>
+<div class="col">
+<div class="panel">
+<div class="ph"><span class="pt">Active Orders</span><span style="font-size:12px;color:var(--muted);font-family:var(--mono)" id="oc">0</span></div>
+<div style="max-height:200px;overflow-y:auto">
+<table><thead><tr><th>Side</th><th>Price</th><th>Size</th><th>Age</th><th></th></tr></thead>
+<tbody id="otb"><tr><td colspan="5" style="color:var(--muted)">No active orders</td></tr></tbody></table>
+</div>
+<div style="display:flex;gap:6px"><button class="btn-cx" onclick="cxAll()" style="flex:2">Cancel All</button><button class="btn-cx" onclick="flashClose()" style="flex:1">&#9889; Flash</button></div>
+</div>
+<div class="panel" style="flex:1">
+<div class="ph"><span class="pt">Log</span><span style="font-size:11px;color:var(--muted);cursor:pointer" onclick="logs=[];rl()">Clear</span></div>
+<div class="log" id="lg"></div>
+</div>
+<div class="panel">
+<div class="ph"><span class="pt">System</span></div>
+<div class="sg">
+<span class="sk">Strategy</span><span class="sv" id="s-st">none</span>
+<span class="sk">Mode</span><span class="sv off" id="s-md">STOPPED</span>
+<span class="sk">Cycles</span><span class="sv" id="s-cy">0</span>
+</div>
+</div>
+</div>
+</div>
+</div>
+
+<!-- ═══ MODALS ═══ -->
+<div class="modal" id="addModal" onclick="if(event.target===this)closeModal('addModal')">
+<div class="modal-box">
+<h2>Add Account</h2>
+<div class="sr"><label>Account Name</label><input id="aa-name" placeholder="e.g. Main"></div>
+<div class="sr"><label>API Key</label><input id="aa-ak"></div>
+<div class="sr"><label>Secret Key</label><input id="aa-sk" type="password"></div>
+<div class="sr"><label>Passphrase</label><input id="aa-pp" type="password"></div>
+<div class="sr"><label>Agent Key</label><input id="aa-ag"></div>
+<div class="sr"><label>Proxy Node</label><select id="aa-proxy"><option value="">Loading...</option></select></div>
+<div class="sr"><label>KYC Region</label><div style="position:relative"><select id="aa-region" class="cinput"><option value="AU">AU (us.okx.com)</option><option value="CN">CN (www.okx.com)</option></select></div></div>
+<div id="latInfo" style="font-size:11px;font-family:var(--mono);color:var(--dim);margin:8px 0 12px 130px;min-height:16px"></div>
+<div class="sa"><button class="bsave" onclick="doCreateAcct()">Create</button><button class="bcancel" onclick="closeModal('addModal')">Cancel</button></div>
+</div>
+</div>
+
+<div class="modal" id="healthModal" onclick="if(event.target===this)closeModal('healthModal')">
+<div class="modal-box" style="width:520px">
+<h2>System Health Check</h2>
+<div id="healthResults" style="font-size:12px;font-family:var(--mono);color:var(--dim)">Click Run to start...</div>
+<div class="sa"><button class="bsave" id="healthRunBtn" onclick="runHealth()">Run Check</button><button class="bcancel" onclick="closeModal('healthModal')">Close</button></div>
+</div>
+</div>
+
+<div class="modal" id="gsModal" onclick="if(event.target===this)closeModal('gsModal')">
+<div class="modal-box" style="width:420px">
+<h2>Global Settings</h2>
+<div class="sr"><label>Bot Token</label><input id="gs-token"></div>
+<div class="sr"><label>Chat IDs</label><input id="gs-chats" placeholder="comma separated"></div>
+<div class="sa"><button class="bsave" onclick="saveGS()">Save</button><button class="btest" onclick="testGS()">Test</button><button class="bcancel" onclick="closeModal('gsModal')">Cancel</button></div>
+</div>
+</div>
+
+<div class="modal" id="acctSetModal" onclick="if(event.target===this)closeModal('acctSetModal')">
+<div class="modal-box">
+<h2>Account Settings</h2>
+<div style="margin-bottom:18px"><h3 style="font-size:11px;color:var(--accent);letter-spacing:1px;margin-bottom:12px;text-transform:uppercase;font-weight:600">OKX API</h3>
+<div class="sr"><label>API Key</label><input id="cfg-ak"></div>
+<div class="sr"><label>Secret Key</label><input id="cfg-sk"></div>
+<div class="sr"><label>Passphrase</label><input id="cfg-pp"></div>
+<div class="sr"><label>Agent Key</label><input id="cfg-ag"></div>
+<div class="sr"><label>KYC Region</label><div style="position:relative"><select id="cfg-region" class="cinput"><option value="AU">AU (us.okx.com)</option><option value="CN">CN (www.okx.com)</option></select></div></div>
+</div>
+
+<div class="sa">
+<button class="bsave" onclick="saveAcctCfg()">Save</button>
+<button class="bcancel" onclick="closeModal('acctSetModal')">Cancel</button>
+<button class="bdel" onclick="confirmDeleteAcct()" style="margin-left:auto">Delete Account</button>
+</div>
+</div>
+</div>
+
+<script>
+var _k='okx_auth';var _s=window[String.fromCharCode(115,101,115,115,105,111,110,83,116,111,114,97,103,101)];var AUTH=_s.getItem(_k);
+if(!AUTH){window.location.replace('/login');document.body.style.display='none';}
+
+
+function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+var currentAcctId=null,currentAcctName='',ctrlPollId=null,acctPollId=null,navId=0;
+var _healthAbort=null,_acctCache={};
+var MR=false,PR=false,MSR=false,logs=[],SA='',obI=null;
+
+function gapi(p,o){o=o||{};return fetch(p,Object.assign({},o,{headers:Object.assign({},o.headers||{},{'Authorization':AUTH,'Content-Type':'application/json'})}));}
+function api(p,o){if(!currentAcctId)return gapi(p,o);var np=p;if(p.indexOf('/api/')===0&&p.indexOf('/api/accounts/')!==0&&p.indexOf('/api/global/')!==0&&p.indexOf('/api/proxy/')!==0){np='/api/accounts/'+currentAcctId+p.substring(4);}o=o||{};return fetch(np,Object.assign({},o,{headers:Object.assign({},o.headers||{},{'Authorization':AUTH,'Content-Type':'application/json'})}));}
+
+// Routing
+function route(){var h=window.location.hash||'#/';if(h.indexOf('#/account/')===0){showAccount(h.substring(10));}else{showControl();}}
+window.onhashchange=route;
+
+function closeAllModals(){['addModal','healthModal','gsModal','acctSetModal'].forEach(function(id){document.getElementById(id).classList.remove('show');});}
+function closeModal(id){document.getElementById(id).classList.remove('show');if(id==='healthModal'&&_healthAbort){_healthAbort.abort();_healthAbort=null;}}
+
+function showControl(){saveAcctState();navId++;currentAcctId=null;closeAllModals();disconnectBook(true);stopMonitorOb();_polyResolvedToken='';document.getElementById('view-ctrl').style.display='block';document.getElementById('view-acct').style.display='none';if(acctPollId){clearInterval(acctPollId);acctPollId=null;}if(obI){clearInterval(obI);obI=null;}if(ctrlPollId)clearInterval(ctrlPollId);pollCtrl();ctrlPollId=setInterval(pollCtrl,5000);}
+
+
+function saveAcctState(){if(!currentAcctId)return;_acctCache[currentAcctId]={mdUrl:document.getElementById('md-mon-url').value,mdSel:document.getElementById('md-mon-sel').value,mdDepth:document.getElementById('md-mon-depth').value,mdSelHtml:document.getElementById('md-mon-sel').innerHTML,mdSelWrap:document.getElementById('md-mon-sel-wrap').style.display,msUrl:document.getElementById('ms-mon-url').value,msSel:document.getElementById('ms-mon-sel').value,msDepth:document.getElementById('ms-mon-depth').value,msSelHtml:document.getElementById('ms-mon-sel').innerHTML,msSelWrap:document.getElementById('ms-mon-sel-wrap').style.display,polyUrl:document.getElementById('pi').value,mkt:document.getElementById('mkt').value,mktBtn:document.getElementById('mkt-btn').textContent,smkt:document.getElementById('smkt').value,smktBtn:document.getElementById('smkt-btn').textContent,mp:document.getElementById('mp').value,msPrice:document.getElementById('ms-price').value,msSide:document.getElementById('ms-side').value,bsPrice:document.getElementById('bs-price').value,bsSide:document.getElementById('bs-side').value,bsDepth:document.getElementById('bs-mon-depth').value,bsMkt:document.getElementById('bsmkt').value,bsMktBtn:document.getElementById('bsmkt-btn').textContent,mdScanS:document.getElementById('md-scan-s').value,mdStabS:document.getElementById('md-stab-s').value,msScanS:document.getElementById('ms-scan-s').value,msStabS:document.getElementById('ms-stab-s').value,bsScanS:document.getElementById('bs-scan-s').value,bsStabS:document.getElementById('bs-stab-s').value,soPolyUrl:document.getElementById('so-pi').value,soPolySelIdx:document.getElementById('so-poly-sel').selectedIndex,soPolySelHtml:document.getElementById('so-poly-sel').innerHTML,soPolySelWrap:document.getElementById('so-poly-sel-wrap').style.display,somkt:document.getElementById('somkt').value,somktBtn:document.getElementById('somkt-btn').textContent,soPolyYes:_soPolyYesToken,soPolyNo:_soPolyNoToken,logs:logs.slice(-50),tab:_activeTab};}
+function restoreAcctState(id){var s=_acctCache[id];if(!s)return false;document.getElementById('md-mon-url').value=s.mdUrl||'';document.getElementById('md-mon-sel').innerHTML=s.mdSelHtml||'<option value="">-- Select --</option>';document.getElementById('md-mon-sel').value=s.mdSel||'';document.getElementById('md-mon-depth').value=s.mdDepth||'3000';document.getElementById('md-mon-sel-wrap').style.display=s.mdSelWrap||'none';document.getElementById('ms-mon-url').value=s.msUrl||'';document.getElementById('ms-mon-sel').innerHTML=s.msSelHtml||'<option value="">-- Select --</option>';document.getElementById('ms-mon-sel').value=s.msSel||'';document.getElementById('ms-mon-depth').value=s.msDepth||'3000';document.getElementById('ms-mon-sel-wrap').style.display=s.msSelWrap||'none';document.getElementById('pi').value=s.polyUrl||'';if(s.mkt){document.getElementById('mkt').value=s.mkt;document.getElementById('mkt-btn').textContent=s.mktBtn||'Select Market';}if(s.smkt){document.getElementById('smkt').value=s.smkt;document.getElementById('smkt-btn').textContent=s.smktBtn||'Select Market';}if(s.mp)document.getElementById('mp').value=s.mp;if(s.msPrice)document.getElementById('ms-price').value=s.msPrice;if(s.msSide)document.getElementById('ms-side').value=s.msSide;if(s.bsPrice)document.getElementById('bs-price').value=s.bsPrice;if(s.bsSide)document.getElementById('bs-side').value=s.bsSide;if(s.bsDepth)document.getElementById('bs-mon-depth').value=s.bsDepth||'3000';if(s.bsMkt){document.getElementById('bsmkt').value=s.bsMkt;document.getElementById('bsmkt-btn').textContent=s.bsMktBtn||'Select Market';}if(s.mdScanS)document.getElementById('md-scan-s').value=s.mdScanS;if(s.mdStabS)document.getElementById('md-stab-s').value=s.mdStabS;if(s.msScanS)document.getElementById('ms-scan-s').value=s.msScanS;if(s.msStabS)document.getElementById('ms-stab-s').value=s.msStabS;if(s.bsScanS)document.getElementById('bs-scan-s').value=s.bsScanS;if(s.bsStabS)document.getElementById('bs-stab-s').value=s.bsStabS;if(s.logs&&s.logs.length){logs=s.logs;rl();}if(s.soPolyUrl!==undefined){document.getElementById('so-pi').value=s.soPolyUrl||'';}if(s.soPolySelHtml){document.getElementById('so-poly-sel').innerHTML=s.soPolySelHtml;document.getElementById('so-poly-sel').selectedIndex=s.soPolySelIdx||0;document.getElementById('so-poly-sel-wrap').style.display=s.soPolySelWrap||'none';}if(s.somkt){document.getElementById('somkt').value=s.somkt;document.getElementById('somkt-btn').textContent=s.somktBtn||'-- Select market --';}if(s.soPolyYes!==undefined){_soPolyYesToken=s.soPolyYes;_soPolyNoToken=s.soPolyNo||'';}if(s.tab!==undefined){_activeTab=s.tab;stab(s.tab);}return true;}
+function showAccount(id){saveAcctState();_activeTab=0;_cachedOkxBids=[];_cachedOkxAsks=[];_cachedPolyBids=[];_cachedPolyAsks=[];navId++;currentAcctId=id;MR=false;PR=false;MSR=false;BSR=false;logs=[];SA="";_monitorActive=false;stopMonitorOb();unlockMonitor("md-mon-");unlockMonitor("ms-mon-");unlockMonitor("bs-mon-");disconnectBook();if(obI){clearInterval(obI);obI=null;}_mkts=[];_mktMap={};document.getElementById("lg").innerHTML="";document.getElementById("mb").className="btn-go";document.getElementById("mb").textContent="Start Engine";document.getElementById("ms").textContent="Idle";document.getElementById("ms").style.color="var(--muted)";document.getElementById("msb").className="btn-go";document.getElementById("msb").textContent="Start Manual-S";document.getElementById("mss").textContent="Idle";document.getElementById("mss").style.color="var(--muted)";document.getElementById("pb").className="btn-go";document.getElementById("pb").textContent="Start Sniper";document.getElementById("ps").textContent="Idle";document.getElementById("ps").style.color="var(--muted)";document.getElementById("mp").value="";document.getElementById("ms-price").value="";document.getElementById("bs-price").value="";document.getElementById("pi").value="";document.getElementById("mkt").value="";document.getElementById("smkt").value="";document.getElementById("bsmkt").value="";document.getElementById("pmkt").value="";document.getElementById("mkt-btn").textContent="Select Market";document.getElementById("smkt-btn").textContent="Select Market";document.getElementById("bsmkt-btn").textContent="Select Market";document.getElementById("pmkt-btn").textContent="Select Market";document.getElementById("somkt-btn").textContent="-- Select market --";document.getElementById("somkt").value="";document.getElementById("so-pi").value="";document.getElementById("so-poly-sel-wrap").style.display="none";_soPolyYesToken="";_soPolyNoToken="";SOR=false;document.getElementById("cn").textContent="NO price = 99 - a = --";document.getElementById("k-bal").textContent="--";document.getElementById("k-avl").textContent="--";document.getElementById("k-pos").textContent="--";document.getElementById("k-ord").textContent="--";document.getElementById("k-eng").textContent="--";document.getElementById("oc").textContent="0";document.getElementById("otb").innerHTML="";closeAllModals();document.getElementById('view-ctrl').style.display='none';document.getElementById('view-acct').style.display='block';document.getElementById('view-acct').classList.add('fade-in');if(ctrlPollId){clearInterval(ctrlPollId);ctrlPollId=null;}if(!currentAcctName){document.getElementById('acctTitle').textContent='SHINORI';gapi('/api/accounts').then(r=>r.json()).then(d=>{var a=(d.accounts||[]).find(x=>x.id===id);if(a){currentAcctName=a.name;}document.getElementById('acctTitle').textContent='SHINORI \u2014 '+(currentAcctName||id);});}else{document.getElementById('acctTitle').textContent='SHINORI \u2014 '+currentAcctName;}loadMkts().then(function(){restoreAcctState(id);});poll();if(acctPollId)clearInterval(acctPollId);acctPollId=setInterval(poll,3000);}
+
+function openAcct(id,name){currentAcctName=name;window.location.hash='#/account/'+id;}
+function doLogout(){var sk=String.fromCharCode(115,101,115,115,105,111,110,83,116,111,114,97,103,101);window[sk].removeItem('okx_auth');window.location.replace('/login');}
+
+// Control panel polling
+async function pollCtrl(){try{var r=await gapi('/api/status');if(r.status===401){doLogout();return;}var d=await r.json();document.getElementById('c-bal').textContent=(d.total_balance||'0.000000')+' xp';document.getElementById('c-avl').textContent=(d.total_available||'0.000000')+' xp';document.getElementById('c-ord').textContent=d.total_orders||0;document.getElementById('c-pos').textContent=d.total_positions||0;var grid=document.getElementById('acctGrid');var accts=d.accounts||[];if(!accts.length){grid.innerHTML='<div style="color:var(--muted);padding:20px;font-size:13px">No accounts yet. Click + Add Account.</div>';return;}grid.innerHTML=accts.map(function(a){var statusCls=a.running?'c-status running':'c-status';return '<div class="ctrl-card" onclick="openAcct(\''+a.id+'\',\''+esc(a.name).replace(/'/g,"\\'")+'\')">'+'<div class="'+statusCls+'"></div>'+'<div class="c-top"><div class="c-name">'+esc(a.name)+'</div><div class="c-latency">'+(a.proxy_node||'--')+'</div></div>'+'<div class="c-stats">'+'<div class="c-stat"><span class="c-stat-l">Bal</span><span class="c-stat-v">'+(a.balance&&a.balance!=='--'?parseFloat(a.balance).toFixed(1):'--')+'</span></div>'+'<div class="c-stat"><span class="c-stat-l">Ord</span><span class="c-stat-v">'+(a.orders||0)+'</span></div>'+'<div class="c-stat"><span class="c-stat-l">Pos</span><span class="c-stat-v">'+(a.positions||0)+'</span></div>'+'<div class="c-stat"><span class="c-stat-l">Status</span><span class="c-stat-v'+(a.running?' green':'')+'">'+(a.running?a.strategy:'idle')+'</span></div>'+'</div></div>';}).join('');}catch(e){al('ERROR',e.message||'Unknown error');}}
+
+// Add account
+function openAddAcct(){document.getElementById('addModal').classList.add('show');document.getElementById('latInfo').textContent='Loading...';gapi('/api/accounts/proxies').then(function(r){return r.json()}).then(function(d){var sel=document.getElementById('aa-proxy');sel.innerHTML=(d.proxies||[]).map(function(p){return '<option value="'+p.id+'">'+p.label+'</option>'}).join('');document.getElementById('latInfo').textContent='Measuring latency...';gapi('/api/proxy/latency').then(function(r){return r.json()}).then(function(lat){var lines=[];for(var k in lat.latencies){var v=lat.latencies[k];lines.push(k+': '+(v.okx_ms>=0?v.okx_ms+'ms':'err'));}document.getElementById('latInfo').innerHTML=lines.join('<br>');}).catch(function(){document.getElementById('latInfo').textContent='Failed';});});}
+async function doCreateAcct(){var body={name:document.getElementById('aa-name').value,api_key:document.getElementById('aa-ak').value,secret_key:document.getElementById('aa-sk').value,passphrase:document.getElementById('aa-pp').value,agent_key:document.getElementById('aa-ag').value,proxy_node:document.getElementById('aa-proxy').value,region:document.getElementById('aa-region').value};if(!body.name||!body.api_key){alert('Name and API Key required');return;}var cbtn=document.querySelector("#addModal .bsave");cbtn.textContent="Creating...";cbtn.disabled=true;var r=await gapi('/api/accounts',{method:'POST',body:JSON.stringify(body)});cbtn.textContent="Create";cbtn.disabled=false;var d=await r.json();if(d.ok){closeModal('addModal');pollCtrl();}else{alert(d.error||'Create failed');}}
+
+// Health
+function openHealth(){document.getElementById('healthModal').classList.add('show');document.getElementById('healthResults').innerHTML='Click Run to start...';document.getElementById('healthRunBtn').disabled=false;document.getElementById('healthRunBtn').textContent='Run Check';}
+async function runHealth(){if(_healthAbort){_healthAbort.abort();}_healthAbort=new AbortController();var _sig=_healthAbort.signal;var rr=document.getElementById('healthResults');var btn=document.getElementById('healthRunBtn');btn.disabled=true;rr.innerHTML='';var done=0;var total=0;function prog(){if(_sig.aborted)throw new Error('aborted');btn.textContent='('+done+'/'+total+')';}try{var proxies=await gapi('/api/proxy/nodes').then(x=>x.json());var plist=proxies.nodes||[];var accts=await gapi('/api/accounts').then(x=>x.json());var aList=accts.accounts||[];total=plist.length+1+aList.length;btn.textContent='(0/'+total+')';rr.innerHTML+='<div class="h-section">Proxy Nodes</div>';for(var i=0;i<plist.length;i++){var p=plist[i];var _lbl=p.label+(p.used?' <span style="color:var(--accent);font-size:10px">[IN USE]</span>':'');rr.innerHTML+='<div class="h-row" id="hp-'+p.id+'"><span>'+_lbl+'</span><span style="color:var(--dim)">testing...</span></div>';try{var lat=await gapi('/api/proxy/latency/'+p.id).then(x=>x.json());var ms=lat.okx_ms;var c=ms<0?'var(--red)':ms<200?'var(--green)':ms<500?'var(--yellow)':'var(--red)';document.getElementById('hp-'+p.id).innerHTML='<span>'+p.label+'</span><span style="color:'+c+'">'+(ms>=0?ms+'ms':'FAIL')+'</span>';}catch(e){document.getElementById('hp-'+p.id).innerHTML='<span>'+p.label+'</span><span style="color:var(--red)">ERR</span>';}done++;prog();}rr.innerHTML+='<div class="h-section">Telegram</div>';rr.innerHTML+='<div class="h-row" id="hp-tg"><span>Notification</span><span style="color:var(--dim)">testing...</span></div>';try{var tg=await gapi('/api/global/notify/test',{method:'POST'}).then(x=>x.json());document.getElementById('hp-tg').innerHTML='<span>Notification</span><span style="color:'+(tg.ok?'var(--green)':'var(--red)')+'">'+(tg.ok?'OK':'FAIL')+'</span>';}catch(e){document.getElementById('hp-tg').innerHTML='<span>Notification</span><span style="color:var(--red)">ERROR</span>';}done++;prog();if(aList.length){rr.innerHTML+='<div class="h-section">OKX API</div>';for(var i=0;i<aList.length;i++){var a=aList[i];rr.innerHTML+='<div class="h-row" id="hp-a-'+a.id+'"><span>'+a.name+'</span><span style="color:var(--dim)">testing...</span></div>';try{var bal=await gapi('/api/accounts/'+a.id+'/balance').then(x=>x.json());var ok=bal.balance&&bal.balance!=='--';document.getElementById('hp-a-'+a.id).innerHTML='<span>'+a.name+'</span><span style="color:'+(ok?'var(--green)':'var(--red)')+'">'+(ok?bal.balance+' xp':'FAIL')+'</span>';}catch(e){document.getElementById('hp-a-'+a.id).innerHTML='<span>'+a.name+'</span><span style="color:var(--red)">ERR</span>';}done++;prog();}}}catch(e){if(e.message!=='aborted')rr.innerHTML+='<span style="color:var(--red)">'+esc(String(e))+'</span>';}btn.disabled=false;btn.textContent='Run Check';_healthAbort=null;}
+
+// Global settings
+function openGlobalSettings(){document.getElementById('gsModal').classList.add('show');gapi('/api/global/config').then(function(r){return r.json()}).then(function(d){document.getElementById('gs-token').value=d.tg_token||'';document.getElementById('gs-chats').value=d.tg_chats||'';});}
+async function saveGS(){try{var r=await gapi('/api/global/config',{method:'POST',body:JSON.stringify({tg_token:document.getElementById('gs-token').value,tg_chats:document.getElementById('gs-chats').value})});if(r.ok){closeModal('gsModal');}else{al('ERROR','Save failed');}}catch(e){al('ERROR','Network error');}}
+async function testGS(){var r=await gapi('/api/global/notify/test',{method:'POST'}).then(function(x){return x.json()});alert(r.ok?'Test sent':'Failed: '+(r.error||''));}
+
+// Account settings (no TG token - that's global only)
+function openAcctSettings(){document.getElementById('acctSetModal').classList.add('show');loadFullCfg();}
+async function loadFullCfg(){try{var r=await api('/api/config');if(!r.ok)return;var c=await r.json();document.getElementById('cfg-ak').value=c.api_key||'';document.getElementById('cfg-sk').value=c.secret_key||'';document.getElementById('cfg-pp').value=c.passphrase||'';document.getElementById('cfg-ag').value=c.agent_key||'';document.getElementById('cfg-region').value=c.region||'AU';}catch(e){al('ERROR',e.message||'Unknown error');}}
+async function saveAcctCfg(){var body={api_key:document.getElementById('cfg-ak').value,secret_key:document.getElementById('cfg-sk').value,passphrase:document.getElementById('cfg-pp').value,agent_key:document.getElementById('cfg-ag').value,region:document.getElementById('cfg-region').value};var r=await api('/api/config',{method:'POST',body:JSON.stringify(body)});if(r.ok){al('INFO','Config saved');closeModal('acctSetModal');}else al('ERROR','Save failed');}
+
+// Delete account
+async function confirmDeleteAcct(){if(!confirm('Delete this account? This will free up the proxy node.')){return;}if(!confirm('Are you sure? This cannot be undone.')){return;}var r=await gapi('/api/accounts/'+currentAcctId,{method:'DELETE'});var d=await r.json();if(d.ok){closeModal('acctSetModal');window.location.hash='#/';}else{alert(d.error||'Delete failed');}}
+
+
+
+// Tabs
+function stab(n){_activeTab=n;document.querySelectorAll('#view-acct .tab').forEach(function(t){t.className=parseInt(t.getAttribute('data-tab'))===n?'tab active':'tab';});for(var i=0;i<6;i++){var el=document.getElementById('t'+i);if(el)el.className=i===n?'tc active':'tc';}
+_activeTab=n;
+/* Clear non-running tabs' selections */
+if(n!==0&&!MR&&!MSR&&!PR){document.getElementById('mkt').value='';document.getElementById('mkt-btn').textContent='-- Select market --';document.getElementById('mp').value='';document.getElementById('cn').textContent='NO price = 99 - a = --';resetMonitor('md-mon-');}
+if(n!==1&&!MSR&&!MR&&!PR){document.getElementById('smkt').value='';document.getElementById('smkt-btn').textContent='-- Select market --';document.getElementById('ms-price').value='';resetMonitor('ms-mon-');}
+if(n!==4&&!BSR&&!MR&&!PR){document.getElementById('bsmkt').value='';document.getElementById('bsmkt-btn').textContent='-- Select market --';document.getElementById('bs-price').value='';resetMonitor('bs-mon-');}
+if(n!==2&&!PR){document.getElementById('pmkt').value='';document.getElementById('pmkt-btn').textContent='-- Select market --';document.getElementById('pi').value='';clearPolyOb();var wrap=document.getElementById('poly-sel-wrap');if(wrap)wrap.style.display='none';var sel=document.getElementById('poly-sel');if(sel)sel.innerHTML='<option value="">-- Select outcome --</option>';_polyResolvedToken='';}
+if(n===3&&!_mtPoll){mtStartPoll();}if(n!==3){mtStopPoll();}
+var _obPanels=document.querySelectorAll('#poly-ob-panel,#okx-ob-panel');_obPanels.forEach(function(p){p.style.display=n===3?'none':'';});
+/* Orderbook: if target tab has a running strategy, render from cache.
+   Otherwise disconnect WS completely — no lingering data from previous tab. */
+var thisRunning=(n===0&&MR)||(n===1&&MSR)||(n===4&&BSR)||(n===2&&PR)||(n===5&&SOR);
+if(thisRunning){renderOkxOb();renderPolyOb();}else if(!MR&&!MSR&&!BSR&&!PR){disconnectBook(true);}}
+function cc(){var a=parseInt(document.getElementById('mp').value);document.getElementById('cn').textContent=(a>=4&&a<=96)?'NO price = 99 - '+a+' = '+(99-a):'NO price = 99 - a = --';}
+
+// Manual-D
+async function tgM(){var btn=document.getElementById('mb');if(btn.disabled)return;btn.disabled=true;try{if(!MR){var asset=document.getElementById('mkt').value;var price=document.getElementById('mp').value;if(!asset||!price){al('ERROR','Select market and set price');return;}SA=asset;var payload={asset_id:asset,price:parseInt(price),market_id:(_mktMap[asset]||{}).market_id||'',no_asset_id:(_mktMap[asset]||{}).no_asset_id||'',position_pct:parseInt(document.getElementById('md-pct').value)||100,scan_interval:parseFloat(document.getElementById('md-scan-s').value)||0.3,stabilize_secs:parseFloat(document.getElementById('md-stab-s').value)||0.3};var monSel=document.getElementById('md-mon-sel');var monTid=monSel?monSel.value:'';if(monTid){var monDepth=document.getElementById('md-mon-depth');payload.monitor={poly_token_id:monTid,depth_threshold:parseFloat(monDepth?monDepth.value:3000)};}try{var r=await api('/api/strategy/manual/start',{method:'POST',body:JSON.stringify(payload)});if(r.ok){var d=await r.json();if(d.ok){MR=true;document.getElementById('mb').className='btn-stop';document.getElementById('mb').textContent='Stop Engine';document.getElementById('ms').textContent='Running @ '+price;document.getElementById('ms').style.color='var(--green)';al('INFO','Manual-D started @ '+price);sob(asset);lockMonitor('md-mon-');}else{al('ERROR',d.error||'Failed');}}else{try{var er=await r.json();al('ERROR',er.error||'HTTP '+r.status);}catch(_){al('ERROR','HTTP '+r.status);}}}catch(e){al('ERROR',e.message);}}else{await api('/api/strategy/manual/stop',{method:'POST'});navId++;MR=false;document.getElementById('mb').className='btn-go';document.getElementById('mb').textContent='Start Engine';document.getElementById('ms').textContent='Idle';document.getElementById('ms').style.color='var(--muted)';unlockMonitor('md-mon-');al('INFO','Manual-D stopped');}}finally{btn.disabled=false;}}
+
+// Manual-S
+async function tgMS(){var btn=document.getElementById('msb');if(btn.disabled)return;btn.disabled=true;try{if(!MSR){var asset=document.getElementById('smkt').value;var price=document.getElementById('ms-price').value;var side=document.getElementById('ms-side').value;if(!asset||!price){al('ERROR','Select market and set price');return;}SA=asset;var payload={asset_id:asset,price:parseInt(price),side:side,mode:'classic',market_id:(_mktMap[asset]||{}).market_id||'',no_asset_id:(_mktMap[asset]||{}).no_asset_id||'',position_pct:parseInt(document.getElementById('ms-pct').value)||100,scan_interval:parseFloat(document.getElementById('ms-scan-s').value)||0.3,stabilize_secs:parseFloat(document.getElementById('ms-stab-s').value)||0.3};var monSel=document.getElementById('ms-mon-sel');var monTid=monSel?monSel.value:'';if(monTid){var monDepth=document.getElementById('ms-mon-depth');payload.monitor={poly_token_id:monTid,depth_threshold:parseFloat(monDepth?monDepth.value:3000)};}try{var r=await api('/api/strategy/manual-s/start',{method:'POST',body:JSON.stringify(payload)});if(r.ok){var d=await r.json();if(d.ok){MSR=true;document.getElementById('msb').className='btn-stop';document.getElementById('msb').textContent='Stop Manual-S';document.getElementById('mss').textContent='Running '+side+' @ '+price;document.getElementById('mss').style.color='var(--green)';al('INFO','Manual-S started '+side+' @ '+price);_obNoSide=(side==='NO');sob(asset);lockMonitor('ms-mon-');}else{al('ERROR',d.error||'Failed');}}else{try{var er=await r.json();al('ERROR',er.error||'HTTP '+r.status);}catch(_){al('ERROR','HTTP '+r.status);}}}catch(e){al('ERROR',e.message);}}else{await api('/api/strategy/manual-s/stop',{method:'POST'});navId++;MSR=false;document.getElementById('msb').className='btn-go';document.getElementById('msb').textContent='Start Manual-S';document.getElementById('mss').textContent='Idle';document.getElementById('mss').style.color='var(--muted)';unlockMonitor('ms-mon-');al('INFO','Manual-S stopped');}}finally{btn.disabled=false;}}
+
+// Bid-Sell
+var BSR=false;
+async function tgBS(){var btn=document.getElementById('bsb');if(btn.disabled)return;btn.disabled=true;try{if(!BSR){var asset=document.getElementById('bsmkt').value;var price=document.getElementById('bs-price').value;var side=document.getElementById('bs-side').value;if(!asset||!price){al('ERROR','Select market and set price');return;}var buyP=parseInt(price)-1;var sellP=parseInt(price);SA=asset;var payload={asset_id:asset,price:buyP,sell_price:sellP,side:side,mode:'bid-sell',market_id:(_mktMap[asset]||{}).market_id||'',no_asset_id:(_mktMap[asset]||{}).no_asset_id||'',position_pct:parseInt(document.getElementById('bs-pct').value)||100,scan_interval:parseFloat(document.getElementById('bs-scan-s').value)||0.3,stabilize_secs:parseFloat(document.getElementById('bs-stab-s').value)||0.3};var monSel=document.getElementById('bs-mon-sel');var monTid=monSel?monSel.value:'';if(monTid){var monDepth=document.getElementById('bs-mon-depth');payload.monitor={poly_token_id:monTid,depth_threshold:parseFloat(monDepth?monDepth.value:3000)};}try{var r=await api('/api/strategy/manual-s/start',{method:'POST',body:JSON.stringify(payload)});if(r.ok){var d=await r.json();if(d.ok){BSR=true;document.getElementById('bsb').className='btn-stop';document.getElementById('bsb').textContent='Stop Bid-Sell';document.getElementById('bss').textContent='Running '+side+' B'+buyP+'/S'+sellP;document.getElementById('bss').style.color='var(--green)';al('INFO','Bid-Sell started '+side+' B'+buyP+'/S'+sellP);_obNoSide=(side==='NO');sob(asset);lockMonitor('bs-mon-');lockBS();}else{al('ERROR',d.error||'Failed');}}else{try{var er=await r.json();al('ERROR',er.error||'HTTP '+r.status);}catch(_){al('ERROR','HTTP '+r.status);}}}catch(e){al('ERROR',e.message);}}else{await api('/api/strategy/manual-s/stop',{method:'POST'});navId++;BSR=false;document.getElementById('bsb').className='btn-go';document.getElementById('bsb').textContent='Start Bid-Sell';document.getElementById('bss').textContent='Idle';document.getElementById('bss').style.color='var(--muted)';unlockMonitor('bs-mon-');unlockBS();al('INFO','Bid-Sell stopped');}}finally{btn.disabled=false;}}
+function lockBS(){document.getElementById('bs-price').disabled=true;document.getElementById('bs-side').disabled=true;document.getElementById('bs-pct').disabled=true;document.getElementById('bs-scan-s').disabled=true;document.getElementById('bs-stab-s').disabled=true;var sb=document.getElementById('sdrop-bsmkt');if(sb)sb.style.pointerEvents='none';}
+function unlockBS(){document.getElementById('bs-price').disabled=false;document.getElementById('bs-side').disabled=false;document.getElementById('bs-pct').disabled=false;document.getElementById('bs-scan-s').disabled=false;document.getElementById('bs-stab-s').disabled=false;var sb=document.getElementById('sdrop-bsmkt');if(sb)sb.style.pointerEvents='';}
+
+
+// Poly
+
+
+// Cancel
+async function cxAll(){if(!confirm('Cancel all orders? This will also stop any running strategy.'))return;if(MR||MSR||PR){await api('/api/strategy/stop',{method:'POST'});}var r=await api('/api/cancel_all',{method:'POST'});var d=await r.json();if(d.ok){al('CANCEL','All cancelled'+(MR||MSR||PR?' + strategy stopped':''));MR=false;MSR=false;BSR=false;PR=false;setTimeout(poll,1500);}else{al('ERROR','Cancel failed: '+(d.error||JSON.stringify(d)));}}
+async function flashClose(){var r=await api('/api/accounts/'+currentAcctId+'/flash_close',{method:'POST'});var d=await r.json();if(d.ok){al('FLASH','Closed: '+d.result.cancelled+' orders cancelled, '+d.result.sold+' positions sold');MR=false;MSR=false;BSR=false;PR=false;setTimeout(poll,1500);}else{al('ERROR','Flash failed: '+(d.error||JSON.stringify(d)));}}
+async function cx(id,aid){var r=await api('/api/cancel_order',{method:'POST',body:JSON.stringify({order_id:id,asset_id:aid})});var d=await r.json();if(d.ok){al('CANCEL','Cancelled '+id);setTimeout(poll,1500);}else{al('ERROR','Cancel failed: '+(d.error||JSON.stringify(d)));}}
+
+// ═══ Manual Trading Tab ═══
+var _mtSide='YES',_mtMode='market',_mtPoll=null,_mtSellAsset='',_mtSellYesAsset='',_mtSellSize=0,_activeTab=0;
+
+function mtSide(s){_mtSide=s;document.getElementById('mt-side-yes').className='btn-toggle'+(s==='YES'?' active':'');document.getElementById('mt-side-no').className='btn-toggle'+(s==='NO'?' active':'');mtFetchTicker();mtFetchPosition();}
+
+function mtMode(m){_mtMode=m;document.getElementById('mt-mode-mkt').className='btn-toggle'+(m==='market'?' active':'');document.getElementById('mt-mode-lmt').className='btn-toggle'+(m==='limit'?' active':'');document.getElementById('mt-buy-limit-price').style.display=m==='limit'?'':'none';document.getElementById('mt-sell-limit-price').style.display=m==='limit'?'':'none';mtFetchTicker();}
+
+function mtGetAssetId(){var base=document.getElementById('tmkt').value;if(!base)return null;if(_mtSide==='YES')return base;var m=_mktMap[base];return m?m.no_asset_id:null;}
+function mtGetYesAssetId(){return document.getElementById('tmkt').value||null;}
+
+var _mtPosSize=0,_mtPosAvg=0,_mtAvail=0;
+async function mtFetchTicker(){var aid=mtGetAssetId();var yaid=mtGetYesAssetId();if(!aid){document.getElementById('mt-ask').textContent='--';document.getElementById('mt-bid').textContent='--';document.getElementById('mt-buy-btn').textContent='Buy @ --';document.getElementById('mt-sell-btn').textContent='Sell @ --';return;}var url='/api/accounts/'+currentAcctId+'/ticker?asset_id='+aid;if(yaid&&yaid!==aid)url+='&yes_asset_id='+yaid;try{var r=await api(url);if(r.ok){var d=await r.json();if(d.best_ask){document.getElementById('mt-ask').textContent=d.best_ask+'\u00a2';document.getElementById('mt-buy-btn').textContent=(_mtMode==='market'?'Buy @ '+d.best_ask+'\u00a2':'Place Buy');}else{document.getElementById('mt-ask').textContent='No asks';document.getElementById('mt-buy-btn').textContent='Buy @ --';}if(d.best_bid){document.getElementById('mt-bid').textContent=d.best_bid+'\u00a2';if(_mtPosSize>0)document.getElementById('mt-sell-btn').textContent=(_mtMode==='market'?'Sell @ '+d.best_bid+'\u00a2':'Place Sell');}else{document.getElementById('mt-bid').textContent='No bids';document.getElementById('mt-sell-btn').textContent='Sell @ --';}}}catch(e){}
+/* Also fetch balance for MAX buy */
+try{var br=await api('/api/balance');if(br.ok){var bd=await br.json();_mtAvail=parseFloat(bd.available)||0;}}catch(e){}
+}
+
+async function mtFetchPosition(){var aid=mtGetAssetId();var infoEl=document.getElementById('mt-sell-info');var sizeEl=document.getElementById('mt-sell-size');var xpEl=document.getElementById('mt-sell-xp');var maxBtn=document.getElementById('mt-sell-max-btn');var sellBtn=document.getElementById('mt-sell-btn');if(!aid){infoEl.textContent='No position';_mtPosSize=0;_mtPosAvg=0;sizeEl.disabled=true;xpEl.disabled=true;maxBtn.disabled=true;sellBtn.disabled=true;return;}try{var r=await api('/api/accounts/'+currentAcctId+'/positions');if(!r.ok)return;var d=await r.json();var positions=d.positions||[];var pos=null;for(var i=0;i<positions.length;i++){if(positions[i].asset_id===aid){pos=positions[i];break;}}if(pos){_mtPosSize=String(pos.size||'0');_mtPosAvg=parseFloat(pos.avg_price)||0;var tkn=pos.token_name||_mtSide;infoEl.textContent=tkn+' '+_mtPosSize+' @ avg '+(_mtPosAvg*100).toFixed(0)+'\u00a2';infoEl.style.color='var(--text)';sizeEl.disabled=false;xpEl.disabled=false;maxBtn.disabled=false;sellBtn.disabled=false;}else{_mtPosSize=0;_mtPosAvg=0;infoEl.textContent='No position';infoEl.style.color='var(--dim)';sizeEl.disabled=true;xpEl.disabled=true;maxBtn.disabled=true;sellBtn.disabled=true;sizeEl.value='';xpEl.value='';}}catch(e){}}
+
+function mtMax(dir){if(dir==='buy'){var price=0;if(_mtMode==='market'){price=parseFloat(document.getElementById('mt-ask').textContent)||0;}else{price=(parseFloat(document.getElementById('mt-lmt-price').value)||0)/100;}if(!price||!_mtAvail)return;document.getElementById('mt-buy-size').value=Math.floor(_mtAvail/price);mtCalcXp('buy');}else{if(!_mtPosSize)return;document.getElementById('mt-sell-size').value=_mtPosSize;mtCalcXp('sell');}}
+
+async function mtBuy(){var aid=mtGetAssetId();if(!aid){al('ERROR','Select a market first');return;}var size=document.getElementById('mt-buy-size').value;if(!size||parseInt(size)<1){al('ERROR','Enter size');return;}var btn=document.getElementById('mt-buy-btn');btn.disabled=true;try{var price,tif;if(_mtMode==='market'){var askEl=document.getElementById('mt-ask').textContent;price=parseFloat(askEl);if(!price||isNaN(price)){al('ERROR','No ask price');return;}tif='ioc';}else{price=parseInt(document.getElementById('mt-lmt-price').value);if(!price){al('ERROR','Enter price');return;}tif='gtc';}var r=await api('/api/accounts/'+currentAcctId+'/manual/place',{method:'POST',body:JSON.stringify({asset_id:aid,side:'BUY',price:String(price),size:String(parseInt(size)),tif:tif})});var d=await r.json();if(d.ok){al('INFO','Buy sent: '+size+' @ '+price+'\u00a2');mtRefresh();mtFetchPosition();}else{al('ERROR',d.error||'Buy failed');}}catch(e){al('ERROR',e.message);}finally{btn.disabled=false;}}
+
+async function mtSell(){var aid=mtGetAssetId();if(!aid){al('ERROR','Select a market first');return;}var size=document.getElementById('mt-sell-size').value.trim();if(!size||Number(size)<=0){al('ERROR','Enter sell size');return;}if(Number(size)>Number(_mtPosSize)){al('ERROR','Size exceeds position ('+_mtPosSize+')');return;}var yaid=mtGetYesAssetId();var btn=document.getElementById('mt-sell-btn');btn.disabled=true;try{var price,tif;if(_mtMode==='market'){var bidEl=document.getElementById('mt-bid').textContent;price=parseFloat(bidEl);if(!price||isNaN(price)){al('ERROR','No bid price');return;}tif='ioc';}else{price=parseInt(document.getElementById('mt-sell-lmt-price').value);if(!price){al('ERROR','Enter sell price');return;}tif='gtc';}var r=await api('/api/accounts/'+currentAcctId+'/manual/place',{method:'POST',body:JSON.stringify({asset_id:aid,side:'SELL',price:String(price),size:String(size),tif:tif})});var d=await r.json();if(d.ok){al('INFO','Sell sent: '+size+' @ '+price+'\u00a2');mtRefresh();mtFetchPosition();}else{al('ERROR',d.error||'Sell failed');}}catch(e){al('ERROR',e.message);}finally{btn.disabled=false;}}
+
+function mtSellInstant(assetId,size,yesAssetId){var url='/api/accounts/'+currentAcctId+'/ticker?asset_id='+assetId;if(yesAssetId&&yesAssetId!==assetId)url+='&yes_asset_id='+yesAssetId;api(url).then(function(r){return r.json();}).then(function(d){if(!d.best_bid){al('ERROR','No bid available');return;}api('/api/accounts/'+currentAcctId+'/manual/place',{method:'POST',body:JSON.stringify({asset_id:assetId,side:'SELL',price:String(d.best_bid),size:String(size),tif:'ioc'})}).then(function(r){return r.json();}).then(function(rd){if(rd.ok){al('INFO','Instant sell: '+size+' @ '+d.best_bid+'\u00a2');mtRefresh();mtFetchPosition();}else{al('ERROR',rd.error||'Sell failed');}});}).catch(function(e){al('ERROR',e.message);});}
+
+function mtSellToSection(assetId,size,yesAssetId,avgPrice){/* Load position into sell section */
+var base=yesAssetId||assetId;document.getElementById('tmkt').value=base;var m=_mktMap[base];if(m)document.getElementById('tmkt-btn').textContent=(m.question||m.event_title).substring(0,55);if(assetId!==base){_mtSide='NO';document.getElementById('mt-side-yes').className='btn-toggle';document.getElementById('mt-side-no').className='btn-toggle active';}else{_mtSide='YES';document.getElementById('mt-side-yes').className='btn-toggle active';document.getElementById('mt-side-no').className='btn-toggle';}mtFetchTicker();mtFetchPosition();stab(3);}
+
+function mtCalcXp(dir){var sizeEl=document.getElementById(dir==='buy'?'mt-buy-size':'mt-sell-size');var xpEl=document.getElementById(dir==='buy'?'mt-buy-xp':'mt-sell-xp');var size=parseFloat(sizeEl.value)||0;if(!size){xpEl.value='';return;}var price=0;if(dir==='buy'){if(_mtMode==='market'){price=parseFloat(document.getElementById('mt-ask').textContent)||0;}else{price=(parseFloat(document.getElementById('mt-lmt-price').value)||0)/100;}}else{if(_mtMode==='market'){price=parseFloat(document.getElementById('mt-bid').textContent)||0;}else{price=(parseFloat(document.getElementById('mt-sell-lmt-price').value)||0)/100;}}if(!price){xpEl.value='';return;}xpEl.value=(size*price).toFixed(2);}
+function mtCalcSize(dir){var sizeEl=document.getElementById(dir==='buy'?'mt-buy-size':'mt-sell-size');var xpEl=document.getElementById(dir==='buy'?'mt-buy-xp':'mt-sell-xp');var xp=parseFloat(xpEl.value)||0;if(!xp){sizeEl.value='';return;}var price=0;if(dir==='buy'){if(_mtMode==='market'){price=parseFloat(document.getElementById('mt-ask').textContent)||0;}else{price=(parseFloat(document.getElementById('mt-lmt-price').value)||0)/100;}}else{if(_mtMode==='market'){price=parseFloat(document.getElementById('mt-bid').textContent)||0;}else{price=(parseFloat(document.getElementById('mt-sell-lmt-price').value)||0)/100;}}if(!price){sizeEl.value='';return;}sizeEl.value=String(xp/price);}
+
+async function mtRefresh(){await mtLoadPositions();await mtLoadHistory();}
+
+async function mtLoadPositions(){try{var [pr,or2]=await Promise.all([api('/api/accounts/'+currentAcctId+'/positions'),api('/api/accounts/'+currentAcctId+'/orders')]);var positions=[];if(pr.ok){var pd=await pr.json();positions=pd.positions||[];}var orders=[];if(or2.ok){var od=await or2.json();orders=od.orders||[];}var sellMap={};orders.forEach(function(o){if(o.side==='SELL'){sellMap[o.asset_id]={order_id:o.order_id,price:o.price};}});document.getElementById('mt-pos-ct').textContent=positions.length;var tb=document.getElementById('mt-pos-tb');if(!positions.length){tb.innerHTML='<tr><td colspan="7" style="color:var(--muted)">\u2014</td></tr>';return;}tb.innerHTML=positions.map(function(p){var aid=p.asset_id||'';var mkt=p.market_name||_findMarketName(aid)||p.market_id||'--';var side=p.token_name||'--';var qty=parseFloat(p.size)||0;var avg=parseFloat(p.avg_price)||0;var val=qty*avg;var sell=sellMap[aid];var yaid=p.yes_asset_id||'';var status,action;if(sell){status='<span style="color:var(--yellow)">Selling@'+Math.round(parseFloat(sell.price)*100)+'\u00a2</span>';action='<button class="cbtn" onclick="cx(\''+esc(sell.order_id)+'\',\''+esc(aid)+'\');setTimeout(mtRefresh,1500)">Cancel</button>';}else{status='<span style="color:var(--muted)">Holding</span>';action='<button class="cbtn" onclick="mtSellInstant(\''+esc(aid)+'\','+Math.round(qty)+',\''+esc(yaid)+'\')">Sell</button> <button class="cbtn" onclick="mtSellToSection(\''+esc(aid)+'\','+Math.round(qty)+',\''+esc(yaid)+'\',\''+avg.toFixed(2)+'\')">&#8593;</button>';}return '<tr><td>'+esc(mkt.substring(0,30))+'</td><td>'+side+'</td><td>'+Math.round(qty)+'</td><td>'+avg.toFixed(2)+'\u00a2</td><td>'+val.toFixed(1)+'</td><td>'+status+'</td><td>'+action+'</td></tr>';}).join('');}catch(e){}}
+
+async function mtLoadHistory(){try{var url='/api/accounts/'+currentAcctId+'/trades?limit=30';var filterAsset=document.getElementById('tmkt').value;if(filterAsset)url+='&asset_id='+filterAsset;var r=await api(url);if(!r.ok)return;var d=await r.json();var trades=d.trades||[];var tb=document.getElementById('mt-hist-tb');if(!trades.length){tb.innerHTML='<tr><td colspan="7" style="color:var(--muted)">\u2014</td></tr>';return;}tb.innerHTML=trades.map(function(t){var time=t.filled_at?new Date(parseInt(t.filled_at)).toLocaleTimeString():'--';var mkt=t.market_name||_findMarketName(t.asset_id)||t.market_id||'--';var price=parseFloat(t.price)||0;var qty=parseFloat(t.size)||0;var total=(price*qty).toFixed(1);return '<tr><td>'+time+'</td><td>'+esc(mkt.substring(0,40))+'</td><td class="'+(t.side==='BUY'?'buy':'sell')+'">'+t.side+'</td><td>'+t.token+'</td><td>'+price.toFixed(2)+'\u00a2</td><td>'+Math.round(qty)+'</td><td>'+total+'</td></tr>';}).join('');}catch(e){}}
+
+function _findMarketName(assetId){if(!assetId)return '';var m=_mktMap[assetId];if(!m){for(var i=0;i<_mkts.length;i++){if(_mkts[i].no_asset_id===assetId){m=_mkts[i];break;}}}if(!m)return '';var q=m.question||m.event_title||'';q=q.replace(/^Will /,'').replace(/\?$/,'');return q;}
+
+function mtStartPoll(){if(_mtPoll)return;mtRefresh();mtFetchTicker();mtFetchPosition();_mtPoll=setInterval(function(){mtRefresh();mtFetchTicker();},5000);}
+
+function mtStopPoll(){if(_mtPoll){clearInterval(_mtPoll);_mtPoll=null;}}
+
+
+// Account polling
+async function poll(){var _nav=navId;try{var r=await api('/api/status');if(r.status===401){doLogout();return;}if(_nav!==navId)return;if(r.ok){var s=await r.json();document.getElementById('api-dot').className='dot dot-g';document.getElementById('api-st').textContent='CONNECTED';document.getElementById('ts').textContent=new Date().toLocaleTimeString();var eng=s.running?s.strategy.toUpperCase():'IDLE';document.getElementById('k-eng').textContent=eng;document.getElementById('k-eng').className=s.running?'kpi-v green':'kpi-v';document.getElementById('s-st').textContent=s.strategy||'none';document.getElementById('s-md').textContent=s.running?'RUNNING':'STOPPED';document.getElementById('s-md').className=s.running?'sv on':'sv off';document.getElementById('s-cy').textContent=s.cycles||'0';MR=s.manual_running||false;PR=s.sniper_running||false;SOR=s.sniper_old_running||false;MSR=s.manual_s_running&&s.manual_s_mode!=='bid-sell';BSR=s.manual_s_running&&s.manual_s_mode==='bid-sell';if(MR){document.getElementById('mb').className='btn-stop';document.getElementById('mb').textContent='Stop Engine';document.getElementById('ms').textContent='Running @ '+(s.manual_price||'?');document.getElementById('ms').style.color='var(--green)';document.getElementById('md-pct').disabled=true;document.getElementById('md-scan-s').disabled=true;document.getElementById('md-stab-s').disabled=true;document.getElementById('mp').disabled=true;if(s.manual_asset_id){document.getElementById('mkt').value=s.manual_asset_id;var _m=_mktMap[s.manual_asset_id];if(_m)document.getElementById('mkt-btn').textContent=(_m.question||_m.event_title).substring(0,55);if(!_okxAsset)sob(s.manual_asset_id);}if(s.manual_price&&document.activeElement!==document.getElementById('mp'))document.getElementById('mp').value=s.manual_price;}else{document.getElementById('mb').className='btn-go';document.getElementById('mb').textContent='Start Engine';document.getElementById('ms').textContent='Idle';document.getElementById('ms').style.color='var(--muted)';document.getElementById('md-pct').disabled=false;document.getElementById('md-scan-s').disabled=false;document.getElementById('md-stab-s').disabled=false;document.getElementById('mp').disabled=false;}if(MSR){document.getElementById('bsb').disabled=true;if(s.manual_s_side)document.getElementById('ms-side').value=s.manual_s_side.toUpperCase();document.getElementById('msb').className='btn-stop';document.getElementById('msb').textContent='Stop Manual-S';document.getElementById('mss').textContent='Running '+(s.manual_s_side||'')+' @ '+(s.manual_s_price||'');document.getElementById('mss').style.color='var(--green)';document.getElementById('ms-price').disabled=true;document.getElementById('ms-side').disabled=true;document.getElementById('ms-pct').disabled=true;document.getElementById('ms-scan-s').disabled=true;document.getElementById('ms-stab-s').disabled=true;if(s.manual_s_asset_id){var _msYes=s.manual_s_yes_asset_id||s.manual_s_asset_id;document.getElementById('smkt').value=_msYes;var _ms=_mktMap[_msYes];if(_ms)document.getElementById('smkt-btn').textContent=(_ms.question||_ms.event_title).substring(0,55);_obNoSide=(s.manual_s_side==='no');if(!_okxAsset)sob(_msYes);}if(s.manual_s_price&&document.activeElement!==document.getElementById('ms-price'))document.getElementById('ms-price').value=s.manual_s_price;}else{document.getElementById('bsb').disabled=false;document.getElementById('msb').className='btn-go';document.getElementById('msb').textContent='Start Manual-S';document.getElementById('mss').textContent='Idle';document.getElementById('mss').style.color='var(--muted)';document.getElementById('ms-price').disabled=false;document.getElementById('ms-side').disabled=false;document.getElementById('ms-pct').disabled=false;document.getElementById('ms-scan-s').disabled=false;document.getElementById('ms-stab-s').disabled=false;}if(BSR){document.getElementById('msb').disabled=true;document.getElementById('bsb').className='btn-stop';document.getElementById('bsb').textContent='Stop Bid-Sell';if(s.manual_s_side)document.getElementById('bs-side').value=s.manual_s_side.toUpperCase();var _bsYes=s.manual_s_yes_asset_id||s.manual_s_asset_id;if(_bsYes){document.getElementById('bsmkt').value=_bsYes;var _bs=_mktMap[_bsYes];if(_bs)document.getElementById('bsmkt-btn').textContent=(_bs.question||_bs.event_title).substring(0,55);_obNoSide=(s.manual_s_side==='no');if(!_okxAsset)sob(_bsYes);}document.getElementById('bss').textContent='Running '+(s.manual_s_side||'')+' B'+(s.manual_s_price||'')+'/S'+(s.manual_s_sell_price||'');document.getElementById('bss').style.color='var(--green)';lockBS();lockMonitor('bs-mon-');if(s.manual_s_sell_price&&document.activeElement!==document.getElementById('bs-price'))document.getElementById('bs-price').value=s.manual_s_sell_price;}else{document.getElementById('msb').disabled=false;document.getElementById('bsb').className='btn-go';document.getElementById('bsb').textContent='Start Bid-Sell';document.getElementById('bss').textContent='Idle';document.getElementById('bss').style.color='var(--muted)';unlockBS();}if(PR){document.getElementById('pb').className='btn-stop';document.getElementById('pb').textContent='Stop Sniper';document.getElementById('ps').textContent='Monitoring...';document.getElementById('ps').style.color='var(--green)';document.getElementById('pi').disabled=true;document.getElementById('pmkt').disabled=true;document.getElementById('sn-thresh').disabled=true;document.getElementById('sn-limit').disabled=true;document.getElementById('sn-pct').disabled=true;document.getElementById('sn-timeout').disabled=true;document.getElementById('sn-settle').disabled=true;document.getElementById('sn-window').disabled=true;document.getElementById('sob').disabled=true;if(s.sniper_poly_url&&!document.getElementById('pi').value){document.getElementById('pi').value=s.sniper_poly_url;onPolyInput();}if(s.sniper_yes_asset){document.getElementById('pmkt').value=s.sniper_yes_asset;var pm=_mktMap[s.sniper_yes_asset];if(pm)document.getElementById('pmkt-btn').textContent=(pm.question||pm.event_title).substring(0,55);}if(s.sniper_yes_token){_polyYesToken=s.sniper_yes_token;_polyNoToken=s.sniper_no_token||'';}if((s.sniper_yes_token||s.sniper_yes_asset)&&!obConnected&&!_bookWs){connectBook(s.sniper_yes_token||'',s.sniper_yes_asset||'');}}else{document.getElementById('pb').className='btn-go';document.getElementById('pb').textContent='Start Sniper';document.getElementById('ps').textContent='Idle';document.getElementById('ps').style.color='var(--muted)';document.getElementById('pi').disabled=false;document.getElementById('pmkt').disabled=false;document.getElementById('sn-thresh').disabled=false;document.getElementById('sn-limit').disabled=false;document.getElementById('sn-pct').disabled=false;document.getElementById('sn-timeout').disabled=false;document.getElementById('sn-settle').disabled=false;document.getElementById('sn-window').disabled=false;if(!SOR)document.getElementById('sob').disabled=false;}}if(SOR){document.getElementById('sob').className='btn-stop';document.getElementById('sob').textContent='Stop Sniper Old';document.getElementById('so-pi').disabled=true;document.getElementById('somkt').disabled=true;document.getElementById('so-thresh').disabled=true;document.getElementById('so-pct').disabled=true;document.getElementById('so-timeout').disabled=true;document.getElementById('so-settle').disabled=true;document.getElementById('so-window').disabled=true;document.getElementById('pb').disabled=true;if(s.sniper_old_poly_url&&!document.getElementById('so-pi').value){document.getElementById('so-pi').value=s.sniper_old_poly_url;}if(s.sniper_old_yes_asset){document.getElementById('somkt').value=s.sniper_old_yes_asset;var sopm=_mktMap[s.sniper_old_yes_asset];if(sopm)document.getElementById('somkt-btn').textContent=(sopm.question||sopm.event_title).substring(0,55);}if(s.sniper_old_yes_token){_soPolyYesToken=s.sniper_old_yes_token;_soPolyNoToken=s.sniper_old_no_token||'';}if((s.sniper_old_yes_token||s.sniper_old_yes_asset)&&!obConnected&&!_bookWs){connectBook(s.sniper_old_yes_token||'',s.sniper_old_yes_asset||'');}}else{document.getElementById('sob').className='btn-go';document.getElementById('sob').textContent='Start Sniper Old';document.getElementById('so-pi').disabled=false;document.getElementById('somkt').disabled=false;document.getElementById('so-thresh').disabled=false;document.getElementById('so-pct').disabled=false;document.getElementById('so-timeout').disabled=false;document.getElementById('so-settle').disabled=false;document.getElementById('so-window').disabled=false;if(!PR)document.getElementById('pb').disabled=false;}
+// Auto-rebalance status sync
+if(currentAcctId){api('/api/accounts/'+currentAcctId+'/rebalance/status').then(function(r){return r.json()}).then(function(d){syncRebalUI(d.enabled||false);var locked=MR||MSR||BSR;var cb1=document.getElementById('md-mon-rebal');var cb2=document.getElementById('ms-mon-rebal');if(cb1)cb1.disabled=locked;if(cb2)cb2.disabled=locked;}).catch(function(){});}
+// Sniper status sync
+if(currentAcctId&&PR){api('/api/sniper/status').then(function(r){return r.json()}).then(function(d){
+var dot=document.getElementById('sn-dot'),st=document.getElementById('sn-state'),det=document.getElementById('sn-detail'),prices=document.getElementById('sn-prices'),timer=document.getElementById('sn-timer'),barFill=document.getElementById('sn-bar-fill'),timerTxt=document.getElementById('sn-timer-text');
+if(!dot)return;
+// Prices
+if(d.last_yes_bid>0||d.last_no_bid>0){prices.style.display='';document.getElementById('sn-yes').textContent='YES '+d.last_yes_bid.toFixed(3);document.getElementById('sn-no').textContent='NO '+d.last_no_bid.toFixed(3);}else{prices.style.display='none';}
+// Restore config inputs from running sniper
+if(d.config){var _snt=document.getElementById('sn-thresh'),_snp=document.getElementById('sn-pct'),_snto=document.getElementById('sn-timeout'),_sns=document.getElementById('sn-settle');if(_snt&&document.activeElement!==_snt)_snt.value=d.config.threshold_cents;if(_snp&&document.activeElement!==_snp)_snp.value=d.config.position_pct;if(_snto&&document.activeElement!==_snto)_snto.value=d.config.timeout_secs;if(_sns&&document.activeElement!==_sns)_sns.value=d.config.settle_ms;var _snw=document.getElementById('sn-window');if(_snw&&document.activeElement!==_snw)_snw.value=d.config.window_ms||150;var _snlm=document.getElementById('sn-limit');if(_snlm&&document.activeElement!==_snlm)_snlm.value=d.config.buy_limit_cents||50;}
+// State
+if(d.status==='monitoring'){dot.className='sn-dot monitoring';st.textContent='Monitoring';det.textContent='';timer.style.display='none';}
+else if(d.status==='settling'&&d.settling){dot.className='sn-dot settling';st.textContent='Settling';det.textContent=d.settling.side.toUpperCase()+' '+d.settling.initial.toFixed(3)+'→'+d.settling.current.toFixed(3);timer.style.display='none';}
+else if(d.status==='holding'&&d.holding){dot.className='sn-dot holding';st.textContent='Holding';det.textContent=d.holding.side.toUpperCase()+' @'+d.holding.buy_price.toFixed(2)+' x'+String(d.holding.buy_size)+' → sell @'+d.holding.sell_target.toFixed(2);timer.style.display='';var pct=Math.min(d.holding.elapsed/(d.config.timeout_secs||10)*100,100);barFill.style.width=pct+'%';barFill.className='sn-bar-fill '+(pct<60?'ok':pct<85?'warn':'danger');timerTxt.textContent=d.holding.elapsed+'s / '+d.config.timeout_secs+'s';}
+else if(d.status==='stopped'){dot.className='sn-dot stopped';st.textContent='Stopped';det.textContent='';timer.style.display='none';PR=false;var btn=document.getElementById('pb');if(btn){btn.className='btn-go';btn.textContent='Start Sniper';}}
+else{dot.className='sn-dot idle';st.textContent=d.status||'Idle';det.textContent='';timer.style.display='none';prices.style.display='none';}
+}).catch(function(){});}
+else if(!PR){var dot=document.getElementById('sn-dot');if(dot){dot.className='sn-dot idle';document.getElementById('sn-state').textContent='Idle';document.getElementById('sn-detail').textContent='';document.getElementById('sn-prices').style.display='none';document.getElementById('sn-timer').style.display='none';}}
+if(currentAcctId&&SOR){api('/api/sniper-old/status').then(function(r){return r.json()}).then(function(d){
+var dot=document.getElementById('so-dot'),st=document.getElementById('so-state'),det=document.getElementById('so-detail');
+if(!dot)return;
+if(d.config){var _t=document.getElementById('so-thresh'),_p=document.getElementById('so-pct'),_to=document.getElementById('so-timeout'),_s=document.getElementById('so-settle'),_w=document.getElementById('so-window');if(_t&&document.activeElement!==_t)_t.value=d.config.threshold_cents;if(_p&&document.activeElement!==_p)_p.value=d.config.position_pct;if(_to&&document.activeElement!==_to)_to.value=d.config.timeout_secs;if(_s&&document.activeElement!==_s)_s.value=d.config.settle_ms;if(_w&&document.activeElement!==_w)_w.value=d.config.window_ms||150;}
+if(d.status==='monitoring'){dot.className='sn-dot monitoring';st.textContent='Monitoring';det.textContent='';}
+else if(d.status==='holding'&&d.holding){dot.className='sn-dot holding';st.textContent='Holding';det.textContent=d.holding.side.toUpperCase()+' @'+d.holding.buy_price.toFixed(2)+' x'+String(d.holding.buy_size)+' → sell @'+d.holding.sell_target.toFixed(2);}
+else if(d.status==='stopped'){dot.className='sn-dot stopped';st.textContent='Stopped';det.textContent='';SOR=false;document.getElementById('sob').className='btn-go';document.getElementById('sob').textContent='Start Sniper Old';}
+else{dot.className='sn-dot idle';st.textContent=d.status||'Idle';det.textContent='';}
+}).catch(function(){});}
+// POLY Monitor trigger detection
+if(s.monitor){var mon=s.monitor;var _mp=MR?'md-mon-':(BSR?'bs-mon-':(MSR?'ms-mon-':null));if(mon.running&&!mon.triggered&&!_monitorActive){_monitorActive=true;lockMonitor(_mp);if(_mp){var _mst=document.getElementById(_mp+'status');if(_mst){_mst.innerHTML='<span class="dot-ind active"></span><span>Active (bid='+esc(String(mon.last_poly_bid))+')</span>';}var _mbtn=document.getElementById(_mp+'btn');if(_mbtn){_mbtn.className='btn-stop btn-sm';_mbtn.textContent='Stop Monitor';}if(mon.depth_threshold){var _dEl=document.getElementById(_mp+'depth');if(_dEl)_dEl.value=mon.depth_threshold;}if(mon.poly_token_id&&!_monitorInterval)startMonitorOb(_mp,mon.poly_token_id);if(mon.poly_token_id&&!_okxAsset)sob(mon.poly_token_id);}}if(!mon.running&&_monitorActive){_monitorActive=false;stopMonitorOb();if(_mp){unlockMonitor(_mp);var _mst2=document.getElementById(_mp+'status');if(_mst2){_mst2.innerHTML='<span class="dot-ind"></span><span>Not active</span>';}var _mbtn2=document.getElementById(_mp+'btn');if(_mbtn2){_mbtn2.className='btn-go btn-sm';_mbtn2.textContent='Start Monitor';}}}if(mon.triggered&&_monitorActive){_monitorActive=false;stopMonitorOb();if(_mp){unlockMonitor(_mp);var _mst3=document.getElementById(_mp+'status');if(_mst3){_mst3.innerHTML='<span class="dot-ind triggered"></span><span>TRIGGERED: '+esc(mon.trigger_reason)+'</span>';}var _mbtn3=document.getElementById(_mp+'btn');if(_mbtn3){_mbtn3.className='btn-go btn-sm';_mbtn3.textContent='Start Monitor';}}al('ERROR','MONITOR TRIGGERED: '+mon.trigger_reason);}}
+if(_nav!==navId)return;var [br,pr2,or2]=await Promise.all([api('/api/balance'),api('/api/positions'),api('/api/orders')]);if(br.ok){var b=await br.json();if(b.raw&&b.raw.code){document.getElementById('k-bal').textContent='ERR';document.getElementById('k-bal').style.color='var(--red)';document.getElementById('k-avl').textContent=b.raw.msg||'--';document.getElementById('k-avl').style.color='var(--red)';}else{document.getElementById('k-bal').textContent=(b.balance||'--')+' xp';document.getElementById('k-bal').style.color='';document.getElementById('k-avl').textContent=(b.available||'--')+' xp';document.getElementById('k-avl').style.color='';}}if(pr2.ok){var pp=await pr2.json();document.getElementById('k-pos').textContent=(pp.positions||[]).length;}if(or2.ok){var o=await or2.json();var orders=o.orders||[];document.getElementById('k-ord').textContent=orders.length;document.getElementById('oc').textContent=orders.length;var tb=document.getElementById('otb');if(!orders.length)tb.innerHTML='<tr><td colspan="5" style="color:var(--muted)">No active orders</td></tr>';else tb.innerHTML=orders.map(function(x){var tk=x.token||'?';var age='';if(x.created_at){var ms=Date.now()-parseInt(x.created_at);var sec=Math.floor(ms/1000);if(sec<60)age=sec+'s';else if(sec<3600)age=Math.floor(sec/60)+'m';else age=Math.floor(sec/3600)+'h';}return '<tr><td class="'+(x.side==='BUY'?'buy':'sell')+'">'+x.side+' '+tk+'</td><td>'+parseFloat(x.price).toFixed(2)+'</td><td>'+parseFloat(x.size).toFixed(0)+'</td><td>'+age+'</td><td><button class="cbtn" onclick="cx(\''+esc(x.order_id)+'\',\''+esc(x.asset_id)+'\')">x</button></td></tr>';}).join('');}}catch(e){document.getElementById('api-dot').className='dot dot-r';document.getElementById('api-st').textContent='OFFLINE';}}
+
+// Orderbook
+// ═══ Real-time WebSocket Orderbook ═══
+var _bookWs=null,_bookReconnect=null,obConnected=false;
+var _polyToken='',_okxAsset='';
+/* Cached book data — keeps last snapshot so tab switch is instant */
+var _cachedOkxBids=[],_cachedOkxAsks=[],_cachedPolyBids=[],_cachedPolyAsks=[],_obNoSide=false;
+var _activeTab=0; /* which tab is currently visible */
+
+function clearOb(){document.getElementById('ob-id').textContent='--';document.getElementById('ob-b').innerHTML='<div style="color:var(--muted)">--</div>';document.getElementById('ob-a').innerHTML='<div style="color:var(--muted)">--</div>';}
+function clearPolyOb(){document.getElementById('pob-status').textContent='--';document.getElementById('pob-b').innerHTML='<div class="obr" style="color:var(--muted)">--</div>';document.getElementById('pob-a').innerHTML='<div class="obr" style="color:var(--muted)">--</div>';}
+
+function renderOkxOb(){
+  if(!_okxAsset)return;
+  var label=_obNoSide?"Live orderbook (NO)":"Live orderbook";
+  document.getElementById("ob-id").textContent=label;
+  var bids=_cachedOkxBids,asks=_cachedOkxAsks;
+  if(_obNoSide){bids=_cachedOkxAsks.map(function(a){return[(1-parseFloat(a[0])).toFixed(2),a[1]];});asks=_cachedOkxBids.map(function(b){return[(1-parseFloat(b[0])).toFixed(2),b[1]];});}
+  document.getElementById("ob-b").innerHTML=bids.length?bids.map(function(b){return '<div class="obr"><span class="obp">'+b[0]+'</span><span class="obs">'+b[1]+'</span></div>';}).join(""):'<div style="color:var(--muted)">Empty</div>';
+  document.getElementById("ob-a").innerHTML=asks.length?asks.map(function(b){return '<div class="obr"><span class="obp">'+b[0]+'</span><span class="obs">'+b[1]+'</span></div>';}).join(""):'<div style="color:var(--muted)">Empty</div>';
+}
+function renderPolyOb(){
+  /* Render whenever we have an active Poly subscription */
+  if(!_polyToken&&!_monitorActive)return;
+  document.getElementById('pob-status').textContent='Live';
+  document.getElementById('pob-b').innerHTML=_cachedPolyBids.length?_cachedPolyBids.map(function(b){var p=typeof b.price!=='undefined'?parseFloat(b.price).toFixed(2):b[0];var s=typeof b.size!=='undefined'?parseFloat(b.size).toFixed(0):b[1];return '<div class="obr"><span class="obp">'+p+'</span><span class="obs">'+s+'</span></div>';}).join(''):'<div style="color:var(--muted)">Empty</div>';
+  document.getElementById('pob-a').innerHTML=_cachedPolyAsks.length?_cachedPolyAsks.map(function(a){var p=typeof a.price!=='undefined'?parseFloat(a.price).toFixed(2):a[0];var s=typeof a.size!=='undefined'?parseFloat(a.size).toFixed(0):a[1];return '<div class="obr"><span class="obp">'+p+'</span><span class="obs">'+s+'</span></div>';}).join(''):'<div style="color:var(--muted)">Empty</div>';
+}
+
+function connectBook(polyToken, okxAsset){
+  disconnectBook(false);
+  _polyToken=polyToken||'';_okxAsset=okxAsset||'';
+  if(!_polyToken&&!_okxAsset)return;
+  var proto=location.protocol==='https:'?'wss:':'ws:';
+  var url=proto+'//'+location.host+'/ws/book/'+currentAcctId;
+  _bookWs=new WebSocket(url);
+  _bookWs.onopen=function(){
+    obConnected=true;
+    _bookWs.send(JSON.stringify({poly_token:_polyToken,okx_asset:_okxAsset}));
+    // Heartbeat
+    _bookReconnect=setInterval(function(){if(_bookWs&&_bookWs.readyState===1)_bookWs.send(JSON.stringify({type:'ping'}));},15000);
+  };
+  _bookWs.onmessage=function(ev){
+    try{var d=JSON.parse(ev.data);
+    if(d.source==='poly'){
+      _cachedPolyBids=(d.bids||[]).sort(function(a,b){return parseFloat(b.price)-parseFloat(a.price)}).slice(0,5);
+      _cachedPolyAsks=(d.asks||[]).sort(function(a,b){return parseFloat(a.price)-parseFloat(b.price)}).slice(0,5);
+      renderPolyOb();
+    }else if(d.source==='okx'){
+      _cachedOkxBids=(d.bids||[]).slice(0,5);
+      _cachedOkxAsks=(d.asks||[]).slice(0,5);
+      renderOkxOb();
+    }}catch(e){}
+  };
+  _bookWs.onclose=function(){
+    obConnected=false;
+    if(_bookReconnect){clearInterval(_bookReconnect);_bookReconnect=null;}
+    // Auto-reconnect after 2s if we still have subscriptions
+    if(_polyToken||_okxAsset){setTimeout(function(){if(!obConnected&&(_polyToken||_okxAsset))connectBook(_polyToken,_okxAsset);},1000);}
+  };
+  _bookWs.onerror=function(){_bookWs.close();};
+}
+
+function disconnectBook(clearDisplays){if(clearDisplays!==false){_cachedOkxBids=[];_cachedOkxAsks=[];_cachedPolyBids=[];_cachedPolyAsks=[];}
+  obConnected=false;
+  if(_bookReconnect){clearInterval(_bookReconnect);_bookReconnect=null;}
+  if(_bookWs){try{_bookWs.close();}catch(e){}_bookWs=null;}
+  if(clearDisplays!==false){_polyToken='';_okxAsset='';clearOb();clearPolyOb();}
+}
+function reconnectWs(){
+  disconnectBook(false);
+  if(_polyToken||_okxAsset)connectBook(_polyToken,_okxAsset);
+}
+
+function sob(a){/* Start OKX book subscription */
+  _okxAsset=a;
+  if(!obConnected)document.getElementById('ob-id').textContent='Connecting...';
+  connectBook(_polyToken,_okxAsset);
+}
+function startPolyOb(tokenId){/* Start Sniper book subscription */
+  _polyToken=tokenId;
+  if(!obConnected)document.getElementById('pob-status').textContent='Connecting...';
+  reconnectWs();
+}
+function stopPolyOb(){_polyToken='';clearPolyOb();if(_okxAsset){reconnectWs();}else if(!MR&&!MSR&&!BSR&&!PR){disconnectBook(true);}}
+
+// Legacy compat - obI var used by other code
+var obI=null,polyObI=null;
+
+// Poly URL resolver
+var _polyInputTimer=null,_polyResolvedToken='';
+function onPolyInput(){var v=document.getElementById('pi').value.trim();
+var wrap=document.getElementById('poly-sel-wrap');var sel=document.getElementById('poly-sel');
+if(!v){wrap.style.display='none';sel.innerHTML='<option value="">-- Select outcome --</option>';_polyResolvedToken='';return;}
+if(_polyInputTimer)clearTimeout(_polyInputTimer);
+_polyInputTimer=setTimeout(async function(){
+document.getElementById('pob-status').textContent='Resolving...';
+try{var r=await gapi('/api/poly/resolve?url='+encodeURIComponent(v));var d=await r.json();
+if(d.ok&&d.tokens&&d.tokens.length){
+var q=d.question||'';document.getElementById('pob-status').textContent=q?q.substring(0,50):'Resolved';
+sel.innerHTML='<option value="">-- Select outcome --</option>';
+d.tokens.forEach(function(t){var o=document.createElement('option');o.value=t.token_id;o.textContent=t.outcome;sel.appendChild(o);});
+wrap.style.display='';
+if(d.tokens.length===2&&!d.is_event){sel.value=d.tokens[0].token_id;_polyYesToken=d.tokens[0].token_id;_polyNoToken=d.tokens[1].token_id;onPolySel();}
+}else{document.getElementById('pob-status').textContent=d.error||'Not found';wrap.style.display='none';_polyResolvedToken='';}}
+catch(e){document.getElementById('pob-status').textContent='Error';wrap.style.display='none';_polyResolvedToken='';}
+},600);}
+function onPolySel(){var sel=document.getElementById('poly-sel');var tid=sel.value;
+if(!tid){stopPolyOb();_polyResolvedToken='';return;}
+_polyResolvedToken=tid;
+// Store YES/NO pair based on selected outcome
+var selText=sel.options[sel.selectedIndex].textContent;
+var baseQ=selText.replace(/ - (Yes|No)$/i,'').trim();
+_polyYesToken='';_polyNoToken='';
+for(var oi=1;oi<sel.options.length;oi++){var oText=sel.options[oi].textContent;var oBase=oText.replace(/ - (Yes|No)$/i,'').trim();if(oBase===baseQ){if(/ - Yes$/i.test(oText)){_polyYesToken=sel.options[oi].value;}else if(/ - No$/i.test(oText)){_polyNoToken=sel.options[oi].value;}}}
+startPolyOb(tid);}
+
+
+// --- POLY MONITOR ---
+var _monTimers={};
+function toggleMonitor(p){var b=document.getElementById(p+'body');var a=document.getElementById(p+'arrow');if(b.style.display==='none'){b.style.display='';a.innerHTML='&#9660;';}else{b.style.display='none';a.innerHTML='&#9654;';}}
+function resolveMonitor(p){var v=document.getElementById(p+'url').value.trim();var wrap=document.getElementById(p+'sel-wrap');var sel=document.getElementById(p+'sel');
+if(!v){wrap.style.display='none';sel.innerHTML='<option value="">-- Select --</option>';return;}
+if(_monTimers[p])clearTimeout(_monTimers[p]);
+_monTimers[p]=setTimeout(async function(){
+try{var r=await gapi('/api/poly/resolve?url='+encodeURIComponent(v));var d=await r.json();
+if(d.ok&&d.tokens&&d.tokens.length){
+sel.innerHTML='<option value="">-- Select --</option>';
+d.tokens.forEach(function(t){var o=document.createElement('option');o.value=t.token_id;o.textContent=t.outcome;sel.appendChild(o);});
+wrap.style.display='';
+if(d.tokens.length===2&&!d.is_event){sel.selectedIndex=1;onMonitorSel(p);}
+}else{wrap.style.display='none';}}
+catch(e){wrap.style.display='none';}
+},600);}
+
+function onMonitorSel(p){
+var sel=document.getElementById(p+'sel');var tid=sel.value;
+if(!tid){stopMonitorOb();return;}
+startMonitorOb(p,tid);
+}
+
+var _monitorInterval=null,_monitorActive=false,_monitorPrefix='';
+function lockMonitor(p){
+var url=document.getElementById(p+'url');if(url)url.disabled=true;
+var sel=document.getElementById(p+'sel');if(sel)sel.disabled=true;
+var dep=document.getElementById(p+'depth');if(dep)dep.disabled=true;
+var st=document.getElementById(p+'status');
+if(st)st.innerHTML='<span class="dot-ind active"></span><span>Active (bound to strategy)</span>';
+}
+function unlockMonitor(p){
+var url=document.getElementById(p+'url');if(url)url.disabled=false;
+var sel=document.getElementById(p+'sel');if(sel)sel.disabled=false;
+var dep=document.getElementById(p+'depth');if(dep)dep.disabled=false;
+var st=document.getElementById(p+'status');
+if(st)st.innerHTML='<span class="dot-ind"></span><span>Not active</span>';
+_monitorActive=false;stopMonitorOb();
+}
+
+async function startMonitor(){
+al('INFO','Monitor starts automatically with strategy. Fill URL + outcome, then click Start Engine.');
+}
+async function stopMonitor(){
+// Monitor stops when strategy stops - no independent stop
+al('INFO','Monitor will stop when you stop the strategy.');
+}
+function _activeMonPrefix(){if(MR)return'md-mon-';if(BSR)return'bs-mon-';if(MSR)return'ms-mon-';return null;}
+
+function startMonitorOb(prefix,tokenId){stopMonitorOb();_monitorInterval=setInterval(async function(){
+try{var r=await gapi('/api/poly/book?token_id='+tokenId);var d=await r.json();
+var bids=(d.bids||[]).slice(0,5);var asks=(d.asks||[]).slice(0,5);
+document.getElementById('pob-status').textContent='Live';
+document.getElementById('pob-b').innerHTML=bids.length?bids.map(function(b){return '<div class="obr"><span class="obp">'+parseFloat(b.price).toFixed(2)+'</span><span class="obs">'+parseFloat(b.size).toFixed(0)+'</span></div>';}).join(''):'<div style="color:var(--muted)">--</div>';
+document.getElementById('pob-a').innerHTML=asks.length?asks.map(function(a){return '<div class="obr"><span class="obp">'+parseFloat(a.price).toFixed(2)+'</span><span class="obs">'+parseFloat(a.size).toFixed(0)+'</span></div>';}).join(''):'<div style="color:var(--muted)">--</div>';
+}catch(e){}},2000);}
+function stopMonitorOb(){if(_monitorInterval){clearInterval(_monitorInterval);_monitorInterval=null;}clearPolyOb();}
+function resetMonitor(p){
+  _monitorActive=false;
+  stopMonitorOb();
+  var url=document.getElementById(p+'url');if(url)url.value='';
+  var wrap=document.getElementById(p+'sel-wrap');if(wrap)wrap.style.display='none';
+  var sel=document.getElementById(p+'sel');if(sel)sel.innerHTML='<option value="">-- Select --</option>';
+  var st=document.getElementById(p+'status');if(st){st.innerHTML='<span class="dot-ind"></span><span>Not active</span>';}
+  var btn=document.getElementById(p+'btn');if(btn){btn.className='btn-go';btn.textContent='Start Monitor';}
+  var depth=document.getElementById(p+'depth');if(depth)depth.value='3000';
+}
+
+// Log
+function al(t,m){var ts=new Date().toLocaleTimeString();var c=t==='ERROR'?'color:var(--red)':t==='CANCEL'?'color:var(--yellow)':'color:var(--dim)';logs.push({ts:ts,t:t,m:m,c:c});if(logs.length>200)logs.shift();rl();}
+function rl(){var el=document.getElementById('lg');if(!el)return;el.innerHTML=logs.map(function(l){return '<div style="'+l.c+'">['+esc(l.ts)+'] '+esc(l.t)+' '+esc(l.m)+'</div>';}).join('');el.scrollTop=el.scrollHeight;}
+
+// Searchable dropdown
+var _mkts=[],_mktMap={};
+function sdInit(wrId,hidId,btnId,listId,qId){var wr=document.getElementById(wrId),btn=document.getElementById(btnId),q=document.getElementById(qId),list=document.getElementById(listId);if(!wr||!btn||!q||!list)return;btn.addEventListener('click',function(e){e.stopPropagation();var open=wr.classList.toggle('open');if(open){q.value='';sdRender(listId,_mkts,hidId,btnId);setTimeout(function(){q.focus();},50);}});q.addEventListener('input',function(){var v=this.value.toLowerCase();var f=_mkts.filter(function(m){return(m.question||m.event_title||'').toLowerCase().indexOf(v)!==-1||String(m.yes_asset_id).indexOf(v)!==-1;});sdRender(listId,f,hidId,btnId);});q.addEventListener('click',function(e){e.stopPropagation();});list.addEventListener('click',function(e){e.stopPropagation();});}
+function sdRender(listId,items,hidId,btnId){var list=document.getElementById(listId),hid=document.getElementById(hidId);if(!list||!hid)return;if(!items.length){list.innerHTML='<div class="sdrop-empty">No markets found</div>';return;}list.innerHTML=items.map(function(m){var t=esc((m.question||m.event_title).substring(0,55))+' ['+esc(String(m.yes_asset_id))+']';var sel=hid.value==m.yes_asset_id?' sel':'';return '<div class="sdrop-item'+sel+'" data-v="'+m.yes_asset_id+'" title="'+t+'">'+t+'</div>';}).join('');list.querySelectorAll('.sdrop-item').forEach(function(el){el.addEventListener('click',function(){sdSelect(hidId,btnId,this.getAttribute('data-v'),this.textContent);});});}
+function sdSelect(hidId,btnId,val,txt){document.getElementById(hidId).value=val;document.getElementById(btnId).textContent=txt;document.querySelectorAll('.sdrop').forEach(function(d){d.classList.remove('open');});if(val){SA=val;if(hidId==='smkt'){_obNoSide=(document.getElementById('ms-side').value==='NO');}if(hidId==='bsmkt'){_obNoSide=(document.getElementById('bs-side').value==='NO');}sob(val);if(hidId==='tmkt'){mtFetchTicker();mtFetchPosition();mtLoadHistory();}}}
+function msSideChange(){_obNoSide=(document.getElementById("ms-side").value==="NO");renderOkxOb();}
+function bsSideChange(){_obNoSide=(document.getElementById("bs-side").value==="NO");renderOkxOb();}
+document.addEventListener('click',function(){document.querySelectorAll('.sdrop').forEach(function(d){d.classList.remove('open');});});
+
+async function loadMkts(){try{var r=await api('/api/markets');if(!r.ok){al('ERROR','Markets: '+r.status);return;}var d=await r.json();_mkts=d.markets||[];_mktMap={};_mkts.forEach(function(m){_mktMap[m.yes_asset_id]=m;});sdRender('mkt-list',_mkts,'mkt','mkt-btn');sdRender('smkt-list',_mkts,'smkt','smkt-btn');sdRender('bsmkt-list',_mkts,'bsmkt','bsmkt-btn');sdRender('pmkt-list',_mkts,'pmkt','pmkt-btn');sdRender('tmkt-list',_mkts,'tmkt','tmkt-btn');sdRender('somkt-list',_mkts,'somkt','somkt-btn');al('INFO','Loaded '+_mkts.length+' markets');}catch(e){al('ERROR','Failed to load markets');}}
+
+sdInit('sdrop-mkt','mkt','mkt-btn','mkt-list','mkt-q');
+sdInit('sdrop-smkt','smkt','smkt-btn','smkt-list','smkt-q');
+sdInit('sdrop-bsmkt','bsmkt','bsmkt-btn','bsmkt-list','bsmkt-q');
+sdInit('sdrop-pmkt','pmkt','pmkt-btn','pmkt-list','pmkt-q');
+sdInit('sdrop-tmkt','tmkt','tmkt-btn','tmkt-list','tmkt-q');
+sdInit('sdrop-somkt','somkt','somkt-btn','somkt-list','somkt-q');
+
+// Boot
+route();
+
+async function toggleRebalance(enabled){
+  if(!currentAcctId)return;
+  try{
+    var r=await api('/api/accounts/'+currentAcctId+'/rebalance/toggle',{method:'POST',body:JSON.stringify({enabled:enabled})});
+    if(r.ok){var d=await r.json();if(d.ok){al('INFO','Auto-Rebalance '+(d.enabled?'ON':'OFF'));syncRebalUI(d.enabled);}else{al('ERROR',d.error||'Failed');}}
+  }catch(e){al('ERROR',e.message);}
+}
+function syncRebalUI(enabled){
+  var cb1=document.getElementById('md-mon-rebal');
+  var cb2=document.getElementById('ms-mon-rebal');
+  if(cb1&&cb1.checked!==enabled){cb1.onchange=null;cb1.checked=enabled;cb1.onchange=function(){toggleRebalance(this.checked)};}
+  if(cb2&&cb2.checked!==enabled){cb2.onchange=null;cb2.checked=enabled;cb2.onchange=function(){toggleRebalance(this.checked)};}
+}
+
+async function tgSniper(){
+  var btn=document.getElementById('pb');
+  if(btn.disabled)return;
+  btn.disabled=true;
+  try{
+    if(!PR){
+      var asset=document.getElementById('pmkt').value;
+      if(!asset){al('ERROR','Select OKX market');return;}
+      // Need poly token IDs - resolve from poly-sel or stored
+      var polySel=document.getElementById('poly-sel');
+      if(!polySel||!polySel.value){al('ERROR','Select Poly outcome first');return;}
+      // poly-sel value is the YES token, we need both YES and NO
+      // The resolve should have stored both
+      // Derive YES/NO token pair from the selected dropdown option
+      var polySel=document.getElementById('poly-sel');
+      if(!polySel||!polySel.value){al('ERROR','Select a Poly outcome first');return;}
+      var selectedToken=polySel.value;
+      var selectedText=polySel.options[polySel.selectedIndex].textContent;
+      var yesToken='',noToken='';
+      // Find the matching pair: same question, opposite YES/NO
+      // Format: "Question - Yes" / "Question - No"
+      var baseQ=selectedText.replace(/ - (Yes|No)$/i,'').trim();
+      var isYes=/ - Yes$/i.test(selectedText);
+      for(var oi=1;oi<polySel.options.length;oi++){
+        var oText=polySel.options[oi].textContent;
+        var oBase=oText.replace(/ - (Yes|No)$/i,'').trim();
+        if(oBase===baseQ){
+          if(/ - Yes$/i.test(oText)){yesToken=polySel.options[oi].value;}
+          else if(/ - No$/i.test(oText)){noToken=polySel.options[oi].value;}
+        }
+      }
+      if(!yesToken||!noToken){al('ERROR','Cannot find YES/NO pair for selected outcome');return;}
+      _polyYesToken=yesToken;_polyNoToken=noToken;_polyResolvedToken=selectedToken;
+      var mkt=_mktMap[asset]||{};
+      var payload={
+        yes_token_id:yesToken,
+        no_token_id:noToken,
+        yes_asset_id:asset,
+        no_asset_id:mkt.no_asset_id||'',
+        market_id:mkt.market_id||'',
+        threshold_cents:parseInt(document.getElementById('sn-thresh').value)||10,
+        buy_limit_cents:parseInt(document.getElementById('sn-limit').value)||50,
+        position_pct:parseInt(document.getElementById('sn-pct').value)||100,
+        timeout_secs:parseInt(document.getElementById('sn-timeout').value)||10,settle_ms:parseInt(document.getElementById('sn-settle').value)||3000,window_ms:parseInt(document.getElementById('sn-window').value)||150,
+        poly_url:document.getElementById('pi').value.trim(),
+        selected_outcome:selectedText,
+      };
+      var r=await api('/api/sniper/start',{method:'POST',body:JSON.stringify(payload)});
+      if(r.ok){var d=await r.json();if(d.ok){PR=true;btn.className='btn-stop';btn.textContent='Stop Sniper';document.getElementById('ps').textContent='Monitoring...';document.getElementById('ps').style.color='var(--green)';al('INFO','Sniper started');}else{al('ERROR',d.error||'Failed');}}else{var e=await r.json();al('ERROR',e.error||'HTTP '+r.status);}
+    }else{
+      await api('/api/sniper/stop',{method:'POST'});
+      PR=false;btn.className='btn-go';btn.textContent='Start Sniper';document.getElementById('ps').textContent='Idle';document.getElementById('ps').style.color='var(--muted)';document.getElementById('sn-hold-info').style.display='none';al('INFO','Sniper stopped');
+    }
+  }catch(e){al('ERROR',e.message);}
+  finally{btn.disabled=false;}
+}
+var _polyYesToken='',_polyNoToken='';
+
+// ─── Sniper Old ───
+var _soPolyYesToken='',_soPolyNoToken='';
+var _soPolyTimer=null;
+async function onSoPolyInput(){
+var url=document.getElementById('so-pi').value.trim();
+if(!url){document.getElementById('so-poly-sel-wrap').style.display='none';return;}
+if(_soPolyTimer)clearTimeout(_soPolyTimer);
+_soPolyTimer=setTimeout(async function(){
+try{var r=await gapi('/api/poly/resolve?url='+encodeURIComponent(url));var d=await r.json();
+if(d.ok&&d.tokens&&d.tokens.length){
+var sel=document.getElementById('so-poly-sel');sel.innerHTML='<option value="">-- Select outcome --</option>';
+d.tokens.forEach(function(t){
+var opt=document.createElement('option');opt.value=t.token_id;
+opt.textContent=t.outcome;opt.dataset.yes=t.token_id;opt.dataset.no='';
+sel.appendChild(opt);});
+for(var i=1;i<sel.options.length;i++){var txt=sel.options[i].textContent;
+if(/ - Yes$/i.test(txt)){var base=txt.replace(/ - Yes$/i,'');
+for(var j=1;j<sel.options.length;j++){if(sel.options[j].textContent===base+' - No'){sel.options[i].dataset.no=sel.options[j].value;sel.options[j].dataset.yes=sel.options[i].value;break;}}}}
+document.getElementById('so-poly-sel-wrap').style.display='';
+if(d.tokens.length===2&&!d.is_event){sel.selectedIndex=1;onSoPolySel();}
+}else{document.getElementById('so-poly-sel-wrap').style.display='none';}}
+catch(e){console.error(e);document.getElementById('so-poly-sel-wrap').style.display='none';}
+},600);
+}
+function onSoPolySel(){
+var sel=document.getElementById('so-poly-sel');var opt=sel.options[sel.selectedIndex];
+if(!opt||!opt.value)return;
+_soPolyYesToken=opt.dataset.yes||'';_soPolyNoToken=opt.dataset.no||'';
+var tid=opt.value;if(tid)startPolyOb(tid);
+}
+async function tgSniperOld(){
+var btn=document.getElementById('sob');if(btn.disabled)return;btn.disabled=true;
+try{if(!SOR){
+var mkt=document.getElementById('somkt').value;
+if(!mkt){al('ERROR','Select OKX market');return;}
+if(!_soPolyYesToken){al('ERROR','Select Poly outcome');return;}
+var mktInfo=_mktMap[mkt]||{};
+var payload={
+yes_token_id:_soPolyYesToken,no_token_id:_soPolyNoToken,
+yes_asset_id:mkt,no_asset_id:mktInfo.no_asset_id||'',
+market_id:mktInfo.market_id||'',
+threshold_cents:parseInt(document.getElementById('so-thresh').value)||10,
+position_pct:parseInt(document.getElementById('so-pct').value)||100,
+timeout_secs:parseInt(document.getElementById('so-timeout').value)||10,
+settle_ms:parseInt(document.getElementById('so-settle').value)||0,
+window_ms:parseInt(document.getElementById('so-window').value)||150,
+poly_url:document.getElementById('so-pi').value,
+selected_outcome:(document.getElementById('so-poly-sel').options[document.getElementById('so-poly-sel').selectedIndex]||{}).textContent||''
+};
+var r=await api('/api/sniper-old/start',{method:'POST',body:JSON.stringify(payload)});
+if(r.ok){var d=await r.json();if(d.ok){SOR=true;btn.className='btn-stop';btn.textContent='Stop Sniper Old';al('INFO','Sniper Old started');}else{al('ERROR',d.error||'Failed');}}
+else{try{var er=await r.json();al('ERROR',er.error||'HTTP '+r.status);}catch(_){al('ERROR','HTTP '+r.status);}}
+}else{
+await api('/api/sniper-old/stop',{method:'POST'});SOR=false;btn.className='btn-go';btn.textContent='Start Sniper Old';al('INFO','Sniper Old stopped');
+}}finally{btn.disabled=false;}}
+
+</script>
+</body>
+</html>
