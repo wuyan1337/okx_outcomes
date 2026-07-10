@@ -39,6 +39,50 @@ with open(config_path) as f:
 # Account manager (initialized in lifespan)
 manager = AccountManager()
 
+# Persistent OKX asset -> Polymarket token/url map used by Ask Sell
+POLY_ASSET_MAP_PATH = Path(__file__).parent.parent / "data" / "poly_asset_map.json"
+
+
+def _load_poly_asset_map() -> dict:
+    try:
+        if POLY_ASSET_MAP_PATH.exists():
+            with open(POLY_ASSET_MAP_PATH, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load poly asset map: {e}")
+    return {}
+
+
+def _save_poly_asset_map(data: dict):
+    try:
+        POLY_ASSET_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(POLY_ASSET_MAP_PATH, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to save poly asset map: {e}")
+
+
+def _record_poly_asset_mapping(account_id: str, market_id: str, yes_asset_id: str, no_asset_id: str,
+                               yes_token_id: str, no_token_id: str, poly_url: str = "",
+                               selected_outcome: str = ""):
+    import time as _time
+    data = _load_poly_asset_map()
+    now = int(_time.time() * 1000)
+    if yes_asset_id and yes_token_id:
+        data[yes_asset_id] = {"account_id": account_id, "okx_market_id": market_id, "okx_asset_id": yes_asset_id,
+                              "side": "yes", "poly_token_id": yes_token_id, "poly_url": poly_url or "",
+                              "selected_outcome": selected_outcome or "", "updated_at": now}
+    if no_asset_id and no_token_id:
+        data[no_asset_id] = {"account_id": account_id, "okx_market_id": market_id, "okx_asset_id": no_asset_id,
+                             "side": "no", "poly_token_id": no_token_id, "poly_url": poly_url or "",
+                             "selected_outcome": selected_outcome or "", "updated_at": now}
+    _save_poly_asset_map(data)
+
+
+def _poly_price_str(price: float) -> str:
+    decimals = 3 if (price < 0.04 or price > 0.96) else 2
+    return f"{price:.{decimals}f}"
+
 # Auth
 security = HTTPBasic(auto_error=False)
 
@@ -672,6 +716,94 @@ async def account_cancel_all(account_id: str, user: str = Depends(verify_auth)):
         return {"ok": False, "error": str(e)}
 
 
+@app.post("/api/accounts/{account_id}/ask_sell")
+async def account_ask_sell(account_id: str, user: str = Depends(verify_auth)):
+    """Place GTC sell orders for all positions at matching Polymarket ask1."""
+    inst = manager.get_instance(account_id)
+    if not inst:
+        raise HTTPException(404, "Account not found")
+    import aiohttp
+    import asyncio as _asyncio
+    try:
+        poly_map = _load_poly_asset_map()
+        orders_resp = await inst.client.get_orders(status="open")
+        open_orders = orders_resp.get("data", {}).get("list", []) if str(orders_resp.get("code", "")) == "0" else []
+        pos_resp = await inst.client.get_positions(status="open")
+        positions = pos_resp.get("data", {}).get("list", []) if str(pos_resp.get("code", "")) == "0" else []
+        results = []
+        placed = skipped = cancelled = 0
+        async with aiohttp.ClientSession() as sess:
+            for p in positions:
+                mid = p.get("marketId", "")
+                token_name = p.get("tokenName", "Yes")
+                token_idx = p.get("tokenIndex", "1")
+                size = p.get("availableSize", p.get("size", "0"))
+                try:
+                    if not mid or float(size or 0) <= 0:
+                        continue
+                except Exception:
+                    continue
+                yes_aid = f"{mid}000"
+                no_aid = f"{mid}100"
+                aid = no_aid if token_idx == "2" or str(token_name).upper() == "NO" else yes_aid
+                mapping = poly_map.get(aid)
+                if not mapping or not mapping.get("poly_token_id"):
+                    skipped += 1
+                    results.append({"asset_id": aid, "size": size, "status": "skipped", "reason": "no_poly_mapping"})
+                    continue
+                token_id = mapping["poly_token_id"]
+                try:
+                    async with sess.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                        if resp.status != 200:
+                            skipped += 1
+                            results.append({"asset_id": aid, "size": size, "status": "skipped", "reason": f"poly_http_{resp.status}"})
+                            continue
+                        book = await resp.json()
+                    asks = sorted(book.get("asks", []), key=lambda x: float(x.get("price", 0)))
+                    if not asks:
+                        skipped += 1
+                        results.append({"asset_id": aid, "size": size, "status": "skipped", "reason": "no_poly_asks"})
+                        continue
+                    ask1 = float(asks[0].get("price", 0))
+                    if ask1 <= 0:
+                        skipped += 1
+                        results.append({"asset_id": aid, "size": size, "status": "skipped", "reason": "bad_poly_ask"})
+                        continue
+                    price_str = _poly_price_str(ask1)
+                    local_cancelled = 0
+                    for o in open_orders:
+                        oid = o.get("oid", o.get("id", ""))
+                        if o.get("assetId") == aid and o.get("side", "").upper() == "SELL" and oid:
+                            try:
+                                cr = await inst.client.cancel_order(asset_id=aid, order_id=oid)
+                                if str(cr.get("code", "")) == "0":
+                                    cancelled += 1
+                                    local_cancelled += 1
+                            except Exception:
+                                pass
+                    if local_cancelled:
+                        await _asyncio.sleep(0.2)
+                    sell_resp = await inst.client.place_order(asset_id=aid, side="sell", price=price_str,
+                                                              size=normalize_size_str(size), tif="gtc", reduce_only=True)
+                    if str(sell_resp.get("code", "")) == "0":
+                        placed += 1
+                        results.append({"asset_id": aid, "side": mapping.get("side", ""),
+                                        "size": normalize_size_str(size), "poly_ask1": price_str,
+                                        "poly_url": mapping.get("poly_url", ""), "status": "placed"})
+                    else:
+                        skipped += 1
+                        results.append({"asset_id": aid, "size": size, "poly_ask1": price_str, "status": "failed",
+                                        "reason": sell_resp.get("message", sell_resp.get("msg", str(sell_resp)))})
+                except Exception as e:
+                    skipped += 1
+                    results.append({"asset_id": aid, "size": size, "status": "failed", "reason": str(e)})
+        return {"ok": True, "placed": placed, "skipped": skipped, "cancelled": cancelled, "results": results}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/api/accounts/{account_id}/flash_close")
 async def account_flash_close(account_id: str, user: str = Depends(verify_auth)):
     """Emergency close: stop strategies, cancel all orders, sell all positions at market."""
@@ -1138,6 +1270,17 @@ async def sniper_start(account_id: str, request: Request, user: str = Depends(ve
         poly_url=body.get("poly_url", ""),
         selected_outcome=body.get("selected_outcome", ""),
     )
+    if result.get("ok"):
+        _record_poly_asset_mapping(
+            account_id=account_id,
+            market_id=body.get("market_id", ""),
+            yes_asset_id=body.get("yes_asset_id", ""),
+            no_asset_id=body.get("no_asset_id", ""),
+            yes_token_id=body.get("yes_token_id", ""),
+            no_token_id=body.get("no_token_id", ""),
+            poly_url=body.get("poly_url", ""),
+            selected_outcome=body.get("selected_outcome", ""),
+        )
     return result
 
 
@@ -1181,6 +1324,17 @@ async def sniper_old_start(account_id: str, request: Request, user: str = Depend
         poly_url=body.get("poly_url", ""),
         selected_outcome=body.get("selected_outcome", ""),
     )
+    if result.get("ok"):
+        _record_poly_asset_mapping(
+            account_id=account_id,
+            market_id=body.get("market_id", ""),
+            yes_asset_id=body.get("yes_asset_id", ""),
+            no_asset_id=body.get("no_asset_id", ""),
+            yes_token_id=body.get("yes_token_id", ""),
+            no_token_id=body.get("no_token_id", ""),
+            poly_url=body.get("poly_url", ""),
+            selected_outcome=body.get("selected_outcome", ""),
+        )
     return result
 
 
