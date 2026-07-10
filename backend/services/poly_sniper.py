@@ -494,11 +494,12 @@ class PolySniper:
             self.state.status = "monitoring"
             return False
 
-        # Check fill - poll open+closed orders (GTC may partially fill)
+        # Check fill briefly, then cancel remaining open GTC buy quickly.
+        # User wants entry orders not to rest: old wait was ~4s, now ~0.1s.
         filled_size = 0.0
         fill_price = buy_limit
-        for _attempt in range(4):
-            await asyncio.sleep(1)
+        for _attempt in range(1):
+            await asyncio.sleep(0.1)
             try:
                 for _status in ("closed", "open"):
                     orders = await self.client.get_orders(status=_status)
@@ -528,7 +529,7 @@ class PolySniper:
 
         # Post-cancel final poll: catch last-second fills during cancel flight
         if filled_size < 1:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.1)
             try:
                 for _status in ("closed", "open"):
                     orders = await self.client.get_orders(status=_status)
@@ -549,7 +550,7 @@ class PolySniper:
                 self.log(f"Post-cancel poll error: {e}")
 
         if filled_size < 1:
-            self.log("Buy order got 0 fill — no liquidity below limit")
+            self.log("Buy order got 0 fill within 0.1s — cancelled")
             await self._notify(f"\u274c \u4e70\u5165\u5931\u8d25: \u65e0\u6df1\u5ea6")
             self.state.status = "monitoring"
             return False
