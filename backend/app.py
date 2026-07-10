@@ -79,6 +79,31 @@ def _record_poly_asset_mapping(account_id: str, market_id: str, yes_asset_id: st
     _save_poly_asset_map(data)
 
 
+def _record_monitor_mapping(account_id: str, market_id: str, yes_asset_id: str, no_asset_id: str,
+                            monitor: dict, fallback_poly_token_id: str = "", selected_side: str = ""):
+    if not monitor:
+        return
+    yes_token_id = monitor.get("yes_token_id", "") or ""
+    no_token_id = monitor.get("no_token_id", "") or ""
+    poly_token_id = monitor.get("poly_token_id", fallback_poly_token_id) or ""
+    side = (selected_side or "").lower()
+    if not yes_token_id and not no_token_id and poly_token_id:
+        if side == "no":
+            no_token_id = poly_token_id
+        else:
+            yes_token_id = poly_token_id
+    _record_poly_asset_mapping(
+        account_id=account_id,
+        market_id=market_id,
+        yes_asset_id=yes_asset_id,
+        no_asset_id=no_asset_id,
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
+        poly_url=monitor.get("poly_url", ""),
+        selected_outcome=monitor.get("selected_outcome", ""),
+    )
+
+
 def _poly_price_str(price: float) -> str:
     decimals = 3 if (price < 0.04 or price > 0.96) else 2
     return f"{price:.{decimals}f}"
@@ -609,6 +634,7 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
             )
             if result.get("ok"):
                 inst.poly_monitor.set_strategy_context(strategy_type, int(price_f), yes_asset_id)
+                _record_monitor_mapping(account_id, market_id, yes_asset_id, no_asset_id, monitor, poly_token_id, side)
             else:
                 # Strategy started but monitor failed - log warning, don't fail the whole thing
                 import logging; import sys
@@ -1171,6 +1197,7 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
             )
             if r and r.get("ok"):
                 inst.poly_monitor.set_strategy_context("manual-d", int(price), asset_id)
+                _record_monitor_mapping(account_id, market_id, asset_id, no_asset_id, monitor, poly_token_id, "yes")
         except Exception as e:
             import logging; import sys
             logging.getLogger(__name__).warning(f"Monitor start error: {e}")
@@ -1210,6 +1237,16 @@ async def account_monitor_start(account_id: str, request: Request, user: str = D
     if not poly_token_id:
         return JSONResponse(status_code=400, content={"ok": False, "error": "poly_token_id required"})
     result = await inst.poly_monitor.start(poly_token_id, reference_price, depth_threshold)
+    if result.get("ok") and body.get("yes_asset_id"):
+        _record_monitor_mapping(
+            account_id,
+            body.get("market_id", ""),
+            body.get("yes_asset_id", ""),
+            body.get("no_asset_id", ""),
+            body.get("monitor", body),
+            poly_token_id,
+            body.get("side", "yes"),
+        )
     return result
 
 
@@ -1473,6 +1510,7 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
             )
             if r and r.get("ok"):
                 inst.poly_monitor.set_strategy_context("manual-s", int(sell_price_val) if mode == "bid-sell" else int(price), asset_id, mode=mode)
+                _record_monitor_mapping(account_id, market_id, asset_id, no_asset_id, monitor, poly_token_id, side.lower())
         except Exception as e:
             import logging; import sys
             logging.getLogger(__name__).warning(f"Monitor start error: {e}")
