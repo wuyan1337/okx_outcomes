@@ -303,6 +303,29 @@ class ManualStrategyS:
                     tif="gtc",
                 )
 
+                # OKX sometimes rejects freshly filled decimal residue with generic
+                # "Invalid request parameters" (precision/oversell by tiny float).
+                # Retry once with whole shares floored; better to hedge most exposure
+                # than leave a naked position and spam Telegram.
+                if str(sell_resp.get("code", "")) != "0" and "Invalid request parameters" in str(sell_resp.get("message", "")):
+                    safe_units = int(new_fill)
+                    safe_notional = (sell_cents / 100.0) * safe_units
+                    if safe_units >= 1 and safe_notional >= 1.0 and str(safe_units) != size_str:
+                        self.log(f"Sell {label} 参数失败，降级整数重试: {size_str} -> {safe_units}")
+                        sell_resp = await self.client.place_order(
+                            asset_id=self.state.asset_id,
+                            side="sell",
+                            price=sell_price,
+                            size=str(safe_units),
+                            tif="gtc",
+                        )
+                        if str(sell_resp.get("code", "")) == "0":
+                            # Mark only the amount actually posted; decimal residue will be
+                            # retried later once more fills accumulate above min notional.
+                            filled = prev_processed + safe_units
+                            new_fill = float(safe_units)
+                            size_str = str(safe_units)
+
                 if str(sell_resp.get("code", "")) == "0":
                     self.state.pending_sells[oid] = filled
                     sell_oid = sell_resp.get("data", {}).get("oid", "") or sell_resp.get("data", {}).get("orderId", "")
