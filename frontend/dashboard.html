@@ -765,7 +765,7 @@ try{var r=await gapi('/api/poly/resolve?url='+encodeURIComponent(v));var d=await
 if(d.ok&&d.tokens&&d.tokens.length){
 var q=d.question||'';document.getElementById('pob-status').textContent=q?q.substring(0,50):'Resolved';
 sel.innerHTML='<option value="">-- Select outcome --</option>';
-d.tokens.forEach(function(t){var o=document.createElement('option');o.value=t.token_id;o.textContent=t.outcome;sel.appendChild(o);});
+d.tokens.forEach(function(t,idx){var o=document.createElement('option');o.value=t.token_id;o.textContent=t.outcome;o.dataset.marketId=t.market_id||'';o.dataset.slug=t.slug||'';o.dataset.idx=idx;sel.appendChild(o);});
 wrap.style.display='';
 if(d.tokens.length===2&&!d.is_event){sel.value=d.tokens[0].token_id;_polyYesToken=d.tokens[0].token_id;_polyNoToken=d.tokens[1].token_id;onPolySel();}
 }else{document.getElementById('pob-status').textContent=d.error||'Not found';wrap.style.display='none';_polyResolvedToken='';}}
@@ -774,11 +774,15 @@ catch(e){document.getElementById('pob-status').textContent='Error';wrap.style.di
 function onPolySel(){var sel=document.getElementById('poly-sel');var tid=sel.value;
 if(!tid){stopPolyOb();_polyResolvedToken='';return;}
 _polyResolvedToken=tid;
-// Store YES/NO pair based on selected outcome
-var selText=sel.options[sel.selectedIndex].textContent;
-var baseQ=selText.replace(/ - (Yes|No)$/i,'').trim();
+// Store token pair for selected binary market. Supports both Yes/No and arbitrary outcomes (e.g. Team to Advance: Norway/England).
+var opt=sel.options[sel.selectedIndex];
+var selText=opt.textContent;
+var marketId=opt.dataset.marketId||'';
 _polyYesToken='';_polyNoToken='';
-for(var oi=1;oi<sel.options.length;oi++){var oText=sel.options[oi].textContent;var oBase=oText.replace(/ - (Yes|No)$/i,'').trim();if(oBase===baseQ){if(/ - Yes$/i.test(oText)){_polyYesToken=sel.options[oi].value;}else if(/ - No$/i.test(oText)){_polyNoToken=sel.options[oi].value;}}}
+var pair=[];
+if(marketId){for(var oi=1;oi<sel.options.length;oi++){if((sel.options[oi].dataset.marketId||'')===marketId){pair.push(sel.options[oi]);}}}
+if(pair.length===2){_polyYesToken=pair[0].value;_polyNoToken=pair[1].value;}
+else{var baseQ=selText.replace(/ - (Yes|No)$/i,'').trim();for(var oi=1;oi<sel.options.length;oi++){var oText=sel.options[oi].textContent;var oBase=oText.replace(/ - (Yes|No)$/i,'').trim();if(oBase===baseQ){if(/ - Yes$/i.test(oText)){_polyYesToken=sel.options[oi].value;}else if(/ - No$/i.test(oText)){_polyNoToken=sel.options[oi].value;}}}}
 startPolyOb(tid);}
 
 
@@ -908,21 +912,31 @@ async function tgSniper(){
       var polySel=document.getElementById('poly-sel');
       if(!polySel||!polySel.value){al('ERROR','Select a Poly outcome first');return;}
       var selectedToken=polySel.value;
-      var selectedText=polySel.options[polySel.selectedIndex].textContent;
+      var selectedOpt=polySel.options[polySel.selectedIndex];
+      var selectedText=selectedOpt.textContent;
       var yesToken='',noToken='';
-      // Find the matching pair: same question, opposite YES/NO
-      // Format: "Question - Yes" / "Question - No"
-      var baseQ=selectedText.replace(/ - (Yes|No)$/i,'').trim();
-      var isYes=/ - Yes$/i.test(selectedText);
-      for(var oi=1;oi<polySel.options.length;oi++){
-        var oText=polySel.options[oi].textContent;
-        var oBase=oText.replace(/ - (Yes|No)$/i,'').trim();
-        if(oBase===baseQ){
-          if(/ - Yes$/i.test(oText)){yesToken=polySel.options[oi].value;}
-          else if(/ - No$/i.test(oText)){noToken=polySel.options[oi].value;}
+      // Find the matching binary pair. Prefer API market_id so non-YES/NO markets work
+      // (e.g. Team to Advance: Norway/England). Fallback to legacy "Question - Yes/No" labels.
+      var marketId=selectedOpt.dataset.marketId||'';
+      var pair=[];
+      if(marketId){
+        for(var oi=1;oi<polySel.options.length;oi++){
+          if((polySel.options[oi].dataset.marketId||'')===marketId){pair.push(polySel.options[oi]);}
         }
       }
-      if(!yesToken||!noToken){al('ERROR','Cannot find YES/NO pair for selected outcome');return;}
+      if(pair.length===2){yesToken=pair[0].value;noToken=pair[1].value;}
+      else{
+        var baseQ=selectedText.replace(/ - (Yes|No)$/i,'').trim();
+        for(var oi=1;oi<polySel.options.length;oi++){
+          var oText=polySel.options[oi].textContent;
+          var oBase=oText.replace(/ - (Yes|No)$/i,'').trim();
+          if(oBase===baseQ){
+            if(/ - Yes$/i.test(oText)){yesToken=polySel.options[oi].value;}
+            else if(/ - No$/i.test(oText)){noToken=polySel.options[oi].value;}
+          }
+        }
+      }
+      if(!yesToken||!noToken){al('ERROR','Cannot find token pair for selected outcome');return;}
       _polyYesToken=yesToken;_polyNoToken=noToken;_polyResolvedToken=selectedToken;
       var mkt=_mktMap[asset]||{};
       var payload={
@@ -962,7 +976,7 @@ if(d.ok&&d.tokens&&d.tokens.length){
 var sel=document.getElementById('so-poly-sel');sel.innerHTML='<option value="">-- Select outcome --</option>';
 d.tokens.forEach(function(t){
 var opt=document.createElement('option');opt.value=t.token_id;
-opt.textContent=t.outcome;opt.dataset.yes=t.token_id;opt.dataset.no='';
+opt.textContent=t.outcome;opt.dataset.yes=t.token_id;opt.dataset.no='';opt.dataset.marketId=t.market_id||'';opt.dataset.slug=t.slug||'';
 sel.appendChild(opt);});
 for(var i=1;i<sel.options.length;i++){var txt=sel.options[i].textContent;
 if(/ - Yes$/i.test(txt)){var base=txt.replace(/ - Yes$/i,'');
