@@ -1679,7 +1679,13 @@ async def proxy_latency_single(node_id: str, user: str = Depends(verify_auth)):
 
 @app.get("/api/poly/resolve")
 async def poly_resolve(url: str = "", user: str = Depends(verify_auth)):
-    """Resolve a Polymarket URL/slug to token_ids."""
+    """Resolve a Polymarket URL/slug to token_ids.
+
+    Sports pages can include the base event plus derived markets/events such as
+    Team to Advance, Extra Time, Penalty Shootout, Total Corners and Player Props.
+    Aggregate known siblings so the dropdown is not limited to the base 3
+    moneyline markets (six Yes/No tokens).
+    """
     import aiohttp, re, json
     if not url:
         return {"ok": False, "error": "No URL provided"}
@@ -1729,50 +1735,111 @@ async def poly_resolve(url: str = "", user: str = Depends(verify_auth)):
                     f"https://gamma-api.polymarket.com/events?slug={slug}",
                 ]
             
+            def _loads(v, default=None):
+                if default is None:
+                    default = []
+                if isinstance(v, str):
+                    try:
+                        return json.loads(v)
+                    except Exception:
+                        return default
+                return v if v is not None else default
+
+            def _market_tokens(mkt, prefix=None):
+                tokens = _loads(mkt.get("clobTokenIds", "[]"), [])
+                outcomes = _loads(mkt.get("outcomes", "[]"), [])
+                q = prefix or mkt.get("question") or mkt.get("groupItemTitle") or mkt.get("slug") or "Market"
+                out = []
+                for i, tid in enumerate(tokens or []):
+                    if not tid:
+                        continue
+                    outcome = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
+                    out.append({
+                        "token_id": str(tid),
+                        "outcome": f"{q} - {outcome}",
+                        "market_id": str(mkt.get("id", "")),
+                        "slug": mkt.get("slug", ""),
+                        "market_type": mkt.get("sportsMarketType", ""),
+                    })
+                return out
+
+            async def _fetch_json(api_url):
+                try:
+                    async with sess.get(api_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                        if resp.status != 200:
+                            return None
+                        return await resp.json()
+                except Exception:
+                    return None
+
+            def _add_market(all_tokens, seen_tokens, mkt):
+                title = mkt.get("question") or mkt.get("groupItemTitle") or mkt.get("slug") or "Market"
+                for tok in _market_tokens(mkt, title):
+                    tid = tok["token_id"]
+                    if tid in seen_tokens:
+                        continue
+                    seen_tokens.add(tid)
+                    all_tokens.append(tok)
+
+            async def _add_event_slug(all_tokens, seen_tokens, ev_slug):
+                item = await _fetch_json(f"https://gamma-api.polymarket.com/events/slug/{ev_slug}")
+                if not item or not isinstance(item, dict):
+                    return
+                for mkt in item.get("markets") or []:
+                    _add_market(all_tokens, seen_tokens, mkt)
+
+            async def _add_market_slug(all_tokens, seen_tokens, mkt_slug):
+                data = await _fetch_json(f"https://gamma-api.polymarket.com/markets?slug={mkt_slug}")
+                if isinstance(data, list) and data:
+                    _add_market(all_tokens, seen_tokens, data[0])
+
+            # Sports event URL: aggregate base event + visible sibling groups.
+            if is_event_slug:
+                all_tokens, seen_tokens = [], set()
+                await _add_event_slug(all_tokens, seen_tokens, slug)
+                for suffix in ("team-to-advance", "extra-time", "penalty-shootout"):
+                    await _add_market_slug(all_tokens, seen_tokens, f"{slug}-{suffix}")
+                for suffix in ("total-corners", "player-props"):
+                    await _add_event_slug(all_tokens, seen_tokens, f"{slug}-{suffix}")
+                if all_tokens:
+                    return {
+                        "ok": True,
+                        "question": slug,
+                        "tokens": all_tokens,
+                        "is_event": True,
+                        "count": len(all_tokens),
+                    }
+
             for api_url in apis:
-                async with sess.get(api_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                    if resp.status != 200:
-                        continue
-                    data = await resp.json()
-                    if not data:
-                        continue
-                    
-                    item = data[0]
-                    
-                    # Check if this is an event (has nested markets) or a market
-                    if "markets" in item and item["markets"]:
-                        # Event with multiple markets (e.g. sports: Win/Draw/Lose)
-                        all_tokens = []
-                        for mkt in item["markets"]:
-                            tokens_raw = mkt.get("clobTokenIds", "[]")
-                            tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
-                            outcomes_raw = mkt.get("outcomes", "[]")
-                            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-                            q = mkt.get("question", "")
-                            for i, tid in enumerate(tokens):
-                                outcome = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
-                                all_tokens.append({"token_id": tid, "outcome": f"{q} - {outcome}"})
-                        return {
-                            "ok": True,
-                            "question": item.get("title", ""),
-                            "tokens": all_tokens,
-                            "is_event": True
-                        }
-                    else:
-                        # Single market
-                        tokens_raw = item.get("clobTokenIds", "[]")
-                        tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
-                        outcomes_raw = item.get("outcomes", "[]")
-                        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-                        result = []
-                        for i, tid in enumerate(tokens):
-                            outcome = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
-                            result.append({"token_id": tid, "outcome": outcome})
-                        return {
-                            "ok": True,
-                            "question": item.get("question", ""),
-                            "tokens": result
-                        }
+                data = await _fetch_json(api_url)
+                if not data:
+                    continue
+                item = data[0] if isinstance(data, list) else data
+                
+                # Check if this is an event (has nested markets) or a market
+                if "markets" in item and item["markets"]:
+                    all_tokens, seen_tokens = [], set()
+                    for mkt in item["markets"]:
+                        _add_market(all_tokens, seen_tokens, mkt)
+                    return {
+                        "ok": True,
+                        "question": item.get("title", ""),
+                        "tokens": all_tokens,
+                        "is_event": True,
+                        "count": len(all_tokens),
+                    }
+                else:
+                    # Single market
+                    result = _market_tokens(item, None)
+                    # Preserve legacy labels for single binary market dropdowns.
+                    for tok in result:
+                        if " - " in tok["outcome"]:
+                            tok["outcome"] = tok["outcome"].split(" - ", 1)[1]
+                    return {
+                        "ok": True,
+                        "question": item.get("question", ""),
+                        "tokens": result
+                    }
             
             # Nothing found - try text search with exact question match as last resort
             # slug_contains is too loose (returns random markets), use text_search instead
