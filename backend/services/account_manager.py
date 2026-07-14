@@ -170,7 +170,7 @@ class AccountInstance:
         except Exception:
             pass
 
-    async def close(self):
+    async def close(self, cancel_orders: bool = True):
         if self.strategy_d.running:
             await self.strategy_d.stop()
         if self.strategy_s.running:
@@ -181,11 +181,13 @@ class AccountInstance:
             await self.sniper.stop()
         if self.sniper_old.running:
             await self.sniper_old.stop()
-        # Cancel ALL open orders on shutdown to prevent orphaned positions
-        try:
-            await self.client.cancel_all()
-        except Exception:
-            pass
+        # Manual account removal can still cancel, but app/service shutdown must not
+        # wipe live exchange orders. Lifespan close_all passes cancel_orders=False.
+        if cancel_orders:
+            try:
+                await self.client.cancel_all()
+            except Exception:
+                pass
         await self.client.close()
 
 
@@ -353,8 +355,8 @@ class AccountManager:
             "total_accounts": len(self.instances),
         }
 
-    async def close_all(self):
+    async def close_all(self, cancel_orders: bool = False):
         for inst in self.instances.values():
-            await inst.close()
+            await inst.close(cancel_orders=cancel_orders)
         if self.notifier:
             await self.notifier.close()

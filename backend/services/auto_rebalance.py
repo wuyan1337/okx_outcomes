@@ -3,7 +3,7 @@
 When monitor triggers (price DROP only), instead of just stopping:
 1. Cancel all orders + stop strategy
 2. Observe Poly for 60s (1 check x 5s), wait for stable price
-3. Determine new price (Poly best bid rounded to cent)
+3. Determine new price (Poly best bid floored to cent)
 4. Post sells for existing positions at max(cost_price, new_price+1)
 5. Restart strategy at new price with monitor
 
@@ -13,6 +13,7 @@ Persisted to JSON file per account.
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from typing import Dict, Optional, Tuple
@@ -173,8 +174,14 @@ class AutoRebalance:
                 self._rebalancing = False
                 return
 
-            # Convert to cents (round to nearest cent)
-            new_price_cents = round(new_price_decimal * 100)
+            # Convert to cents by FLOOR, not round:
+            # 0.2975 -> 29, 0.2925 -> 29, 0.3000 -> 30.
+            # Add a tiny epsilon to avoid 0.30 * 100 becoming 29.999999999.
+            new_price_cents = math.floor(new_price_decimal * 100 + 1e-9)
+            logger.info(
+                f"[Rebalance:{self.account_id}] Stable poly bid={new_price_decimal:.4f} "
+                f"-> floor cents={new_price_cents}"
+            )
 
             # Validate range
             if new_price_cents < 4 or new_price_cents > 95:
