@@ -585,7 +585,6 @@ function unlockBS(){document.getElementById('bs-price').disabled=false;document.
 
 // Cancel
 async function cxAll(){if(MR||MSR||PR){await api('/api/strategy/stop',{method:'POST'});}var r=await api('/api/cancel_all',{method:'POST'});var d=await r.json();if(d.ok){al('CANCEL','All cancelled'+(MR||MSR||PR?' + strategy stopped':''));MR=false;MSR=false;BSR=false;PR=false;setTimeout(poll,1500);}else{al('ERROR','Cancel failed: '+(d.error||JSON.stringify(d)));}}
-async function askSell(){var r=await api('/api/ask_sell',{method:'POST'});var d=await r.json();if(d.ok){al('ASK SELL','Placed '+d.placed+', skipped '+d.skipped+(d.cancelled?(', cancelled '+d.cancelled):''));setTimeout(poll,1500);if(typeof mtRefresh==='function')setTimeout(mtRefresh,1800);}else{al('ERROR','Ask Sell failed: '+(d.error||JSON.stringify(d)));}}
 async function flashClose(){var r=await api('/api/accounts/'+currentAcctId+'/flash_close',{method:'POST'});var d=await r.json();if(d.ok){al('FLASH','Closed: '+d.result.cancelled+' orders cancelled, '+d.result.sold+' positions sold');MR=false;MSR=false;BSR=false;PR=false;setTimeout(poll,1500);}else{al('ERROR','Flash failed: '+(d.error||JSON.stringify(d)));}}
 async function cx(id,aid){var r=await api('/api/cancel_order',{method:'POST',body:JSON.stringify({order_id:id,asset_id:aid})});var d=await r.json();if(d.ok){al('CANCEL','Cancelled '+id);setTimeout(poll,1500);}else{al('ERROR','Cancel failed: '+(d.error||JSON.stringify(d)));}}
 
