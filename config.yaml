@@ -1,6 +1,6 @@
 server:
   host: 127.0.0.1
-  password: woshidiyi123
+  password: '114514'
   port: 8899
   username: shinori
 telegram:
