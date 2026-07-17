@@ -404,6 +404,40 @@ async def account_positions(account_id: str, user: str = Depends(verify_auth)):
         return {"positions": [], "error": str(e)}
 
 
+@app.get("/api/markets")
+async def api_markets(user: str = Depends(verify_auth)):
+    accounts = get_accounts()
+    if not accounts:
+        return {"markets": [], "error": "No accounts configured"}
+    inst = None
+    for acct in accounts:
+        inst = manager.get_instance(acct.get("id"))
+        if inst:
+            break
+    if not inst:
+        return {"markets": [], "error": "No active account instance"}
+    try:
+        data = await inst.client.get_events(status="active", page_size=50)
+        markets = []
+        if isinstance(data, dict):
+            events = data.get("data", {}).get("events", [])
+            for ev in events:
+                for mkt in ev.get("markets", []):
+                    yes_out = mkt.get("yesOutcome", {})
+                    no_out = mkt.get("noOutcome", {})
+                    if yes_out.get("assetId"):
+                        markets.append({
+                            "event_title": ev.get("eventTitle", ""),
+                            "question": mkt.get("question", ""),
+                            "market_id": mkt.get("marketId", ""),
+                            "yes_asset_id": yes_out.get("assetId", ""),
+                            "no_asset_id": no_out.get("assetId", ""),
+                        })
+        return {"markets": markets}
+    except Exception as e:
+        return {"markets": [], "error": str(e)}
+
+
 @app.get("/api/accounts/{account_id}/markets")
 async def account_markets(account_id: str, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
