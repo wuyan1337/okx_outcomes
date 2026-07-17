@@ -93,6 +93,7 @@ PROXY_NODES = {
     "JP3": {"label": "JP3 (Tokyo3)", "host": "3.112.202.198", "port": 9111},
     "JP4": {"label": "JP4 (AWS Tokyo)", "host": "127.0.0.1", "port": 9114},
     "JP5": {"label": "JP5 (AWS Tokyo)", "host": "127.0.0.1", "port": 9115},
+    "OSAKA": {"label": "OSAKA (217.142.250.144)", "host": "217.142.250.144", "port": 9111},
 }
 
 
