@@ -503,8 +503,10 @@ var currentAcctId=null,currentAcctName='',ctrlPollId=null,acctPollId=null,navId=
 var _healthAbort=null,_acctCache={};
 var MR=false,PR=false,MSR=false,logs=[],SA='',obI=null;
 
-function gapi(p,o){o=o||{};return fetch(p,Object.assign({},o,{headers:Object.assign({},o.headers||{},{'Authorization':AUTH,'Content-Type':'application/json'})}));}
-function api(p,o){if(!currentAcctId)return gapi(p,o);var np=p;if(p.indexOf('/api/')===0&&p.indexOf('/api/accounts/')!==0&&p.indexOf('/api/global/')!==0&&p.indexOf('/api/proxy/')!==0){np='/api/accounts/'+currentAcctId+p.substring(4);}o=o||{};return fetch(np,Object.assign({},o,{headers:Object.assign({},o.headers||{},{'Authorization':AUTH,'Content-Type':'application/json'})}));}
+var BASE_PATH=(location.pathname.indexOf('/okx')===0)?'/okx':'';
+function apiUrl(p){return BASE_PATH+p;}
+function gapi(p,o){o=o||{};return fetch(apiUrl(p),Object.assign({},o,{headers:Object.assign({},o.headers||{},{'Authorization':AUTH,'Content-Type':'application/json'})}));}
+function api(p,o){if(!currentAcctId)return gapi(p,o);var np=p;if(p.indexOf('/api/')===0&&p.indexOf('/api/accounts/')!==0&&p.indexOf('/api/global/')!==0&&p.indexOf('/api/proxy/')!==0){np='/api/accounts/'+currentAcctId+p.substring(4);}o=o||{};return fetch(apiUrl(np),Object.assign({},o,{headers:Object.assign({},o.headers||{},{'Authorization':AUTH,'Content-Type':'application/json'})}));}
 
 // Routing
 function route(){var h=window.location.hash||'#/';if(h.indexOf('#/account/')===0){showAccount(h.substring(10));}else{showControl();}}
@@ -698,7 +700,7 @@ function connectBook(polyToken, okxAsset){
   _polyToken=polyToken||'';_okxAsset=okxAsset||'';
   if(!_polyToken&&!_okxAsset)return;
   var proto=location.protocol==='https:'?'wss:':'ws:';
-  var url=proto+'//'+location.host+'/ws/book/'+currentAcctId;
+  var url=proto+'//'+location.host+BASE_PATH+'/ws/book/'+currentAcctId;
   _bookWs=new WebSocket(url);
   _bookWs.onopen=function(){
     obConnected=true;
