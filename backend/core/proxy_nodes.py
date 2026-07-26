@@ -26,12 +26,7 @@ ROUTE_LABELS = {
 BUILTIN_PROXY_NODES = {
     "JP1": {"name": "JP-TYO-01", "location": "Tokyo", "route": "socks5", "host": "168.138.196.214", "port": 9111},
     "JP2": {"name": "JP-TYO-02", "location": "Tokyo", "route": "direct", "host": None, "port": None},
-    "JP3": {"name": "JP-TYO-03", "location": "Tokyo", "route": "socks5", "host": "3.112.202.198", "port": 9111},
-    "JP4": {"name": "JP-TYO-04", "location": "Tokyo", "route": "tunnel", "host": "127.0.0.1", "port": 9114},
-    "JP5": {"name": "JP-TYO-05", "location": "Tokyo", "route": "tunnel", "host": "127.0.0.1", "port": 9115},
-    "OSAKA": {"name": "JP-OSA-01", "location": "Osaka", "route": "socks5", "host": "217.142.250.144", "port": 9111},
     "SG1": {"name": "SG-SIN-01", "location": "Singapore", "route": "socks5", "host": "13.213.17.198", "port": 9111},
-    "K1": {"name": "KR-SEL-01", "location": "Seoul", "route": "socks5", "host": "13.125.182.63", "port": 9111},
     "SYD1": {"name": "AU-SYD-01", "location": "Sydney", "route": "socks5", "host": "192.9.160.224", "port": 9111},
     "SYD2": {"name": "AU-SYD-02", "location": "Sydney", "route": "socks5", "host": "161.33.232.81", "port": 9111},
 }
