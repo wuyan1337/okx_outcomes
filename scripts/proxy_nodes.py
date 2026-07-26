@@ -272,6 +272,8 @@ def _asset_id(value: str) -> str:
 
 def _account_id(value: str) -> str:
     result = value.strip()
+    if not result:
+        return result
     if not ACCOUNT_ID_RE.fullmatch(result):
         raise argparse.ArgumentTypeError("account id contains unsupported characters")
     return result
