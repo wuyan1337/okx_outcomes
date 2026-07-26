@@ -1,15 +1,14 @@
 """SQLite database for multi-account management."""
 import sqlite3
 import json
-import hashlib
 from pathlib import Path
 from typing import Optional
 from cryptography.fernet import Fernet
-import base64
 
 DB_PATH = Path(__file__).parent.parent.parent / "data" / "accounts.db"
 
-# Derive encryption key from a fixed seed (stored alongside DB - this protects at-rest only)
+# The generated key is stored beside the database; this is local at-rest
+# protection, not a replacement for host-level access control.
 _KEY_FILE = Path(__file__).parent.parent.parent / "data" / ".key"
 
 
@@ -75,6 +74,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS global_config (
             key TEXT PRIMARY KEY,
             value TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS sniper_state (
+            account_id TEXT PRIMARY KEY,
+            config_json TEXT NOT NULL DEFAULT '{}',
+            runtime_json TEXT NOT NULL DEFAULT '{}',
+            running INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
         );
     """)
     conn.commit()
@@ -184,10 +192,14 @@ def update_account(account_id: str, **kwargs) -> bool:
         values.append(v)
     sets.append("updated_at = datetime('now')")
     values.append(account_id)
-    conn.execute(f"UPDATE accounts SET {', '.join(sets)} WHERE id = ?", values)
-    conn.commit()
-    conn.close()
-    return True
+    try:
+        cursor = conn.execute(
+            f"UPDATE accounts SET {', '.join(sets)} WHERE id = ?", values
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
 
 
 def delete_account(account_id: str) -> bool:
@@ -215,3 +227,72 @@ def set_global_config(key: str, value: str):
     )
     conn.commit()
     conn.close()
+
+
+def get_sniper_state(account_id: str) -> Optional[dict]:
+    """Return the persisted sniper configuration and last runtime snapshot."""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT config_json, runtime_json, running, updated_at FROM sniper_state WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    corrupt_fields = []
+
+    def _load_object(field_name: str) -> dict:
+        raw_value = row[field_name]
+        if not raw_value:
+            corrupt_fields.append(field_name)
+            return {}
+        try:
+            value = json.loads(raw_value)
+        except (TypeError, json.JSONDecodeError):
+            corrupt_fields.append(field_name)
+            return {}
+        if not isinstance(value, dict):
+            corrupt_fields.append(field_name)
+            return {}
+        return value
+
+    config_data = _load_object("config_json")
+    runtime_data = _load_object("runtime_json")
+    return {
+        "config": config_data,
+        "runtime": runtime_data,
+        "running": bool(row["running"]),
+        "updated_at": row["updated_at"],
+        "corrupt": bool(corrupt_fields),
+        "corrupt_fields": corrupt_fields,
+    }
+
+
+def save_sniper_state(account_id: str, config_data: dict, runtime_data: dict,
+                       running: bool) -> None:
+    """Atomically persist a sniper snapshot for page and process recovery."""
+    config_json = json.dumps(
+        config_data or {}, ensure_ascii=False, separators=(",", ":")
+    )
+    runtime_json = json.dumps(
+        runtime_data or {}, ensure_ascii=False, separators=(",", ":")
+    )
+    conn = get_db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO sniper_state (account_id, config_json, runtime_json, running, updated_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(account_id) DO UPDATE SET
+                config_json = excluded.config_json,
+                runtime_json = excluded.runtime_json,
+                running = excluded.running,
+                updated_at = datetime('now')
+            """,
+            (account_id, config_json, runtime_json, 1 if running else 0),
+        )
+        conn.commit()
+    finally:
+        conn.close()

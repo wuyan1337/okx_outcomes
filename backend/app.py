@@ -1,26 +1,37 @@
-import time
-import json
 """FastAPI backend for OKX Outcomes Bot — Multi-Account System."""
+
 import asyncio
-import yaml
+import json
+import logging
+import os
 import secrets
-import logging; import sys
+import time
 from pathlib import Path
 from contextlib import asynccontextmanager
+from functools import wraps
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, status, Request
+import yaml
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from .core.database import (
     init_db, get_accounts, get_account, get_account_decrypted,
     get_available_proxies, get_used_proxies, PROXY_NODES,
-    get_global_config, set_global_config, update_account, delete_account
+    get_global_config, set_global_config, update_account, delete_account,
 )
 from .services.account_manager import AccountManager
 from .services.notifier import TelegramNotifier
 from .services.size_utils import normalize_size_str
+from .core.price_utils import (
+    align_okx_price,
+    as_decimal,
+    cents_to_price,
+    format_okx_price,
+    invert_binary_price,
+    price_to_cents,
+)
 
 # Configure application-level logging so notifier/strategy messages appear in journalctl
 logging.basicConfig(
@@ -31,13 +42,67 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# Load config (for server auth only now)
+# Load file-backed server settings and the one-time Telegram migration source.
 config_path = Path(__file__).parent.parent / "config.yaml"
-with open(config_path) as f:
+with open(config_path, encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
-# Account manager (initialized in lifespan)
 manager = AccountManager()
+
+
+def _sniper_busy(instance) -> bool:
+    sniper = getattr(instance, "sniper", None)
+    if sniper is None:
+        return False
+    return bool(
+        sniper.running
+        or getattr(sniper, "starting", False)
+        or getattr(getattr(sniper, "state", None), "locked", False)
+        or getattr(sniper, "_persistence_failed", False)
+    )
+
+
+def _account_trading_busy(instance) -> bool:
+    monitor_enabled = bool(
+        getattr(getattr(instance.poly_monitor, "state", None), "enabled", False)
+    )
+    rebalancing = bool(
+        getattr(getattr(instance, "auto_rebalance", None), "_rebalancing", False)
+    )
+    return bool(
+        instance.strategy_d.running
+        or instance.strategy_s.running
+        or _sniper_busy(instance)
+        or instance.sniper_old.running
+        or instance.poly_monitor.running
+        or monitor_enabled
+        or rebalancing
+    )
+
+
+def _risk_control_busy(instance) -> bool:
+    return bool(
+        instance.poly_monitor.running
+        or getattr(getattr(instance.poly_monitor, "state", None), "enabled", False)
+        or getattr(getattr(instance, "auto_rebalance", None), "_rebalancing", False)
+    )
+
+
+def _serialize_strategy_lifecycle(handler):
+    """Serialize web start/stop operations for one account."""
+    @wraps(handler)
+    async def wrapped(account_id: str, *args, **kwargs):
+        instance = manager.get_instance(account_id)
+        if instance is None:
+            return await handler(account_id, *args, **kwargs)
+        lock = getattr(instance, "strategy_lifecycle_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            instance.strategy_lifecycle_lock = lock
+        async with lock:
+            return await handler(account_id, *args, **kwargs)
+
+    return wrapped
 
 # Persistent OKX asset -> Polymarket token/url map used by Ask Sell
 POLY_ASSET_MAP_PATH = Path(__file__).parent.parent / "data" / "poly_asset_map.json"
@@ -46,7 +111,7 @@ POLY_ASSET_MAP_PATH = Path(__file__).parent.parent / "data" / "poly_asset_map.js
 def _load_poly_asset_map() -> dict:
     try:
         if POLY_ASSET_MAP_PATH.exists():
-            with open(POLY_ASSET_MAP_PATH, "r") as f:
+            with open(POLY_ASSET_MAP_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
     except Exception as e:
         logger.warning(f"Failed to load poly asset map: {e}")
@@ -56,7 +121,7 @@ def _load_poly_asset_map() -> dict:
 def _save_poly_asset_map(data: dict):
     try:
         POLY_ASSET_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(POLY_ASSET_MAP_PATH, "w") as f:
+        with open(POLY_ASSET_MAP_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning(f"Failed to save poly asset map: {e}")
@@ -104,9 +169,18 @@ def _record_monitor_mapping(account_id: str, market_id: str, yes_asset_id: str, 
     )
 
 
-def _poly_price_str(price: float) -> str:
-    decimals = 3 if (price < 0.04 or price > 0.96) else 2
-    return f"{price:.{decimals}f}"
+def _monitor_poly_side(monitor: dict) -> str:
+    explicit = str(monitor.get("poly_side", "") or "").lower()
+    if explicit in {"yes", "no"}:
+        return explicit
+    token_id = str(monitor.get("poly_token_id", "") or "")
+    if token_id and token_id == str(monitor.get("no_token_id", "") or ""):
+        return "no"
+    return "yes"
+
+
+def _okx_price_str(price, side: str) -> str:
+    return format_okx_price(price, rounding="buy" if side.lower() == "buy" else "sell")
 
 # Auth
 security = HTTPBasic(auto_error=False)
@@ -155,13 +229,61 @@ def verify_auth(request: Request, credentials: Optional[HTTPBasicCredentials] = 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    telegram_config = config.get("telegram", {})
+    if not get_global_config("tg_token", "") and telegram_config.get("bot_token"):
+        set_global_config("tg_token", str(telegram_config.get("bot_token", "")))
+    if not get_global_config("tg_chats", "") and telegram_config.get("chat_ids"):
+        set_global_config(
+            "tg_chats",
+            ",".join(str(chat_id) for chat_id in telegram_config.get("chat_ids", [])),
+        )
     await manager.init()
 
     yield
     await manager.close_all()
 
 
-app = FastAPI(title="OKX Outcomes Bot", lifespan=lifespan)
+def _normalise_base_path(value: str) -> str:
+    value = (value or "").strip()
+    if not value or value == "/":
+        return ""
+    return "/" + value.strip("/")
+
+
+APP_BASE_PATH = _normalise_base_path(
+    os.getenv("OKX_BASE_PATH", config.get("server", {}).get("base_path", ""))
+)
+
+
+class BasePathMiddleware:
+    """Accept either proxy-stripped or prefix-preserving HTTP/WS requests."""
+
+    def __init__(self, app, configured_prefix: str = ""):
+        self.app = app
+        self.configured_prefix = configured_prefix
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in {"http", "websocket"}:
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers") or [])
+        forwarded = headers.get(b"x-forwarded-prefix", b"").decode("latin-1")
+        prefix = self.configured_prefix or _normalise_base_path(forwarded)
+        path = scope.get("path", "")
+        if prefix and (path == prefix or path.startswith(prefix + "/")):
+            scope = dict(scope)
+            scope["root_path"] = prefix
+            scope["path"] = path[len(prefix):] or "/"
+            scope["raw_path"] = scope["path"].encode("utf-8")
+        elif prefix:
+            scope = dict(scope)
+            scope["root_path"] = prefix
+        await self.app(scope, receive, send)
+
+
+app = FastAPI(title="OKX Outcomes Bot", lifespan=lifespan, root_path=APP_BASE_PATH)
+app.add_middleware(BasePathMiddleware, configured_prefix=APP_BASE_PATH)
 
 # Register WebSocket routes for real-time orderbook
 from .ws_book import register_ws_routes
@@ -174,22 +296,22 @@ frontend_dir = Path(__file__).parent.parent / "frontend"
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_root():
-    return HTMLResponse(content=(frontend_dir / "login.html").read_text(), status_code=200)
+    return HTMLResponse(content=(frontend_dir / "login.html").read_text(encoding="utf-8"), status_code=200)
 
 
 @app.get("/login", response_class=HTMLResponse)
 async def serve_login():
-    return HTMLResponse(content=(frontend_dir / "login.html").read_text(), status_code=200)
+    return HTMLResponse(content=(frontend_dir / "login.html").read_text(encoding="utf-8"), status_code=200)
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def serve_dashboard():
-    return HTMLResponse(content=(frontend_dir / "dashboard.html").read_text(), status_code=200)
+    return HTMLResponse(content=(frontend_dir / "dashboard.html").read_text(encoding="utf-8"), status_code=200)
 
 
 @app.get("/sniper-help", response_class=HTMLResponse)
 async def sniper_help():
-    return HTMLResponse(content=(frontend_dir / "sniper-help.html").read_text(), status_code=200)
+    return HTMLResponse(content=(frontend_dir / "sniper-help.html").read_text(encoding="utf-8"), status_code=200)
 
 
 # ─── Global APIs ───
@@ -207,10 +329,14 @@ async def get_status(user: str = Depends(verify_auth)):
         elif inst.strategy_s.running:
             mode = getattr(inst.strategy_s.state, "mode", "classic")
             running_strategy = "Bid-Sell" if mode == "bid-sell" else "Manual-S"
-        elif inst.sniper.running:
-            running_strategy = "Sniper"
+        elif _sniper_busy(inst):
+            running_strategy = "Sniper" if inst.sniper.running else "Sniper (locked)"
         elif inst.sniper_old.running:
             running_strategy = "Sniper-Old"
+        elif getattr(inst.auto_rebalance, "_rebalancing", False):
+            running_strategy = "Auto-Rebalance"
+        elif inst.poly_monitor.running or getattr(inst.poly_monitor.state, "enabled", False):
+            running_strategy = "Poly Monitor"
         # Get per-account stats for cards
         acct_orders = 0
         acct_positions = 0
@@ -232,14 +358,19 @@ async def get_status(user: str = Depends(verify_auth)):
             if isinstance(pos_data, dict) and str(pos_data.get("code", "")) == "0":
                 raw_pos = pos_data.get("data", {})
                 pos_list = raw_pos.get("list", []) if isinstance(raw_pos, dict) else raw_pos if isinstance(raw_pos, list) else []
-                acct_positions = len([p for p in pos_list if float(p.get("pos", "0")) != 0])
+                for position in pos_list:
+                    try:
+                        if as_decimal(position.get("size", "0")) != 0:
+                            acct_positions += 1
+                    except ValueError:
+                        continue
         except Exception:
             pass
         accounts_info.append({
             "id": inst.account_id,
             "name": inst.name,
             "proxy_node": inst.proxy_node,
-            "running": inst.strategy_d.running or inst.strategy_s.running or inst.sniper.running or inst.sniper_old.running,
+            "running": _account_trading_busy(inst),
             "strategy": running_strategy,
             "orders": acct_orders,
             "positions": acct_positions,
@@ -261,12 +392,23 @@ async def list_accounts(user: str = Depends(verify_auth)):
         running = False
         strategy = None
         if inst:
+            running = _account_trading_busy(inst)
             if inst.strategy_d.running:
-                running = True
                 strategy = "Manual-D"
             elif inst.strategy_s.running:
-                running = True
-                strategy = "Manual-S"
+                strategy = (
+                    "Bid-Sell"
+                    if getattr(inst.strategy_s.state, "mode", "classic") == "bid-sell"
+                    else "Manual-S"
+                )
+            elif _sniper_busy(inst):
+                strategy = "Sniper" if inst.sniper.running else "Sniper (locked)"
+            elif inst.sniper_old.running:
+                strategy = "Sniper-Old"
+            elif getattr(inst.auto_rebalance, "_rebalancing", False):
+                strategy = "Auto-Rebalance"
+            elif inst.poly_monitor.running or getattr(inst.poly_monitor.state, "enabled", False):
+                strategy = "Poly Monitor"
         result.append({
             "id": acc["id"],
             "name": acc["name"],
@@ -309,8 +451,13 @@ async def create_new_account(request: Request, user: str = Depends(verify_auth))
 
     if not all([name, api_key, secret_key, passphrase, agent_key, proxy_node]):
         return JSONResponse(status_code=400, content={"ok": False, "error": "All fields required"})
+    if region not in {"AU", "CN"}:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "region must be AU or CN"})
 
     try:
+        from .core.auth import OKXSigner
+        if not OKXSigner(agent_key).address:
+            raise ValueError("Invalid agent private key")
         result = await manager.add_account(name, api_key, secret_key, passphrase, agent_key, proxy_node, region=region)
         return {"ok": True, "account": result}
     except ValueError as e:
@@ -386,7 +533,7 @@ async def account_positions(account_id: str, user: str = Depends(verify_auth)):
                 token_name = p.get("tokenName", "Yes")
                 # OKX positions don't include assetId — derive from marketId + tokenIndex
                 # tokenIndex "1" = YES -> {marketId}000, tokenIndex "2" = NO -> {marketId}100
-                token_idx = p.get("tokenIndex", "1")
+                token_idx = str(p.get("tokenIndex", "1"))
                 yes_aid = f"{mid}000" if mid else ""
                 no_aid = f"{mid}100" if mid else ""
                 aid = no_aid if token_idx == "2" or token_name.upper() == "NO" else yes_aid
@@ -396,6 +543,7 @@ async def account_positions(account_id: str, user: str = Depends(verify_auth)):
                     "yes_asset_id": yes_aid,
                     "token_name": token_name,
                     "size": p.get("size", "0"),
+                    "available_size": p.get("availableSize", p.get("size", "0")),
                     "avg_price": p.get("avgPrice", "0"),
                     "market_name": _market_name_cache.get(mid, ""),
                 })
@@ -425,7 +573,7 @@ async def api_markets(user: str = Depends(verify_auth)):
                 for mkt in ev.get("markets", []):
                     yes_out = mkt.get("yesOutcome", {})
                     no_out = mkt.get("noOutcome", {})
-                    if yes_out.get("assetId"):
+                    if yes_out.get("assetId") and no_out.get("assetId"):
                         markets.append({
                             "event_title": ev.get("eventTitle", ""),
                             "question": mkt.get("question", ""),
@@ -452,7 +600,7 @@ async def account_markets(account_id: str, user: str = Depends(verify_auth)):
                 for mkt in ev.get("markets", []):
                     yes_out = mkt.get("yesOutcome", {})
                     no_out = mkt.get("noOutcome", {})
-                    if yes_out.get("assetId"):
+                    if yes_out.get("assetId") and no_out.get("assetId"):
                         markets.append({
                             "event_title": ev.get("eventTitle", ""),
                             "question": mkt.get("question", ""),
@@ -473,13 +621,13 @@ def _invert_okx_book(book: dict) -> dict:
         if not a:
             continue
         row = list(a)
-        row[0] = f"{1 - float(a[0]):.2f}"
+        row[0] = format_okx_price(invert_binary_price(a[0]))
         bids.append(row)
     for b in book.get("bids", []) or []:
         if not b:
             continue
         row = list(b)
-        row[0] = f"{1 - float(b[0]):.2f}"
+        row[0] = format_okx_price(invert_binary_price(b[0]))
         asks.append(row)
     bids.sort(key=lambda x: float(x[0]), reverse=True)
     asks.sort(key=lambda x: float(x[0]))
@@ -516,24 +664,29 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
     elif inst.strategy_s.running:
         mode = getattr(inst.strategy_s.state, "mode", "classic")
         strategy = "bid-sell" if mode == "bid-sell" else "manual-s"
-    elif inst.sniper.running:
+    elif _sniper_busy(inst):
         strategy = "sniper"
     elif inst.sniper_old.running:
         strategy = "sniper-old"
+    elif getattr(inst.auto_rebalance, "_rebalancing", False):
+        strategy = "auto-rebalance"
+    elif inst.poly_monitor.running or getattr(inst.poly_monitor.state, "enabled", False):
+        strategy = "poly-monitor"
     return {
         "manual_running": inst.strategy_d.running,
         "manual_d_scan_interval": getattr(inst.strategy_d.state, "scan_interval", 0.3) if inst.strategy_d.running else 0.3,
         "manual_d_stabilize_secs": getattr(inst.strategy_d.state, "stabilize_secs", 0.3) if inst.strategy_d.running else 0.3,
         "manual_s_running": inst.strategy_s.running,
-        "sniper_running": inst.sniper.running,
+        "sniper_running": _sniper_busy(inst),
+        "sniper_locked": getattr(inst.sniper.state, "locked", False),
         "sniper_old_running": inst.sniper_old.running,
-        "sniper_status": inst.sniper.state.status if inst.sniper.running else "stopped",
-        "sniper_yes_token": getattr(inst.sniper.state, "yes_token_id", "") if inst.sniper.running else "",
-        "sniper_no_token": getattr(inst.sniper.state, "no_token_id", "") if inst.sniper.running else "",
-        "sniper_yes_asset": getattr(inst.sniper.state, "yes_asset_id", "") if inst.sniper.running else "",
-        "sniper_no_asset": getattr(inst.sniper.state, "no_asset_id", "") if inst.sniper.running else "",
-        "sniper_poly_url": getattr(inst.sniper.state, "poly_url", "") if inst.sniper.running else "",
-        "sniper_selected_outcome": getattr(inst.sniper.state, "selected_outcome", "") if inst.sniper.running else "",
+        "sniper_status": inst.sniper.state.status,
+        "sniper_yes_token": getattr(inst.sniper.state, "yes_token_id", ""),
+        "sniper_no_token": getattr(inst.sniper.state, "no_token_id", ""),
+        "sniper_yes_asset": getattr(inst.sniper.state, "yes_asset_id", ""),
+        "sniper_no_asset": getattr(inst.sniper.state, "no_asset_id", ""),
+        "sniper_poly_url": getattr(inst.sniper.state, "poly_url", ""),
+        "sniper_selected_outcome": getattr(inst.sniper.state, "selected_outcome", ""),
         "sniper_old_status": inst.sniper_old.state.status if inst.sniper_old.running else "stopped",
         "sniper_old_yes_token": getattr(inst.sniper_old.state, "yes_token_id", "") if inst.sniper_old.running else "",
         "sniper_old_no_token": getattr(inst.sniper_old.state, "no_token_id", "") if inst.sniper_old.running else "",
@@ -552,7 +705,7 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         "manual_s_stabilize_secs": getattr(inst.strategy_s.state, "stabilize_secs", 0.3) if inst.strategy_s.running else 0.3,
 
         "strategy": strategy or "none",
-        "running": inst.strategy_d.running or inst.strategy_s.running or inst.sniper.running or inst.sniper_old.running,
+        "running": _account_trading_busy(inst),
         "cycles": inst.strategy_d.cycles + inst.strategy_s.cycles,
         "last_heartbeat": getattr(inst.client, 'last_heartbeat', None),
         "manual_asset_id": inst.strategy_d.state.yes_asset_id if inst.strategy_d.state.running else (inst.strategy_s.state.yes_asset_id if inst.strategy_s.state.running else ''),
@@ -562,6 +715,7 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
 
 
 @app.post("/api/accounts/{account_id}/strategy/start")
+@_serialize_strategy_lifecycle
 async def start_strategy(account_id: str, request: Request, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
@@ -581,10 +735,18 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
 
     if not no_asset_id:
         return JSONResponse(status_code=400, content={"ok": False, "error": "no_asset_id is required"})
-
-    price_f = float(price)
-    # OKX uses cents (e.g. 33 for 0.33)
-    price_decimal = price_f / 100.0  # Convert to decimal for Poly comparison
+    if strategy_type not in {"manual-d", "manual-s"}:
+        return JSONResponse(status_code=400, content={"ok": False, "error": f"Unknown strategy: {strategy_type}"})
+    if _account_trading_busy(inst):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Another strategy is already running"})
+    side = str(side).lower()
+    if side not in {"yes", "no"}:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "side must be YES or NO"})
+    try:
+        price_cents = as_decimal(price)
+        price_decimal = align_okx_price(cents_to_price(price_cents), "buy")
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
 
     # Pre-flight: check OKX API accessible
     try:
@@ -597,24 +759,33 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
     # If monitor enabled, verify BOTH OKX and Poly bid == strategy price
     if monitor and monitor.get("poly_token_id"):
         poly_token_id = monitor["poly_token_id"]
-        depth_threshold = float(monitor.get("depth_threshold", 3000))
+        expected_poly_side = "yes" if strategy_type == "manual-d" else side
+        if _monitor_poly_side(monitor) != expected_poly_side:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": f"Monitor must use the Poly outcome mapped to OKX {expected_poly_side.upper()}"},
+            )
 
         # Check OKX orderbook: best bid must match strategy price
         try:
             okx_book = await inst.client.get_orderbook(yes_asset_id, depth=5)
-            okx_bids = []
+            okx_levels = []
             if str(okx_book.get("code", "")) == "0":
                 book_data = okx_book.get("data", [{}])
                 if book_data:
-                    okx_bids = book_data[0].get("bids", []) if isinstance(book_data, list) else book_data.get("bids", [])
-            if not okx_bids:
-                return JSONResponse(status_code=400, content={"ok": False, "error": "Cannot get OKX orderbook or no bids"})
-            okx_best_bid = float(okx_bids[0][0]) if okx_bids else 0
-            # OKX orderbook returns decimal prices (e.g. 0.33 for 33 cents)
-            if abs(okx_best_bid - price_decimal) > 0.02:
+                    first_book = book_data[0] if isinstance(book_data, list) else book_data
+                    okx_levels = first_book.get("asks" if expected_poly_side == "no" else "bids", [])
+            if not okx_levels:
+                return JSONResponse(status_code=400, content={"ok": False, "error": "Cannot get OKX orderbook for selected side"})
+            okx_best_bid = (
+                invert_binary_price(okx_levels[0][0])
+                if expected_poly_side == "no"
+                else as_decimal(okx_levels[0][0])
+            )
+            if okx_best_bid != price_decimal:
                 return JSONResponse(status_code=400, content={
                     "ok": False,
-                    "error": f"OKX best bid ({okx_best_bid:.4f}) != strategy price ({price_decimal:.4f}). Cannot start with monitor."
+                    "error": f"OKX best bid ({okx_best_bid}) != strategy price ({price_decimal}). Cannot start with monitor."
                 })
         except Exception as e:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"OKX orderbook check failed: {e}"})
@@ -629,11 +800,11 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
             poly_bids = sorted(poly_book.get("bids", []), key=lambda x: float(x.get("price", 0)), reverse=True)
             if not poly_bids:
                 return JSONResponse(status_code=400, content={"ok": False, "error": "Cannot get Poly orderbook or no bids"})
-            poly_best_bid = float(poly_bids[0].get("price", 0))
-            if abs(poly_best_bid - price_decimal) > 0.005:
+            poly_best_bid = as_decimal(poly_bids[0].get("price", 0))
+            if align_okx_price(poly_best_bid, "buy") != price_decimal:
                 return JSONResponse(status_code=400, content={
                     "ok": False,
-                    "error": f"Poly best bid ({poly_best_bid:.4f}) != strategy price ({price_decimal:.4f}). Cannot start with monitor."
+                    "error": f"Poly best bid ({poly_best_bid}) != strategy price ({price_decimal}). Cannot start with monitor."
                 })
         except _aiohttp.ClientError as e:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly orderbook check failed: {e}"})
@@ -645,16 +816,14 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
                 market_id=market_id,
                 yes_asset_id=yes_asset_id,
                 no_asset_id=no_asset_id,
-                price_a=price_f, position_pct=int(body.get("position_pct", 100)))
+                price_a=str(price_cents), position_pct=int(body.get("position_pct", 100)))
         elif strategy_type == "manual-s":
             await inst.strategy_s.start(
                 market_id=market_id,
                 yes_asset_id=yes_asset_id,
                 no_asset_id=no_asset_id,
                 side=side,
-                price_a=price_f, position_pct=int(body.get("position_pct", 100)))
-        else:
-            return JSONResponse(status_code=400, content={"ok": False, "error": f"Unknown strategy: {strategy_type}"})
+                price_a=str(price_cents), position_pct=int(body.get("position_pct", 100)))
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -663,24 +832,31 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
         try:
             result = await inst.poly_monitor.start(
                 poly_token_id=monitor["poly_token_id"],
-                reference_price=price_decimal,
+                reference_price=float(price_decimal),
                 depth_threshold=float(monitor.get("depth_threshold", 3000)),
             )
             if result.get("ok"):
-                inst.poly_monitor.set_strategy_context(strategy_type, int(price_f), yes_asset_id)
+                strategy_asset = no_asset_id if expected_poly_side == "no" else yes_asset_id
+                inst.poly_monitor.set_strategy_context(strategy_type, float(price_cents), strategy_asset)
                 _record_monitor_mapping(account_id, market_id, yes_asset_id, no_asset_id, monitor, poly_token_id, side)
             else:
-                # Strategy started but monitor failed - log warning, don't fail the whole thing
-                import logging; import sys
-                logging.getLogger(__name__).warning(f"Monitor start failed: {result}")
+                if strategy_type == "manual-d":
+                    await inst.strategy_d.stop()
+                else:
+                    await inst.strategy_s.stop()
+                return JSONResponse(status_code=400, content={"ok": False, "error": result.get("error", "Monitor failed to start")})
         except Exception as e:
-            import logging; import sys
-            logging.getLogger(__name__).warning(f"Monitor start error: {e}")
+            if strategy_type == "manual-d":
+                await inst.strategy_d.stop()
+            else:
+                await inst.strategy_s.stop()
+            return JSONResponse(status_code=400, content={"ok": False, "error": f"Monitor start error: {e}"})
 
     return {"ok": True}
 
 
 @app.post("/api/accounts/{account_id}/strategy/stop")
+@_serialize_strategy_lifecycle
 async def stop_strategy(account_id: str, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
@@ -699,104 +875,199 @@ async def stop_strategy(account_id: str, user: str = Depends(verify_auth)):
     return {"ok": True}
 
 
+async def _stop_account_trading(inst) -> None:
+    """Stop every local task that could submit another account order."""
+    auto_rebalance = getattr(inst, "auto_rebalance", None)
+    if auto_rebalance is not None:
+        await auto_rebalance.cancel()
+    if inst.strategy_s.running:
+        await inst.strategy_s.stop()
+    if inst.strategy_d.running:
+        await inst.strategy_d.stop()
+    if inst.sniper.running:
+        await inst.sniper.stop()
+    if inst.sniper_old.running:
+        await inst.sniper_old.stop()
+    monitor_enabled = bool(
+        getattr(getattr(inst.poly_monitor, "state", None), "enabled", False)
+    )
+    if inst.poly_monitor.running or monitor_enabled:
+        await inst.poly_monitor.stop()
+
+
+async def _query_open_orders_verified(client) -> list[dict]:
+    response = await client.get_orders(status="open")
+    if not isinstance(response, dict) or str(response.get("code", "")) != "0":
+        message = (
+            response.get("message", response.get("msg", "query failed"))
+            if isinstance(response, dict)
+            else "invalid response"
+        )
+        raise RuntimeError(f"Cannot verify open orders: {message}")
+    data = response.get("data", {})
+    if (
+        not isinstance(data, dict)
+        or "list" not in data
+        or not isinstance(data.get("list"), list)
+    ):
+        raise RuntimeError("Cannot verify open orders: invalid response shape")
+    return data["list"]
+
+
+async def _cancel_open_orders_verified(client) -> dict:
+    """Cancel the current account snapshot and prove that no order remains."""
+    orders = await _query_open_orders_verified(client)
+    if not orders:
+        return {"ok": True, "cancelled": 0, "failed": 0, "total": 0, "method": "none"}
+
+    cancels = [
+        {"assetId": order.get("assetId", ""), "oid": order.get("oid", order.get("id", ""))}
+        for order in orders
+        if order.get("assetId") and (order.get("oid") or order.get("id"))
+    ]
+    remaining = orders
+    if cancels:
+        try:
+            batch_response = await client.cancel_orders_batch(cancels)
+            if isinstance(batch_response, dict) and str(batch_response.get("code", "")) == "0":
+                await asyncio.sleep(0.5)
+                try:
+                    remaining = await _query_open_orders_verified(client)
+                except Exception:
+                    # Still make the safe, idempotent individual attempts. The
+                    # final query below remains the only success condition.
+                    remaining = orders
+                if not remaining:
+                    return {
+                        "ok": True,
+                        "cancelled": len(orders),
+                        "failed": 0,
+                        "total": len(orders),
+                        "method": "batch",
+                    }
+        except Exception:
+            remaining = orders
+
+    async def _cancel_one(order: dict) -> bool:
+        order_id = order.get("oid", order.get("id", ""))
+        asset_id = order.get("assetId", "")
+        if not order_id or not asset_id:
+            return False
+        try:
+            response = await client.cancel_order(asset_id=asset_id, order_id=order_id)
+            return isinstance(response, dict) and str(response.get("code", "")) == "0"
+        except Exception:
+            return False
+
+    for _ in range(2):
+        if remaining:
+            await asyncio.gather(*[_cancel_one(order) for order in remaining])
+            await asyncio.sleep(0.5)
+        remaining = await _query_open_orders_verified(client)
+        if not remaining:
+            break
+
+    return {
+        "ok": not remaining,
+        "cancelled": max(0, len(orders) - len(remaining)),
+        "failed": len(remaining),
+        "total": len(orders),
+        "method": "parallel",
+    }
+
+
+async def _query_open_positions_verified(client) -> list[dict]:
+    response = await client.get_positions(status="open")
+    if not isinstance(response, dict) or str(response.get("code", "")) != "0":
+        message = (
+            response.get("message", response.get("msg", "query failed"))
+            if isinstance(response, dict)
+            else "invalid response"
+        )
+        raise RuntimeError(f"Cannot verify open positions: {message}")
+    data = response.get("data", {})
+    if (
+        not isinstance(data, dict)
+        or "list" not in data
+        or not isinstance(data.get("list"), list)
+    ):
+        raise RuntimeError("Cannot verify open positions: invalid response shape")
+
+    positions = []
+    for position in data["list"]:
+        try:
+            size = as_decimal(position.get("size", position.get("availableSize", "0")))
+        except ValueError as exc:
+            raise RuntimeError("Cannot verify open positions: invalid position size") from exc
+        if size > 0:
+            positions.append(position)
+    return positions
+
+
 @app.post("/api/accounts/{account_id}/cancel_all")
+@_serialize_strategy_lifecycle
 async def account_cancel_all(account_id: str, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
     try:
-        import asyncio as _asyncio
-
-        # Step 1: Stop any running strategies first (prevent re-ordering)
-        if inst.strategy_s.running:
-            await inst.strategy_s.stop()
-        if inst.strategy_d.running:
-            await inst.strategy_d.stop()
-        if inst.sniper.running:
-            await inst.sniper.stop()
-        if inst.sniper_old.running:
-            await inst.sniper_old.stop()
-        if inst.poly_monitor.running:
-            await inst.poly_monitor.stop()
-
-        # Step 2: Get open orders
-        orders_resp = await inst.client.get_orders(status="open")
-        orders = []
-        if str(orders_resp.get("code", "")) == "0":
-            orders = orders_resp.get("data", {}).get("list", [])
-        if not orders:
+        await _stop_account_trading(inst)
+        result = await _cancel_open_orders_verified(inst.client)
+        if result["total"] == 0:
             return {"ok": True, "result": {"message": "No orders to cancel", "cancelled": 0}}
-
-        # Step 3: Try batch cancel (single request, fastest)
-        cancels = [{"assetId": o.get("assetId", ""), "oid": o.get("oid", o.get("id", ""))}
-                   for o in orders if o.get("assetId") and (o.get("oid") or o.get("id"))]
-        if cancels:
-            try:
-                batch_resp = await inst.client.cancel_orders_batch(cancels)
-                if str(batch_resp.get("code", "")) == "0":
-                    # Verify
-                    await _asyncio.sleep(0.5)
-                    verify = await inst.client.get_orders(status="open")
-                    remaining = verify.get("data", {}).get("list", []) if str(verify.get("code","")) == "0" else []
-                    if not remaining:
-                        return {"ok": True, "result": {"cancelled": len(cancels), "failed": 0, "total": len(orders), "method": "batch"}}
-            except Exception:
-                pass  # Fall through to parallel
-
-        # Step 4: Fallback — parallel individual cancels
-        async def _cancel_one(o):
-            oid = o.get("oid", o.get("id", ""))
-            asset_id = o.get("assetId", "")
-            if not oid or not asset_id:
-                return False
-            try:
-                r = await inst.client.cancel_order(asset_id=asset_id, order_id=oid)
-                return str(r.get("code", "")) == "0"
-            except Exception:
-                return False
-
-        results = await _asyncio.gather(*[_cancel_one(o) for o in orders])
-        cancelled = sum(1 for r in results if r)
-        failed = sum(1 for r in results if not r)
-
-        # Step 5: Verify + retry failures
-        if failed > 0:
-            await _asyncio.sleep(0.5)
-            verify = await inst.client.get_orders(status="open")
-            still_open = verify.get("data", {}).get("list", []) if str(verify.get("code","")) == "0" else []
-            if still_open:
-                results2 = await _asyncio.gather(*[_cancel_one(o) for o in still_open])
-                cancelled += sum(1 for r in results2 if r)
-                failed = sum(1 for r in results2 if not r)
-
-        return {"ok": True, "result": {"cancelled": cancelled, "failed": failed, "total": len(orders), "method": "parallel"}}
+        if not result["ok"]:
+            return {
+                "ok": False,
+                "error": f"Cancellation incomplete: {result['failed']} orders remain open",
+                "result": result,
+            }
+        return {"ok": True, "result": result}
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logger.error("Cancel All failed for account %s: %s", account_id, e)
         return {"ok": False, "error": str(e)}
 
 
 @app.post("/api/accounts/{account_id}/ask_sell")
+@_serialize_strategy_lifecycle
 async def account_ask_sell(account_id: str, user: str = Depends(verify_auth)):
     """Place GTC sell orders for all positions at matching Polymarket ask1."""
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
+    if _account_trading_busy(inst):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "Ask Sell is disabled while an account strategy is running or locked",
+            },
+        )
     import aiohttp
     import asyncio as _asyncio
     try:
         poly_map = _load_poly_asset_map()
-        orders_resp = await inst.client.get_orders(status="open")
-        open_orders = orders_resp.get("data", {}).get("list", []) if str(orders_resp.get("code", "")) == "0" else []
-        pos_resp = await inst.client.get_positions(status="open")
-        positions = pos_resp.get("data", {}).get("list", []) if str(pos_resp.get("code", "")) == "0" else []
+        open_orders = await _query_open_orders_verified(inst.client)
+        try:
+            positions = await _query_open_positions_verified(inst.client)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"Flash could not verify positions after cancellation: {exc}",
+                "result": {
+                    "cancelled": cancellation["cancelled"],
+                    "submitted": 0,
+                    "closed": 0,
+                    "remaining": None,
+                    "failures": [str(exc)],
+                },
+            }
         results = []
         placed = skipped = cancelled = 0
         async with aiohttp.ClientSession() as sess:
             for p in positions:
                 mid = p.get("marketId", "")
                 token_name = p.get("tokenName", "Yes")
-                token_idx = p.get("tokenIndex", "1")
+                token_idx = str(p.get("tokenIndex", "1"))
                 size = p.get("availableSize", p.get("size", "0"))
                 try:
                     if not mid or float(size or 0) <= 0:
@@ -829,7 +1100,7 @@ async def account_ask_sell(account_id: str, user: str = Depends(verify_auth)):
                         skipped += 1
                         results.append({"asset_id": aid, "size": size, "status": "skipped", "reason": "bad_poly_ask"})
                         continue
-                    price_str = _poly_price_str(ask1)
+                    price_str = _okx_price_str(ask1, "sell")
                     local_cancelled = 0
                     for o in open_orders:
                         oid = o.get("oid", o.get("id", ""))
@@ -843,6 +1114,24 @@ async def account_ask_sell(account_id: str, user: str = Depends(verify_auth)):
                                 pass
                     if local_cancelled:
                         await _asyncio.sleep(0.2)
+                    matching_open_sells = [
+                        order
+                        for order in await _query_open_orders_verified(inst.client)
+                        if order.get("assetId") == aid
+                        and str(order.get("side", "")).upper() == "SELL"
+                    ]
+                    if matching_open_sells:
+                        skipped += 1
+                        results.append({
+                            "asset_id": aid,
+                            "size": size,
+                            "poly_ask1": price_str,
+                            "status": "failed",
+                            "reason": (
+                                "existing sell order could not be confirmed cancelled"
+                            ),
+                        })
+                        continue
                     sell_resp = await inst.client.place_order(asset_id=aid, side="sell", price=price_str,
                                                               size=normalize_size_str(size), tif="gtc", reduce_only=True)
                     if str(sell_resp.get("code", "")) == "0":
@@ -859,94 +1148,183 @@ async def account_ask_sell(account_id: str, user: str = Depends(verify_auth)):
                     results.append({"asset_id": aid, "size": size, "status": "failed", "reason": str(e)})
         return {"ok": True, "placed": placed, "skipped": skipped, "cancelled": cancelled, "results": results}
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logger.error("Ask Sell failed for account %s: %s", account_id, e)
         return {"ok": False, "error": str(e)}
 
 
 @app.post("/api/accounts/{account_id}/flash_close")
+@_serialize_strategy_lifecycle
 async def account_flash_close(account_id: str, user: str = Depends(verify_auth)):
-    """Emergency close: stop strategies, cancel all orders, sell all positions at market."""
+    """Stop account activity and prove the emergency close result."""
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
     try:
-        import asyncio as _asyncio
+        await _stop_account_trading(inst)
+        cancellation = await _cancel_open_orders_verified(inst.client)
+        if not cancellation["ok"]:
+            return {
+                "ok": False,
+                "error": (
+                    "Flash stopped before closing positions: "
+                    f"{cancellation['failed']} orders remain open"
+                ),
+                "result": {
+                    "cancelled": cancellation["cancelled"],
+                    "submitted": 0,
+                    "closed": 0,
+                    "remaining": None,
+                },
+            }
 
-        # Step 1: Stop strategies
-        if inst.strategy_s.running:
-            await inst.strategy_s.stop()
-        if inst.strategy_d.running:
-            await inst.strategy_d.stop()
-        if inst.sniper.running:
-            await inst.sniper.stop()
-        if inst.sniper_old.running:
-            await inst.sniper_old.stop()
-        if inst.poly_monitor.running:
-            await inst.poly_monitor.stop()
+        positions = await _query_open_positions_verified(inst.client)
+        submitted = 0
+        failures = []
+        initial_assets = set()
+        for position in positions:
+            market_id = str(position.get("marketId", "") or "")
+            token_index = str(position.get("tokenIndex", "") or "")
+            token_name = str(position.get("tokenName", "") or "").upper()
+            if not market_id:
+                failures.append("position is missing marketId")
+                continue
+            if token_index == "2" or token_name == "NO":
+                is_no = True
+            elif token_index == "1" or token_name == "YES":
+                is_no = False
+            else:
+                failures.append(f"{market_id}: unknown outcome")
+                continue
 
-        # Step 2: Cancel all orders
-        orders_resp = await inst.client.get_orders(status="open")
-        orders = []
-        if str(orders_resp.get("code", "")) == "0":
-            orders = orders_resp.get("data", {}).get("list", [])
-        if orders:
-            cancels = [{"assetId": o.get("assetId", ""), "oid": o.get("oid", o.get("id", ""))}
-                       for o in orders if o.get("assetId") and (o.get("oid") or o.get("id"))]
-            if cancels:
-                try:
-                    await inst.client.cancel_orders_batch(cancels)
-                except Exception:
-                    pass
-
-        # Step 3: Sell all positions at market (IOC at best bid)
-        await _asyncio.sleep(0.3)
-        pos_resp = await inst.client.get_positions(status="open")
-        sold = 0
-        if str(pos_resp.get("code", "")) == "0":
-            positions = pos_resp.get("data", {}).get("list", [])
-            for p in positions:
-                mid = p.get("marketId", "")
-                token_idx = p.get("tokenIndex", "1")
-                size = p.get("availableSize", p.get("size", "0"))
-                if not mid or float(size) <= 0:
+            yes_asset_id = f"{market_id}000"
+            trade_asset_id = f"{market_id}100" if is_no else yes_asset_id
+            initial_assets.add(trade_asset_id)
+            try:
+                available_size = as_decimal(
+                    position.get("availableSize", position.get("size", "0"))
+                )
+                if available_size <= 0:
+                    failures.append(f"{trade_asset_id}: no available position to close")
                     continue
-                yes_aid = f"{mid}000"
-                no_aid = f"{mid}100"
-                trade_aid = no_aid if token_idx == "2" else yes_aid
-                # Get best bid for this asset
-                try:
-                    book = await inst.client.get_orderbook(yes_aid, depth=1)
-                    best_bid = None
-                    if isinstance(book, dict) and "data" in book:
-                        bdata = book["data"]
-                        if isinstance(bdata, list) and len(bdata) > 0:
-                            if token_idx == "2":
-                                # NO position: bid = 1 - YES best_ask
-                                asks = bdata[0].get("asks", [])
-                                if asks:
-                                    best_bid = f"{1 - float(asks[0][0]):.2f}"
-                            else:
-                                bids = bdata[0].get("bids", [])
-                                if bids:
-                                    best_bid = bids[0][0]
-                    if best_bid and float(best_bid) > 0:
-                        resp = await inst.client.place_order(
-                            asset_id=trade_aid,
-                            side="sell",
-                            price=best_bid,
-                            size=normalize_size_str(size),
-                            tif="ioc",
-                        )
-                        if str(resp.get("code", "")) == "0":
-                            sold += 1
-                except Exception:
-                    pass
 
-        return {"ok": True, "result": {"cancelled": len(orders), "sold": sold}}
+                book = await inst.client.get_orderbook(yes_asset_id, depth=1)
+                if not isinstance(book, dict) or str(book.get("code", "0")) != "0":
+                    raise RuntimeError("orderbook query failed")
+                book_data = book.get("data", [])
+                if not isinstance(book_data, list) or not book_data or not isinstance(book_data[0], dict):
+                    raise RuntimeError("invalid orderbook response")
+                if is_no:
+                    asks = book_data[0].get("asks", [])
+                    if not asks:
+                        raise RuntimeError("NO best bid is unavailable")
+                    best_bid = format_okx_price(invert_binary_price(asks[0][0]))
+                else:
+                    bids = book_data[0].get("bids", [])
+                    if not bids:
+                        raise RuntimeError("YES best bid is unavailable")
+                    best_bid = format_okx_price(bids[0][0])
+
+                response = await inst.client.place_order(
+                    asset_id=trade_asset_id,
+                    side="sell",
+                    price=best_bid,
+                    size=normalize_size_str(available_size),
+                    tif="ioc",
+                    reduce_only=True,
+                )
+                if not isinstance(response, dict) or str(response.get("code", "")) != "0":
+                    message = (
+                        response.get("message", response.get("msg", "order rejected"))
+                        if isinstance(response, dict)
+                        else "invalid order response"
+                    )
+                    raise RuntimeError(message)
+                submitted += 1
+            except Exception as exc:
+                failures.append(f"{trade_asset_id}: {exc}")
+
+        if submitted:
+            await asyncio.sleep(0.5)
+
+        # IOC acceptance is not proof of a fill. Re-read both account states
+        # and report success only when the exchange confirms they are empty.
+        progress = {
+            "cancelled": cancellation["cancelled"],
+            "submitted": submitted,
+            "closed": 0,
+            "remaining": None,
+            "failures": list(failures),
+        }
+        try:
+            final_cancellation = await _cancel_open_orders_verified(inst.client)
+            progress["cancelled"] += final_cancellation["cancelled"]
+            remaining_positions = await _query_open_positions_verified(inst.client)
+        except Exception as exc:
+            progress["failures"].append(f"final verification: {exc}")
+            return {
+                "ok": False,
+                "error": f"Flash final verification failed: {exc}",
+                "result": progress,
+            }
+        remaining_assets = set()
+        for position in remaining_positions:
+            market_id = str(position.get("marketId", "") or "")
+            token_index = str(position.get("tokenIndex", "") or "")
+            token_name = str(position.get("tokenName", "") or "").upper()
+            if market_id:
+                remaining_assets.add(
+                    f"{market_id}100"
+                    if token_index == "2" or token_name == "NO"
+                    else f"{market_id}000"
+                )
+        closed = len(initial_assets - remaining_assets)
+        progress["closed"] = closed
+        progress["remaining"] = len(remaining_positions)
+        result = progress
+        if not final_cancellation["ok"]:
+            return {
+                "ok": False,
+                "error": (
+                    "Flash incomplete: "
+                    f"{final_cancellation['failed']} orders remain open"
+                ),
+                "result": result,
+            }
+        if remaining_positions:
+            return {
+                "ok": False,
+                "error": f"Flash incomplete: {len(remaining_positions)} positions remain open",
+                "result": result,
+            }
+        sniper = getattr(inst, "sniper", None)
+        if sniper is not None and getattr(
+            getattr(sniper, "state", None), "locked", False
+        ):
+            try:
+                reconciliation = await sniper.stop()
+                still_locked = bool(
+                    getattr(getattr(sniper, "state", None), "locked", False)
+                    or (
+                        isinstance(reconciliation, dict)
+                        and reconciliation.get("needs_reconciliation")
+                    )
+                )
+            except Exception as exc:
+                still_locked = True
+                result["failures"].append(f"Sniper reconciliation: {exc}")
+            result["needs_reconciliation"] = still_locked
+            if still_locked:
+                return {
+                    "ok": False,
+                    "error": (
+                        "Flash closed the verified exchange exposure, but "
+                        "Sniper still requires reconciliation"
+                    ),
+                    "result": result,
+                }
+        return {"ok": True, "result": result}
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logger.error("Flash close failed for account %s: %s", account_id, e)
         return {"ok": False, "error": str(e)}
 
 
@@ -962,6 +1340,13 @@ async def account_cancel_order(account_id: str, request: Request, user: str = De
         return JSONResponse(status_code=400, content={"ok": False, "error": "order_id and asset_id required"})
     try:
         result = await inst.client.cancel_order(asset_id=asset_id, order_id=order_id)
+        if not isinstance(result, dict) or str(result.get("code", "")) != "0":
+            message = (
+                result.get("message", result.get("msg", "cancellation rejected"))
+                if isinstance(result, dict)
+                else "invalid cancellation response"
+            )
+            return {"ok": False, "error": message, "result": result}
         return {"ok": True, "result": result}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -1050,6 +1435,7 @@ async def account_trades(account_id: str, limit: int = 50, asset_id: str = None,
     except Exception as e:
         return {"trades": [], "error": str(e)}
 @app.post("/api/accounts/{account_id}/manual/place")
+@_serialize_strategy_lifecycle
 async def account_manual_place(account_id: str, request: Request, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
@@ -1064,18 +1450,137 @@ async def account_manual_place(account_id: str, request: Request, user: str = De
         return JSONResponse(status_code=400, content={"ok": False, "error": "asset_id, side, price, size required"})
     if tif not in ("gtc", "ioc"):
         return JSONResponse(status_code=400, content={"ok": False, "error": "tif must be gtc or ioc"})
-    # Normalize price: ensure decimal format (e.g. "45" -> "0.45", "0.9" -> "0.90")
+    sniper = getattr(inst, "sniper", None)
+    if sniper is not None and getattr(sniper, "_persistence_failed", False):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "Manual orders are disabled until the critical Sniper state is persisted",
+            },
+        )
+    if sniper is not None and (
+        sniper.running or getattr(sniper, "starting", False)
+    ):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "Manual orders are disabled while Sniper is running",
+            },
+        )
+    if (
+        sniper is not None
+        and getattr(getattr(sniper, "state", None), "locked", False)
+        and side == "BUY"
+    ):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "Manual buys are disabled while Sniper requires reconciliation",
+            },
+        )
     try:
-        price_f = float(price)
-        if price_f >= 1:
-            price_f = price_f / 100.0  # cents -> decimal
-        cents = round(price_f * 100)
-        price_str = f"{price_f:.2f}" if 4 <= cents <= 96 else f"{price_f:.3f}"
+        price_decimal = cents_to_price(price)
+        price_str = _okx_price_str(price_decimal, side)
+        actual_price_decimal = as_decimal(price_str)
+        actual_price_cents = price_to_cents(actual_price_decimal)
     except (ValueError, TypeError):
         return JSONResponse(status_code=400, content={"ok": False, "error": f"Invalid price: {price}"})
     size_str = normalize_size_str(size)
-    import logging; import sys
-    print(f"[MANUAL PLACE] asset_id={asset_id} side={side.lower()} price={price_str} size={size_str} tif={tif}")
+    try:
+        size_decimal = as_decimal(size_str)
+    except ValueError:
+        size_decimal = as_decimal(0)
+    if size_decimal <= 0:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Size must be positive"})
+    if side == "BUY" and actual_price_decimal * size_decimal < 1:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "error": "OKX requires at least 1 xp notional for a buy order",
+            },
+        )
+    if side == "SELL":
+        try:
+            asset_id_text = str(asset_id)
+            market_id_filter = (
+                asset_id_text[:-3]
+                if asset_id_text.endswith(("000", "100"))
+                else None
+            )
+            positions_response = await inst.client.get_positions(
+                status="open", market_id=market_id_filter
+            )
+            if str(positions_response.get("code", "")) != "0":
+                raise RuntimeError(
+                    positions_response.get("message", positions_response.get("msg", "position query failed"))
+                )
+            available_size = as_decimal(0)
+            total_size = as_decimal(0)
+            positions_data = positions_response.get("data") or {}
+            positions = (
+                positions_data.get("list", [])
+                if isinstance(positions_data, dict)
+                else positions_data
+            )
+            for position in positions:
+                market_id = str(position.get("marketId") or "")
+                token_index = str(position.get("tokenIndex") or "")
+                token_name = str(position.get("tokenName") or "").upper()
+                position_asset_id = (
+                    f"{market_id}100"
+                    if token_index == "2" or token_name == "NO"
+                    else f"{market_id}000"
+                )
+                if position_asset_id == asset_id_text:
+                    available_size += as_decimal(
+                        position.get("availableSize", position.get("size", "0"))
+                    )
+                    total_size += as_decimal(position.get("size", "0"))
+            if size_decimal > available_size:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "ok": False,
+                        "error": (
+                            f"Sell size {size_str} exceeds available position "
+                            f"{format(available_size, 'f')}"
+                        ),
+                    },
+                )
+            if (
+                actual_price_decimal * size_decimal < 1
+                and (
+                    size_decimal != available_size
+                    or available_size != total_size
+                )
+            ):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "ok": False,
+                        "error": (
+                            "OKX requires at least 1 xp notional unless selling "
+                            "the full available position with no frozen size"
+                        ),
+                    },
+                )
+        except Exception:
+            return JSONResponse(
+                status_code=503,
+                content={"ok": False, "error": "Cannot validate available sell size"},
+            )
+    logger.info(
+        "Manual order asset=%s side=%s price=%s size=%s tif=%s",
+        asset_id,
+        side.lower(),
+        price_str,
+        size_str,
+        tif,
+    )
     try:
         result = await inst.client.place_order(
             asset_id=asset_id,
@@ -1086,8 +1591,13 @@ async def account_manual_place(account_id: str, request: Request, user: str = De
             reduce_only=(side.lower() == "sell"),
         )
         if isinstance(result, dict) and str(result.get("code", "")) == "0":
-            return {"ok": True, "result": result}
-        print(f"[MANUAL PLACE] OKX error: {result}")
+            return {
+                "ok": True,
+                "result": result,
+                "price": price_str,
+                "price_cents": format(actual_price_cents, "f"),
+            }
+        logger.warning("Manual order rejected by OKX: %s", result)
         return {"ok": False, "error": result.get("message", result.get("msg", str(result)))}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -1117,25 +1627,19 @@ async def account_ticker(account_id: str, asset_id: str, yes_asset_id: str = "",
                     best_bid = bids[0][0]
         # If querying YES book for a NO position, invert prices
         if yes_asset_id and yes_asset_id != asset_id:
-            inv_bid = "{:.2f}".format(1 - float(best_ask)) if best_ask else None
-            inv_ask = "{:.2f}".format(1 - float(best_bid)) if best_bid else None
+            inv_bid = format_okx_price(invert_binary_price(best_ask)) if best_ask else None
+            inv_ask = format_okx_price(invert_binary_price(best_bid)) if best_bid else None
             best_bid, best_ask = inv_bid, inv_ask
         return {"best_ask": best_ask, "best_bid": best_bid}
     except Exception as e:
         return {"best_ask": None, "best_bid": None, "error": str(e)}
 
 
-# ─── Account Settings (risk control) ───
-
-# (removed dead config routes — see per-account v2 routes below)
-
-
-# --- Per-account compatibility routes (prod-style API) ---
-
-
+# ─── Manual strategy API ───
 
 
 @app.post("/api/accounts/{account_id}/strategy/manual/start")
+@_serialize_strategy_lifecycle
 async def account_manual_start_v2(account_id: str, request: Request, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
@@ -1145,8 +1649,8 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
         return JSONResponse(status_code=400, content={"ok": False, "error": "Manual-D already running."})
     if inst.strategy_s.running:
         return JSONResponse(status_code=400, content={"ok": False, "error": "Manual-S is running. Stop it first."})
-    if inst.sniper.running:
-        return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper is running. Stop it first."})
+    if _sniper_busy(inst):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper is running or locked. Resolve it first."})
     if inst.sniper_old.running:
         return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper-Old is running. Stop it first."})
     body = await request.json()
@@ -1173,6 +1677,12 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
     if not no_asset_id:
         return JSONResponse(status_code=400, content={"ok": False, "error": "no_asset_id is required"})
     try:
+        price_cents = as_decimal(price)
+        price_decimal = cents_to_price(price_cents)
+        expected_okx_bid = align_okx_price(price_decimal, "buy")
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+    try:
         bal = await inst.client.get_balance()
         if isinstance(bal, dict) and bal.get("code") and str(bal["code"]) != "0":
             return JSONResponse(status_code=503, content={"ok": False, "error": f"OKX API: {bal.get('msg')}"})
@@ -1180,10 +1690,13 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
         return JSONResponse(status_code=503, content={"ok": False, "error": f"Cannot reach OKX: {e}"})
     # Monitor validation if enabled
     monitor = body.get("monitor")  # {poly_token_id, depth_threshold}
-    price_decimal = float(price) / 100.0 if float(price) >= 1 else float(price)
     if monitor and monitor.get("poly_token_id"):
         poly_token_id = monitor["poly_token_id"]
-        depth_threshold = float(monitor.get("depth_threshold", 3000))
+        if _monitor_poly_side(monitor) != "yes":
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "Manual-D monitor must use the Poly outcome mapped to OKX YES"},
+            )
         # Check OKX best bid == strategy price
         try:
             okx_book = await inst.client.get_orderbook(asset_id, depth=5)
@@ -1194,9 +1707,9 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
                     okx_bids = book_data[0].get("bids", [])
             if not okx_bids:
                 return JSONResponse(status_code=400, content={"ok": False, "error": "No OKX bids found"})
-            okx_best_bid = float(okx_bids[0][0])
-            if abs(okx_best_bid - price_decimal) > 0.02:
-                return JSONResponse(status_code=400, content={"ok": False, "error": f"OKX best bid ({okx_best_bid:.4f}) != price ({price_decimal:.4f})"})
+            okx_best_bid = as_decimal(okx_bids[0][0])
+            if okx_best_bid != expected_okx_bid:
+                return JSONResponse(status_code=400, content={"ok": False, "error": f"OKX best bid ({okx_best_bid}) != YES buy bid ({expected_okx_bid})"})
         except Exception as e:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"OKX book check: {e}"})
         # Check Poly best bid == strategy price
@@ -1209,15 +1722,14 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
             poly_bids = sorted(poly_book.get("bids", []), key=lambda x: float(x.get("price", 0)), reverse=True)
             if not poly_bids:
                 return JSONResponse(status_code=400, content={"ok": False, "error": "No Poly bids found"})
-            poly_best_bid = float(poly_bids[0].get("price", 0))
-            poly_check_price = sell_price_decimal if mode == 'bid-sell' else price_decimal
-            if abs(poly_best_bid - poly_check_price) > 0.02:
-                return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly best bid ({poly_best_bid:.4f}) too far from price ({poly_check_price:.4f})"})
+            poly_best_bid = as_decimal(poly_bids[0].get("price", 0))
+            if align_okx_price(poly_best_bid, "buy") != expected_okx_bid:
+                return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly best bid ({poly_best_bid}) does not map to YES buy bid ({expected_okx_bid})"})
         except Exception as e:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly book check: {e}"})
 
     try:
-        await inst.strategy_d.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price), position_pct=int(body.get("position_pct", 100)), scan_interval=float(body.get("scan_interval", 0.3)), stabilize_secs=float(body.get("stabilize_secs", 0.3)))
+        await inst.strategy_d.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=str(price_cents), position_pct=int(body.get("position_pct", 100)), scan_interval=float(body.get("scan_interval", 0.3)), stabilize_secs=float(body.get("stabilize_secs", 0.3)))
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -1226,20 +1738,24 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
         try:
             r = await inst.poly_monitor.start(
                 poly_token_id=monitor["poly_token_id"],
-                reference_price=price_decimal,
+                reference_price=float(price_decimal),
                 depth_threshold=float(monitor.get("depth_threshold", 3000)),
             )
             if r and r.get("ok"):
-                inst.poly_monitor.set_strategy_context("manual-d", int(price), asset_id)
+                inst.poly_monitor.set_strategy_context("manual-d", float(price_cents), asset_id)
                 _record_monitor_mapping(account_id, market_id, asset_id, no_asset_id, monitor, poly_token_id, "yes")
+            else:
+                await inst.strategy_d.stop()
+                return JSONResponse(status_code=400, content={"ok": False, "error": (r or {}).get("error", "Monitor failed to start")})
         except Exception as e:
-            import logging; import sys
-            logging.getLogger(__name__).warning(f"Monitor start error: {e}")
+            await inst.strategy_d.stop()
+            return JSONResponse(status_code=400, content={"ok": False, "error": f"Monitor start error: {e}"})
 
     return {"ok": True}
 
 
 @app.post("/api/accounts/{account_id}/strategy/manual/stop")
+@_serialize_strategy_lifecycle
 async def account_manual_stop_v2(account_id: str, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
@@ -1260,6 +1776,7 @@ async def account_manual_stop_v2(account_id: str, user: str = Depends(verify_aut
 
 # --- POLY MONITOR (risk control) ---
 @app.post("/api/accounts/{account_id}/monitor/start")
+@_serialize_strategy_lifecycle
 async def account_monitor_start(account_id: str, request: Request, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
@@ -1286,6 +1803,7 @@ async def account_monitor_start(account_id: str, request: Request, user: str = D
 
 
 @app.post("/api/accounts/{account_id}/rebalance/toggle")
+@_serialize_strategy_lifecycle
 async def account_rebalance_toggle(account_id: str, request: Request, user: str = Depends(verify_auth)):
     """Toggle auto-rebalance on/off for an account."""
     inst = manager.get_instance(account_id)
@@ -1293,7 +1811,24 @@ async def account_rebalance_toggle(account_id: str, request: Request, user: str 
         raise HTTPException(404, "Account not found")
     body = await request.json()
     enabled = body.get("enabled", not inst.auto_rebalance.enabled)
-    inst.auto_rebalance.enabled = enabled
+    if not isinstance(enabled, bool):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "enabled": inst.auto_rebalance.enabled,
+                "error": "enabled must be a boolean",
+            },
+        )
+    if not inst.auto_rebalance.set_enabled(enabled):
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "enabled": inst.auto_rebalance.enabled,
+                "error": "Auto-Rebalance setting could not be persisted",
+            },
+        )
     return {"ok": True, "enabled": inst.auto_rebalance.enabled}
 
 
@@ -1307,61 +1842,95 @@ async def account_rebalance_status(account_id: str, user: str = Depends(verify_a
 
 
 @app.post("/api/accounts/{account_id}/rebalance/clear-layers")
+@_serialize_strategy_lifecycle
 async def account_rebalance_clear(account_id: str, user: str = Depends(verify_auth)):
     """Clear cost layers (reset position tracking)."""
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
-    inst.auto_rebalance.cost_layers.clear()
-    inst.auto_rebalance._save_layers()
+    if _account_trading_busy(inst):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "Stop all strategies and risk-control tasks before clearing cost layers",
+            },
+        )
+    previous_layers = inst.auto_rebalance.cost_layers
+    inst.auto_rebalance.cost_layers = {}
+    if not inst.auto_rebalance._save_layers():
+        inst.auto_rebalance.cost_layers = previous_layers
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": "Cost layers could not be persisted"},
+        )
     return {"ok": True}
 
 # ─── Sniper Endpoints ───
 
 @app.post("/api/accounts/{account_id}/sniper/start")
+@_serialize_strategy_lifecycle
 async def sniper_start(account_id: str, request: Request, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
-    if inst.strategy_s.running or inst.strategy_d.running or inst.sniper_old.running:
+    if (
+        inst.strategy_s.running
+        or inst.strategy_d.running
+        or inst.sniper_old.running
+        or _risk_control_busy(inst)
+    ):
         return {"ok": False, "error": "Cannot run sniper while another strategy is active"}
     body = await request.json()
     result = await inst.sniper.start(
+        targets=body.get("targets"),
         yes_token_id=body.get("yes_token_id", ""),
         no_token_id=body.get("no_token_id", ""),
         yes_asset_id=body.get("yes_asset_id", ""),
         no_asset_id=body.get("no_asset_id", ""),
         market_id=body.get("market_id", ""),
-        threshold_cents=int(body.get("threshold_cents", 40)),
-        buy_limit_cents=int(body.get("buy_limit_cents", 50)),
-        position_pct=int(body.get("position_pct", 100)),
-        timeout_secs=int(body.get("timeout_secs", 3)),
+        threshold_cents=body.get("threshold_cents", 40),
+        buy_limit_cents=body.get("buy_limit_cents", 50),
+        position_pct=body.get("position_pct", 100),
+        timeout_secs=body.get("timeout_secs", 3),
         settle_ms=int(body.get("settle_ms", 0)),
         window_ms=int(body.get("window_ms", 150)),
         poly_url=body.get("poly_url", ""),
         selected_outcome=body.get("selected_outcome", ""),
     )
     if result.get("ok"):
-        _record_poly_asset_mapping(
-            account_id=account_id,
-            market_id=body.get("market_id", ""),
-            yes_asset_id=body.get("yes_asset_id", ""),
-            no_asset_id=body.get("no_asset_id", ""),
-            yes_token_id=body.get("yes_token_id", ""),
-            no_token_id=body.get("no_token_id", ""),
-            poly_url=body.get("poly_url", ""),
-            selected_outcome=body.get("selected_outcome", ""),
-        )
+        for target in inst.sniper.targets:
+            _record_poly_asset_mapping(
+                account_id=account_id,
+                market_id=target.market_id,
+                yes_asset_id=target.yes_asset_id,
+                no_asset_id=target.no_asset_id,
+                yes_token_id=target.poly_token_id if target.side == "yes" else "",
+                no_token_id=target.poly_token_id if target.side == "no" else "",
+                poly_url=target.poly_url,
+                selected_outcome=target.name,
+            )
     return result
 
 
 @app.post("/api/accounts/{account_id}/sniper/stop")
+@_serialize_strategy_lifecycle
 async def sniper_stop(account_id: str, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
-    await inst.sniper.stop()
-    return {"ok": True}
+    result = await inst.sniper.stop()
+    if not isinstance(result, dict):
+        result = {"ok": True}
+    return {
+        **result,
+        "stopped": not inst.sniper.running,
+        "locked": bool(inst.sniper.state.locked),
+        "status": inst.sniper.state.status,
+        "needs_reconciliation": bool(
+            result.get("needs_reconciliation") or inst.sniper.state.locked
+        ),
+    }
 
 
 @app.get("/api/accounts/{account_id}/sniper/status")
@@ -1373,11 +1942,17 @@ async def sniper_status(account_id: str, user: str = Depends(verify_auth)):
 
 
 @app.post("/api/accounts/{account_id}/sniper-old/start")
+@_serialize_strategy_lifecycle
 async def sniper_old_start(account_id: str, request: Request, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
-    if inst.strategy_s.running or inst.strategy_d.running or inst.sniper.running:
+    if (
+        inst.strategy_s.running
+        or inst.strategy_d.running
+        or _sniper_busy(inst)
+        or _risk_control_busy(inst)
+    ):
         return {"ok": False, "error": "Cannot run sniper-old while another strategy is active"}
     body = await request.json()
     result = await inst.sniper_old.start(
@@ -1410,6 +1985,7 @@ async def sniper_old_start(account_id: str, request: Request, user: str = Depend
 
 
 @app.post("/api/accounts/{account_id}/sniper-old/stop")
+@_serialize_strategy_lifecycle
 async def sniper_old_stop(account_id: str, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
@@ -1429,6 +2005,7 @@ async def sniper_old_status(account_id: str, user: str = Depends(verify_auth)):
 
 
 @app.post("/api/accounts/{account_id}/monitor/stop")
+@_serialize_strategy_lifecycle
 async def account_monitor_stop(account_id: str, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
@@ -1446,6 +2023,7 @@ async def account_monitor_status(account_id: str, user: str = Depends(verify_aut
 
 
 @app.post("/api/accounts/{account_id}/strategy/manual-s/start")
+@_serialize_strategy_lifecycle
 async def account_manual_s_start(account_id: str, request: Request, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
@@ -1455,10 +2033,12 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
         return JSONResponse(status_code=400, content={"ok": False, "error": "Manual-S already running."})
     if inst.strategy_d.running:
         return JSONResponse(status_code=400, content={"ok": False, "error": "Manual-D is running. Stop it first."})
-    if inst.sniper.running:
-        return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper is running. Stop it first."})
+    if _sniper_busy(inst):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper is running or locked. Resolve it first."})
     if inst.sniper_old.running:
         return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper-Old is running. Stop it first."})
+    if _risk_control_busy(inst):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Monitor or Auto-Rebalance is still active. Stop it first."})
     body = await request.json()
     asset_id = body.get("asset_id", "")
     price = body.get("price", 0)
@@ -1486,30 +2066,53 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
     # Monitor validation if enabled
     monitor = body.get("monitor")
     mode = body.get("mode", "classic")
-    sell_price_val = float(body.get("sell_price", 0)) or (float(price) + 1)
-    price_decimal = float(price) / 100.0 if float(price) >= 1 else float(price)
-    sell_price_decimal = sell_price_val / 100.0 if sell_price_val >= 1 else sell_price_val
-    # Monitor reference: bid-sell watches sell level, classic watches buy level
-    monitor_ref = sell_price_decimal if mode == "bid-sell" else price_decimal
-    is_no_side = side.upper() == "NO"
+    if mode not in {"classic", "bid-sell"}:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "mode must be classic or bid-sell"})
+    side_normalized = str(side).lower()
+    if side_normalized not in {"yes", "no"}:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "side must be YES or NO"})
+    try:
+        price_cents = as_decimal(price)
+        sell_price_input = as_decimal(body.get("sell_price", 0) or 0)
+        if sell_price_input <= 0:
+            sell_price_input = price_cents + 1
+        buy_price_decimal = align_okx_price(cents_to_price(price_cents), "buy")
+        sell_price_decimal = align_okx_price(cents_to_price(sell_price_input), "sell")
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+    if mode == "bid-sell" and sell_price_decimal - buy_price_decimal != as_decimal("0.01"):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "error": "Bid-Sell requires an executable 1 cent spread",
+            },
+        )
+    monitor_ref = sell_price_decimal if mode == "bid-sell" else buy_price_decimal
+    is_no_side = side_normalized == "no"
     if monitor and monitor.get("poly_token_id"):
         poly_token_id = monitor["poly_token_id"]
-        # Check OKX best bid near strategy sell price (monitor watches sell level)
-        # OKX only has YES orderbook; for NO side, YES bid should be ~(1-NO_price)
-        okx_check_price = sell_price_decimal if mode == 'bid-sell' else price_decimal
-        okx_expected = (1.0 - okx_check_price) if is_no_side else okx_check_price
+        if _monitor_poly_side(monitor) != side_normalized:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": f"Manual-S {side_normalized.upper()} must use the matching Poly {side_normalized.upper()} token"},
+            )
         try:
             okx_book = await inst.client.get_orderbook(asset_id, depth=5)
-            okx_bids = []
+            okx_levels = []
             if str(okx_book.get("code", "")) == "0":
                 book_data = okx_book.get("data", [{}])
                 if book_data and isinstance(book_data, list):
-                    okx_bids = book_data[0].get("bids", [])
-            if not okx_bids:
-                return JSONResponse(status_code=400, content={"ok": False, "error": "No OKX bids found"})
-            okx_best_bid = float(okx_bids[0][0])
-            if abs(okx_best_bid - okx_expected) > 0.03:
-                return JSONResponse(status_code=400, content={"ok": False, "error": f"OKX best bid ({okx_best_bid:.4f}) too far from sell price ({okx_expected:.4f})"})
+                    okx_levels = book_data[0].get("asks" if is_no_side else "bids", [])
+            if not okx_levels:
+                return JSONResponse(status_code=400, content={"ok": False, "error": "No OKX levels found for selected side"})
+            okx_best_bid = (
+                invert_binary_price(okx_levels[0][0])
+                if is_no_side
+                else as_decimal(okx_levels[0][0])
+            )
+            if okx_best_bid != monitor_ref:
+                return JSONResponse(status_code=400, content={"ok": False, "error": f"OKX {side_normalized.upper()} best bid ({okx_best_bid}) != monitor price ({monitor_ref})"})
         except Exception as e:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"OKX book check: {e}"})
         # Check Poly best bid
@@ -1522,15 +2125,14 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
             poly_bids = sorted(poly_book.get("bids", []), key=lambda x: float(x.get("price", 0)), reverse=True)
             if not poly_bids:
                 return JSONResponse(status_code=400, content={"ok": False, "error": "No Poly bids found"})
-            poly_best_bid = float(poly_bids[0].get("price", 0))
-            poly_check_price = sell_price_decimal if mode == 'bid-sell' else price_decimal
-            if abs(poly_best_bid - poly_check_price) > 0.02:
-                return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly best bid ({poly_best_bid:.4f}) too far from price ({poly_check_price:.4f})"})
+            poly_best_bid = as_decimal(poly_bids[0].get("price", 0))
+            if align_okx_price(poly_best_bid, "buy") != monitor_ref:
+                return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly best bid ({poly_best_bid}) does not map to monitor price ({monitor_ref})"})
         except Exception as e:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly book check: {e}"})
 
     try:
-        await inst.strategy_s.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=float(price), sell_price=float(body.get("sell_price", 0)), mode=body.get("mode", "classic"), side=side, position_pct=int(body.get("position_pct", 100)), scan_interval=float(body.get("scan_interval", 0.3)), stabilize_secs=float(body.get("stabilize_secs", 0.3)))
+        await inst.strategy_s.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=str(price_cents), sell_price=str(sell_price_input), mode=mode, side=side_normalized, position_pct=int(body.get("position_pct", 100)), scan_interval=float(body.get("scan_interval", 0.3)), stabilize_secs=float(body.get("stabilize_secs", 0.3)))
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -1539,20 +2141,26 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
         try:
             r = await inst.poly_monitor.start(
                 poly_token_id=monitor["poly_token_id"],
-                reference_price=monitor_ref,
+                reference_price=float(monitor_ref),
                 depth_threshold=float(monitor.get("depth_threshold", 3000)),
             )
             if r and r.get("ok"):
-                inst.poly_monitor.set_strategy_context("manual-s", int(sell_price_val) if mode == "bid-sell" else int(price), asset_id, mode=mode)
+                strategy_price_cents = price_to_cents(monitor_ref)
+                strategy_asset_id = no_asset_id if is_no_side else asset_id
+                inst.poly_monitor.set_strategy_context("manual-s", float(strategy_price_cents), strategy_asset_id, mode=mode)
                 _record_monitor_mapping(account_id, market_id, asset_id, no_asset_id, monitor, poly_token_id, side.lower())
+            else:
+                await inst.strategy_s.stop()
+                return JSONResponse(status_code=400, content={"ok": False, "error": (r or {}).get("error", "Monitor failed to start")})
         except Exception as e:
-            import logging; import sys
-            logging.getLogger(__name__).warning(f"Monitor start error: {e}")
+            await inst.strategy_s.stop()
+            return JSONResponse(status_code=400, content={"ok": False, "error": f"Monitor start error: {e}"})
 
     return {"ok": True}
 
 
 @app.post("/api/accounts/{account_id}/strategy/manual-s/stop")
+@_serialize_strategy_lifecycle
 async def account_manual_s_stop(account_id: str, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
@@ -1589,10 +2197,17 @@ async def account_config_v2(account_id: str, user: str = Depends(verify_auth)):
 
 
 @app.post("/api/accounts/{account_id}/config")
+@_serialize_strategy_lifecycle
 async def save_account_config_v2(account_id: str, request: Request, user: str = Depends(verify_auth)):
     from .core.database import update_account as db_update
+    from .core.client import OKXOutcomesClient
+
+    stored_account = get_account_decrypted(account_id)
+    if not stored_account:
+        raise HTTPException(404, "Account not found")
     body = await request.json()
     kwargs = {}
+    reloaded = False
     if "depth_threshold" in body:
         kwargs["depth_threshold"] = int(body["depth_threshold"])
     if "price_tick" in body:
@@ -1609,19 +2224,111 @@ async def save_account_config_v2(account_id: str, request: Request, user: str = 
     # Region -> base_url
     if "region" in body:
         region = body["region"]
+        if region not in {"AU", "CN"}:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "region must be AU or CN"},
+            )
         if region == "CN":
             kwargs["base_url"] = "https://www.okx.com"
         else:
             kwargs["base_url"] = "https://us.okx.com"
     if kwargs:
-        db_update(account_id, **kwargs)
-        # Reload client if credentials or region changed
         cred_keys = {"api_key", "secret_key", "passphrase", "agent_private_key", "base_url"}
-        if cred_keys & set(kwargs.keys()):
-            inst = manager.get_instance(account_id)
+        credentials_changed = bool(cred_keys & set(kwargs))
+        replacement = None
+        inst = manager.get_instance(account_id)
+        if credentials_changed:
+            if inst and _account_trading_busy(inst):
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "ok": False,
+                        "error": "Stop and reconcile all account strategies before changing credentials or region",
+                    },
+                )
+            verification_client = inst.client if inst else OKXOutcomesClient(
+                api_key=stored_account["api_key"],
+                secret_key=stored_account["secret_key"],
+                passphrase=stored_account["passphrase"],
+                agent_private_key=stored_account["agent_private_key"],
+                base_url=stored_account.get("base_url", "https://us.okx.com"),
+                proxy_node=stored_account.get("proxy_node", "JP2"),
+            )
+            try:
+                open_orders = await _query_open_orders_verified(verification_client)
+                open_positions = await _query_open_positions_verified(verification_client)
+            except Exception as exc:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "ok": False,
+                        "error": f"Cannot verify account is flat before credential change: {exc}",
+                    },
+                )
+            finally:
+                if inst is None:
+                    await verification_client.close()
+            if open_orders or open_positions:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "ok": False,
+                        "error": (
+                            "Cancel all open orders and close all positions "
+                            "before changing credentials or region"
+                        ),
+                    },
+                )
+
+            candidate = dict(stored_account)
+            candidate.update(kwargs)
+            replacement = OKXOutcomesClient(
+                api_key=candidate["api_key"],
+                secret_key=candidate["secret_key"],
+                passphrase=candidate["passphrase"],
+                agent_private_key=candidate["agent_private_key"],
+                base_url=candidate.get("base_url", "https://us.okx.com"),
+                proxy_node=candidate.get("proxy_node", "JP2"),
+            )
+            if not replacement.signer.address:
+                await replacement.close()
+                return JSONResponse(
+                    status_code=400,
+                    content={"ok": False, "error": "Invalid agent private key"},
+                )
+
+        try:
+            if not db_update(account_id, **kwargs):
+                raise RuntimeError("Account update did not modify a row")
+        except Exception:
+            if replacement is not None:
+                await replacement.close()
+            raise
+
+        if credentials_changed:
             if inst:
-                await inst.reload_client()
-    return {"ok": True, "reloaded": True}
+                previous = inst.install_client(replacement)
+                if previous and hasattr(previous, "close"):
+                    try:
+                        await previous.close()
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to close previous client for %s: %s",
+                            account_id,
+                            exc,
+                        )
+                reloaded = True
+            else:
+                await replacement.close()
+                loaded = await manager._load_account(account_id)
+                if loaded is None:
+                    return JSONResponse(
+                        status_code=500,
+                        content={"ok": False, "error": "Account could not be loaded"},
+                    )
+                reloaded = True
+    return {"ok": True, "reloaded": reloaded}
 
 
 @app.post("/api/accounts/{account_id}/notify/test")
@@ -1724,7 +2431,7 @@ async def poly_resolve(url: str = "", user: str = Depends(verify_auth)):
     if not url:
         return {"ok": False, "error": "No URL provided"}
     
-    # If already a raw token_id (long number), validate it
+    # A long numeric value is accepted directly as a token ID.
     if re.match(r'^\d{30,}$', url):
         return {"ok": True, "tokens": [{"token_id": url, "outcome": "YES"}]}
     
@@ -1875,8 +2582,7 @@ async def poly_resolve(url: str = "", user: str = Depends(verify_auth)):
                         "tokens": result
                     }
             
-            # Nothing found - try text search with exact question match as last resort
-            # slug_contains is too loose (returns random markets), use text_search instead
+            # Retry the exact market slug with an explicit active filter.
             api_url = f"https://gamma-api.polymarket.com/markets?slug={slug}&active=true&limit=1"
             async with sess.get(api_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 if resp.status == 200:
@@ -1926,32 +2632,30 @@ async def poly_book(token_id: str = "", user: str = Depends(verify_auth)):
 @app.get("/api/global/config")
 async def get_global_config_route(user: str = Depends(verify_auth)):
     return {
-        "tg_token": config.get("telegram", {}).get("bot_token", ""),
-        "tg_chats": ",".join(str(c) for c in config.get("telegram", {}).get("chat_ids", []))
+        "tg_token": get_global_config("tg_token", ""),
+        "tg_chats": get_global_config("tg_chats", ""),
     }
 
 
 @app.post("/api/global/config")
 async def save_global_config(request: Request, user: str = Depends(verify_auth)):
     body = await request.json()
-    import yaml
-    if "telegram" not in config:
-        config["telegram"] = {}
-    config["telegram"]["bot_token"] = body.get("tg_token", "")
+    token = str(body.get("tg_token", "") or "")
     chats_raw = body.get("tg_chats", "")
-    if isinstance(chats_raw, str):
-        config["telegram"]["chat_ids"] = [c.strip() for c in chats_raw.split(",") if c.strip()]
-    else:
-        config["telegram"]["chat_ids"] = chats_raw
-    # Save to disk
-    config_path = Path(__file__).parent.parent / "config.yaml"
-    with open(config_path, "w") as cf:
-        yaml.dump(config, cf, default_flow_style=False)
-    # Update live notifier
+    chats = (
+        [c.strip() for c in chats_raw.split(",") if c.strip()]
+        if isinstance(chats_raw, str)
+        else [str(c).strip() for c in chats_raw if str(c).strip()]
+    )
+    set_global_config("tg_token", token)
+    set_global_config("tg_chats", ",".join(chats))
     if manager.notifier:
-        manager.notifier.token = body.get("tg_token", "")
-        manager.notifier.chat_ids = [c.strip() for c in body.get("tg_chats", "").split(",") if c.strip()]
-        manager.notifier._session = None  # Force new session with new token
+        if manager.notifier._session and not manager.notifier._session.closed:
+            await manager.notifier._session.close()
+        manager.notifier._session = None
+        manager.notifier.token = token
+        manager.notifier.chat_ids = chats
+        manager.notifier.enabled = bool(token and chats)
     return {"ok": True}
 
 
@@ -1959,8 +2663,8 @@ async def save_global_config(request: Request, user: str = Depends(verify_auth))
 async def test_global_notify(user: str = Depends(verify_auth)):
     try:
         import aiohttp
-        token = config.get("telegram", {}).get("bot_token", "")
-        chats = config.get("telegram", {}).get("chat_ids", [])
+        token = get_global_config("tg_token", "")
+        chats = [c.strip() for c in get_global_config("tg_chats", "").split(",") if c.strip()]
         if not token or not chats:
             return {"ok": False, "error": "No token or chat_ids configured"}
         async with aiohttp.ClientSession() as client:
@@ -1972,4 +2676,3 @@ async def test_global_notify(user: str = Depends(verify_auth)):
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-

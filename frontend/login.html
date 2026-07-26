@@ -125,9 +125,11 @@ function render(time){
 requestAnimationFrame(render);
 }
 
-// === Auth ===
+function detectBasePath(){var path=location.pathname.replace(/\/+$/,'');return path.endsWith('/login')?path.slice(0,-6):(path==='/'?'':path);}
+var BASE_PATH=detectBasePath();
+function appUrl(path){return BASE_PATH+(path.charAt(0)==='/'?path:'/'+path);}
 var a=sessionStorage.getItem('okx_auth');
-if(a){fetch('/api/status',{headers:{'Authorization':a}}).then(function(r){if(r.ok)window.location.replace('/dashboard');});}
+if(a){fetch(appUrl('/api/status'),{headers:{'Authorization':a}}).then(function(r){if(r.ok)window.location.replace(appUrl('/dashboard'));});}
 document.getElementById('p').onkeydown=function(e){if(e.key==='Enter')go();};
 document.getElementById('u').onkeydown=function(e){if(e.key==='Enter')document.getElementById('p').focus();};
 function go(){
@@ -135,8 +137,8 @@ function go(){
   if(!u||!p)return;
   var b=document.getElementById('b');b.disabled=true;b.textContent='Connecting...';
   var auth='Basic '+btoa(u+':'+p);
-  fetch('/api/status',{headers:{'Authorization':auth}}).then(function(r){
-    if(r.ok){sessionStorage.setItem('okx_auth',auth);window.location.replace('/dashboard');}
+  fetch(appUrl('/api/status'),{headers:{'Authorization':auth}}).then(function(r){
+    if(r.ok){sessionStorage.setItem('okx_auth',auth);window.location.replace(appUrl('/dashboard'));}
     else{document.getElementById('e').style.display='block';b.disabled=false;b.textContent='Connect';}
   }).catch(function(){document.getElementById('e').style.display='block';b.disabled=false;b.textContent='Connect';});
 }

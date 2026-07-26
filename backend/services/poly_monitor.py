@@ -1,22 +1,14 @@
-"""POLY Monitor - Risk control module for Manual-D and Manual-S strategies.
-
-Monitors Polymarket orderbook in real-time. If Poly best bid/ask moves away from
-the locked price (set at start), immediately cancels all OKX orders and sends TG alert.
-
-Logic:
-- User sets poly_url + token (outcome) before starting strategy
-- On strategy start with monitor enabled: lock current Poly best bid as reference_price
-- Monitor checks: if Poly best_bid != reference_price -> CANCEL ALL + TG alert
-- Also checks: if OKX best_bid != reference_price -> CANCEL ALL + TG alert (already late)
-- After trigger: monitor stops, strategy keeps its state (user manually restarts)
-"""
+"""Polymarket best-bid risk control for Manual-D and Manual-S."""
 import asyncio
+from decimal import Decimal, ROUND_FLOOR
 import logging
 import time
 from typing import Optional
 from dataclasses import dataclass
 
 import aiohttp
+
+from ..core.price_utils import as_decimal, okx_tick
 
 logger = logging.getLogger(__name__)
 
@@ -28,13 +20,13 @@ POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 class MonitorState:
     enabled: bool = False
     poly_token_id: str = ""
-    reference_price: float = 0.0  # locked price at start
-    depth_threshold: float = 10000.0  # min $ at new best bid to trigger (default $10k)
+    reference_price: float = 0.0
+    depth_threshold: float = 10000.0
     triggered: bool = False
     trigger_reason: str = ""
     last_poly_bid: float = 0.0
-    last_poly_bid_size: float = 0.0  # size at best bid
-    last_poly_bid_value: float = 0.0  # $ value at best bid (price * size)
+    last_poly_bid_size: float = 0.0
+    last_poly_bid_value: float = 0.0
     last_check_ts: int = 0
 
 
@@ -49,11 +41,11 @@ class PolyMonitor:
         self._task: Optional[asyncio.Task] = None
         self.notifier = None
         self._running = False
-        self.on_trigger_callback = None  # Called when triggered to stop strategies
-        self.auto_rebalance = None       # AutoRebalance instance (set by AccountInstance)
-        self._strategy_type = ""         # "manual-s" or "manual-d" (set on start)
-        self._strategy_mode = "classic"   # "classic" or "bid-sell"
-        self._old_price_cents = 0        # Strategy price when monitor started
+        self.on_trigger_callback = None
+        self.auto_rebalance = None
+        self._strategy_type = ""
+        self._strategy_mode = "classic"
+        self._old_price_cents = Decimal("0")
 
     @property
     def running(self) -> bool:
@@ -65,18 +57,19 @@ class PolyMonitor:
             return {"ok": False, "error": "Monitor already running"}
 
         self.state.poly_token_id = poly_token_id
-        self.state.depth_threshold = depth_threshold
+        self.state.depth_threshold = float(as_decimal(depth_threshold))
         self.state.triggered = False
         self.state.trigger_reason = ""
 
         # Get current Poly best bid as reference if not provided
-        if reference_price <= 0:
+        reference = as_decimal(reference_price)
+        if reference <= 0:
             bid = await self._get_poly_best_bid(poly_token_id)
-            if bid is None:
+            if bid is None or bid <= 0:
                 return {"ok": False, "error": "Cannot fetch Poly orderbook"}
             self.state.reference_price = bid
         else:
-            self.state.reference_price = reference_price
+            self.state.reference_price = float(reference)
 
         self._running = True
         self.state.enabled = True
@@ -84,12 +77,11 @@ class PolyMonitor:
         logger.info(f"[PolyMonitor] Started for {self.account_id}, ref_price={self.state.reference_price}")
         return {"ok": True, "reference_price": self.state.reference_price}
 
-    def set_strategy_context(self, strategy_type: str, price_cents: int, asset_id: str = "", mode: str = "classic"):
+    def set_strategy_context(self, strategy_type: str, price_cents, asset_id: str = "", mode: str = "classic"):
         """Called by start flow to record what strategy is running."""
         self._strategy_type = strategy_type
-        self._old_price_cents = price_cents
+        self._old_price_cents = as_decimal(price_cents)
         self._strategy_asset_id = asset_id
-        self._strategy_mode = mode
         self._strategy_mode = mode
 
     async def stop(self):
@@ -110,6 +102,34 @@ class PolyMonitor:
         bid, _ = await self._get_poly_best_bid_with_depth(token_id)
         return bid
 
+    @staticmethod
+    def _best_bid_from_payload(data: dict) -> tuple[float, list]:
+        """Parse a successful CLOB book, preserving an explicitly empty bid side."""
+        if not isinstance(data, dict) or "bids" not in data:
+            raise ValueError("Poly book response is missing bids")
+        bids = data["bids"]
+        if not isinstance(bids, list):
+            raise ValueError("Poly book bids must be a list")
+        if not bids:
+            return 0.0, []
+        bids = sorted(
+            bids,
+            key=lambda row: as_decimal(row.get("price", "0")),
+            reverse=True,
+        )
+        return float(as_decimal(bids[0].get("price", "0"))), bids
+
+    async def _observe_book_payload(self, data: dict, source: str) -> bool:
+        """Apply one valid full-book observation to monitor state and risk checks."""
+        try:
+            best_bid, bids = self._best_bid_from_payload(data)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        self.state.last_poly_bid = best_bid
+        self.state.last_check_ts = int(time.time() * 1000)
+        await self._check_price(best_bid, bids, source)
+        return True
+
     async def _get_poly_best_bid_with_depth(self, token_id: str):
         """Fetch current Poly best bid price and full bids list (sorted high->low)."""
         try:
@@ -118,18 +138,13 @@ class PolyMonitor:
                 async with sess.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        bids = data.get("bids", [])
-                        if bids:
-                            # Sort bids by price descending (CLOB returns ascending)
-                            bids = sorted(bids, key=lambda x: float(x.get("price", 0)), reverse=True)
-                            return float(bids[0].get("price", 0)), bids
+                        return self._best_bid_from_payload(data)
         except Exception as e:
             logger.warning(f"[PolyMonitor] Failed to get Poly bid: {e}")
         return None, []
 
     async def _monitor_loop(self):
         """Main monitoring loop: REST poll every 1.5s + WS for instant updates."""
-        import json
         token_id = self.state.poly_token_id
 
         # Start both: REST poller (reliable) + WS listener (fast)
@@ -137,7 +152,6 @@ class PolyMonitor:
         ws_task = asyncio.create_task(self._ws_listen_loop(token_id))
 
         try:
-            # Wait until either task finishes (triggered or cancelled)
             done, pending = await asyncio.wait(
                 [rest_task, ws_task],
                 return_when=asyncio.FIRST_COMPLETED,
@@ -186,13 +200,18 @@ class PolyMonitor:
                                     items = raw if isinstance(raw, list) else [raw]
                                     for data in items:
                                         if data.get("event_type") == "book":
-                                            bids = data.get("bids", [])
-                                            if bids:
-                                                bids = sorted(bids, key=lambda x: float(x.get("price", 0)), reverse=True)
-                                                best_bid = float(bids[0].get("price", 0))
-                                                self.state.last_poly_bid = best_bid
-                                                self.state.last_check_ts = int(time.time() * 1000)
-                                                await self._check_price(best_bid, bids, "poly_ws")
+                                            await self._observe_book_payload(data, "poly_ws")
+                                        elif data.get("event_type") == "price_change":
+                                            changes = data.get("price_changes", [])
+                                            if any(
+                                                str(change.get("asset_id", change.get("assetId", ""))) in ("", str(token_id))
+                                                for change in changes
+                                            ):
+                                                best_bid, bids = await self._get_poly_best_bid_with_depth(token_id)
+                                                if best_bid is not None:
+                                                    self.state.last_poly_bid = best_bid
+                                                    self.state.last_check_ts = int(time.time() * 1000)
+                                                    await self._check_price(best_bid, bids, "poly_ws_change")
                                 except Exception:
                                     pass
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
@@ -205,6 +224,13 @@ class PolyMonitor:
                 await asyncio.sleep(min(retry_delay, 5))
                 retry_delay = min(retry_delay * 2, 5)
 
+    @staticmethod
+    def _risk_bid_price(price) -> Decimal:
+        """Floor a Poly bid to the executable OKX tick for conservative risk checks."""
+        value = as_decimal(price)
+        tick = okx_tick(value)
+        return (value / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+
     async def _check_price(self, current_bid: float, bids: list, source: str):
         """Check if price deviated from reference.
 
@@ -215,32 +241,30 @@ class PolyMonitor:
            Only trigger if depth at new best bid >= threshold (confirms real move).
            For bid-sell mode: ROSE also triggers (need to rebalance up to capture higher spread).
         """
-        # Truncate both to cents (ignore 3rd decimal from Poly)
-        current_bid = int(current_bid * 100) / 100.0
-        ref = int(self.state.reference_price * 100) / 100.0
+        current_bid = self._risk_bid_price(current_bid)
+        ref = self._risk_bid_price(self.state.reference_price)
         if ref <= 0:
             return
 
-        # Price hasn't changed - all good
-        if abs(current_bid - ref) <= 0.005:
+        if current_bid == ref:
             return
 
         # Calculate depth at best bid level (used for logging + condition B)
-        best_bid_size = 0.0
+        best_bid_size = Decimal("0")
         if bids:
-            best_price = float(bids[0].get("price", 0))
+            best_price = as_decimal(bids[0].get("price", "0"))
             for b in bids:
-                if abs(float(b.get("price", 0)) - best_price) < 0.0005:
-                    best_bid_size += float(b.get("size", 0))
+                if as_decimal(b.get("price", "0")) == best_price:
+                    best_bid_size += as_decimal(b.get("size", "0"))
                 else:
                     break
         best_bid_value = current_bid * best_bid_size
-        self.state.last_poly_bid_size = best_bid_size
-        self.state.last_poly_bid_value = best_bid_value
+        self.state.last_poly_bid_size = float(best_bid_size)
+        self.state.last_poly_bid_value = float(best_bid_value)
 
         # CONDITION A: Price dropped (bid < reference)
         # Reference price disappeared from bids → immediate trigger
-        if current_bid < ref - 0.005:
+        if current_bid < ref:
             reason = (
                 f"Poly bid DROPPED: {ref:.3f} -> {current_bid:.3f} "
                 f"(reference gone from bid side) [{source}]"
@@ -251,17 +275,17 @@ class PolyMonitor:
         # CONDITION B: Price rose (bid > reference)
         # Both classic and bid-sell trigger on ROSE (bid-sell needs to rebalance up)
         # Only trigger if depth at new best bid >= threshold
-        if current_bid > ref + 0.005:
-            threshold = self.state.depth_threshold
+        if current_bid > ref:
+            threshold = as_decimal(self.state.depth_threshold)
             if best_bid_value < threshold:
                 logger.debug(
                     f"[PolyMonitor] Bid rose {ref:.2f}->{current_bid:.2f} "
-                    f"but value ${best_bid_value:.0f} < ${threshold:.0f}, ignoring"
+                    f"but value {best_bid_value:.0f} xp < {threshold:.0f} xp, ignoring"
                 )
                 return
             reason = (
                 f"Poly bid ROSE: {ref:.3f} -> {current_bid:.3f} "
-                f"(${best_bid_value:,.0f} at new bid >= ${threshold:,.0f} threshold) [{source}]"
+                f"({best_bid_value:,.0f} xp at new bid >= {threshold:,.0f} xp threshold) [{source}]"
             )
             asyncio.ensure_future(asyncio.shield(self._trigger(reason)))
 
@@ -278,22 +302,42 @@ class PolyMonitor:
         # Step 1: CANCEL ALL ORDERS IMMEDIATELY (highest priority)
         cancelled = await self._fast_cancel_all()
         logger.info(f"[PolyMonitor] Final cancel result: {cancelled}")
+        cancel_confirmed = bool(cancelled.get("ok"))
 
-        # Step 2: Stop strategies (with timeout so it can never block)
+        # Step 2: Bound the strategy-stop wait to five seconds.
+        strategies_stopped = False
         if self.on_trigger_callback:
             try:
                 await asyncio.wait_for(self.on_trigger_callback(), timeout=5.0)
+                strategies_stopped = True
                 logger.info("[PolyMonitor] Strategies stopped via callback")
             except asyncio.TimeoutError:
-                logger.error("[PolyMonitor] Strategy stop timed out (5s) - forcing")
+                logger.error(
+                    "[PolyMonitor] Strategy stop timed out (5s); auto-rebalance blocked"
+                )
             except Exception as e:
-                logger.error(f"[PolyMonitor] Strategy stop failed: {e}")
+                logger.error(
+                    f"[PolyMonitor] Strategy stop failed; auto-rebalance blocked: {e}"
+                )
 
         # TG notification
         if self.notifier:
             try:
-                rebal_status = " → 🔄 准备自动重部署" if (self.auto_rebalance and self.auto_rebalance.enabled) else ""
-                msg = f"[{self.account_name or self.account_id}] ⚠️ <b>风控触发</b>\nReason: {reason}\nAction: 已全部撤单{rebal_status}"
+                wants_rebalance = bool(self.auto_rebalance and self.auto_rebalance.enabled)
+                if cancel_confirmed and strategies_stopped:
+                    rebal_status = " → 🔄 准备自动重部署" if wants_rebalance else ""
+                    action = f"已确认开放订单为 0{rebal_status}"
+                elif cancel_confirmed:
+                    action = (
+                        "已确认开放订单为 0，但策略停止未确认；"
+                        "已禁止自动重部署，需手动检查"
+                    )
+                else:
+                    action = (
+                        "撤单失败或无法确认开放订单为 0；"
+                        "已禁止自动重部署，需手动检查"
+                    )
+                msg = f"[{self.account_name or self.account_id}] ⚠️ <b>风控触发</b>\nReason: {reason}\nAction: {action}"
                 logger.info(f"[PolyMonitor] Sending TG notification, enabled={self.notifier.enabled}")
                 await self.notifier.send(msg)
                 logger.info("[PolyMonitor] TG notification sent")
@@ -303,7 +347,12 @@ class PolyMonitor:
             logger.warning("[PolyMonitor] No notifier configured!")
 
         # Auto-rebalance: on any price move (DROPPED or ROSE)
-        if self.auto_rebalance and self.auto_rebalance.enabled:
+        if (
+            self.auto_rebalance
+            and self.auto_rebalance.enabled
+            and cancel_confirmed
+            and strategies_stopped
+        ):
             try:
                 await self.auto_rebalance.execute(
                     trigger_reason=reason,
@@ -313,95 +362,97 @@ class PolyMonitor:
                 )
             except Exception as e:
                 logger.error(f"[PolyMonitor] Auto-rebalance launch failed: {e}")
+        elif self.auto_rebalance and self.auto_rebalance.enabled:
+            logger.critical(
+                "[PolyMonitor] Auto-rebalance blocked because cancellation or strategy stop was not verified"
+            )
 
     async def _fast_cancel_all(self) -> dict:
-        """Cancel all open orders. Try cancelAll first (fastest), then batch, then individual."""
-        import asyncio
-        result = {"cancelled": 0, "failed": 0, "total": 0}
+        """Cancel orders and succeed only after a verified empty open-order list."""
+        result = {"ok": False, "cancelled": 0, "failed": 0, "total": 0}
 
-        # Attempt 0: cancelAll (empty assetIds = cancel ALL orders for this account)
+        async def _open_orders() -> list:
+            response = await self.client.get_orders(status="open")
+            if str(response.get("code", "")) != "0":
+                message = response.get("message", response.get("msg", response.get("code")))
+                raise RuntimeError(f"open-order verification failed: {message}")
+            orders = response.get("data", {}).get("list", [])
+            if not isinstance(orders, list):
+                raise RuntimeError("open-order verification returned invalid data")
+            return orders
+
         try:
-            cancel_resp = await self.client.cancel_all([])
-            if str(cancel_resp.get("code", "")) == "0":
-                # Verify: check if orders actually gone
-                await asyncio.sleep(0.5)
-                verify = await self.client.get_orders(status="open")
-                remaining = []
-                if str(verify.get("code", "")) == "0":
-                    remaining = verify.get("data", {}).get("list", [])
-                if not remaining:
-                    logger.info("[PolyMonitor] cancelAll succeeded + verified (0 remaining)")
-                    result["cancelled"] = -1
-                    return result
-                else:
-                    logger.warning(f"[PolyMonitor] cancelAll returned OK but {len(remaining)} orders still open, falling back")
-            else:
-                logger.warning(f"[PolyMonitor] cancelAll response: {cancel_resp}")
-        except Exception as e:
-            logger.warning(f"[PolyMonitor] cancelAll failed: {e}, falling back")
-
-        for attempt in range(3):
             try:
-                orders_resp = await self.client.get_orders(status="open")
-                orders = []
-                if str(orders_resp.get("code", "")) == "0":
-                    orders = orders_resp.get("data", {}).get("list", [])
+                response = await self.client.cancel_all([])
+                if str(response.get("code", "")) != "0":
+                    logger.warning("[PolyMonitor] cancelAll response: %s", response)
+            except Exception as exc:
+                logger.warning("[PolyMonitor] cancelAll exception: %s", exc)
+
+            await asyncio.sleep(0.5)
+            for attempt in range(3):
+                orders = await _open_orders()
+                result["total"] = max(result["total"], len(orders))
                 if not orders:
-                    break  # All cancelled
-                result["total"] = len(orders)
+                    result.update(ok=True, failed=0, remaining=0)
+                    logger.info("[PolyMonitor] Cancellation verified: 0 open orders")
+                    return result
 
-                # Try batch cancel first (single request)
                 cancels = []
-                for o in orders:
-                    oid = o.get("oid", o.get("id", ""))
-                    asset_id = o.get("assetId", "")
-                    if oid and asset_id:
-                        cancels.append({"assetId": asset_id, "oid": oid})
-                if cancels:
-                    try:
-                        batch_resp = await self.client.cancel_orders_batch(cancels)
-                        if str(batch_resp.get("code", "")) == "0":
-                            result["cancelled"] = len(cancels)
-                            # Verify
-                            await asyncio.sleep(0.5)
-                            verify = await self.client.get_orders(status="open")
-                            remaining = verify.get("data", {}).get("list", []) if str(verify.get("code","")) == "0" else orders
-                            if not remaining:
-                                break  # Success
-                            logger.warning(f"[PolyMonitor] Batch cancel: {len(remaining)} still open, retrying")
-                            continue
-                    except Exception as be:
-                        logger.warning(f"[PolyMonitor] Batch cancel failed: {be}, falling back to parallel")
+                for order in orders:
+                    order_id = order.get("oid", order.get("id", ""))
+                    asset_id = order.get("assetId", order.get("tokenId", ""))
+                    if order_id and asset_id:
+                        cancels.append({"assetId": asset_id, "oid": order_id})
+                if len(cancels) != len(orders):
+                    result.update(failed=len(orders), remaining=len(orders))
+                    result["error"] = "open orders are missing cancellation identifiers"
+                    return result
 
-                # Fallback: parallel individual cancels
-                async def _cancel_one(o):
-                    oid = o.get("oid", o.get("id", ""))
-                    asset_id = o.get("assetId", "")
-                    if not oid or not asset_id:
-                        return False
-                    try:
-                        r = await self.client.cancel_order(asset_id=asset_id, order_id=oid)
-                        ok = str(r.get("code", "")) == "0"
-                        if not ok:
-                            logger.warning(f"[PolyMonitor] cancel_order {oid} resp: {r}")
-                        return ok
-                    except Exception as e:
-                        logger.warning(f"[PolyMonitor] cancel_order {oid} exception: {e}")
-                        return False
+                batch_ok = False
+                try:
+                    batch_response = await self.client.cancel_orders_batch(cancels)
+                    batch_ok = str(batch_response.get("code", "")) == "0"
+                    if not batch_ok:
+                        logger.warning(
+                            "[PolyMonitor] Batch cancel response: %s", batch_response
+                        )
+                except Exception as exc:
+                    logger.warning("[PolyMonitor] Batch cancel exception: %s", exc)
 
-                results = await asyncio.gather(*[_cancel_one(o) for o in orders])
-                result["cancelled"] = sum(1 for r in results if r)
-                result["failed"] = sum(1 for r in results if not r)
+                if not batch_ok:
+                    async def _cancel_one(order):
+                        order_id = order.get("oid", order.get("id", ""))
+                        asset_id = order.get("assetId", order.get("tokenId", ""))
+                        try:
+                            item_response = await self.client.cancel_order(
+                                asset_id=asset_id, order_id=order_id
+                            )
+                            return str(item_response.get("code", "")) == "0"
+                        except Exception:
+                            return False
 
-                if result["failed"] == 0:
-                    break
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.error(f"[PolyMonitor] _fast_cancel_all attempt {attempt+1} error: {e}")
-                await asyncio.sleep(0.5)
+                    outcomes = await asyncio.gather(
+                        *[_cancel_one(order) for order in orders]
+                    )
+                    result["cancelled"] += sum(bool(value) for value in outcomes)
+                else:
+                    result["cancelled"] += len(cancels)
+                if attempt < 2:
+                    await asyncio.sleep(0.5)
 
-        if result.get("failed", 0) > 0:
-            logger.critical(f"[PolyMonitor] {result['failed']} orders NOT cancelled after 3 attempts!")
+            # Every successful path returns from an empty, successful query.
+            remaining = await _open_orders()
+            if not remaining:
+                result.update(ok=True, failed=0, remaining=0)
+                return result
+            result.update(failed=len(remaining), remaining=len(remaining))
+            result["error"] = f"{len(remaining)} orders remain open"
+        except Exception as exc:
+            result["failed"] = max(1, result.get("failed", 0))
+            result["error"] = str(exc)
+
+        logger.critical("[PolyMonitor] Cancellation not verified: %s", result)
         return result
 
     def status(self) -> dict:

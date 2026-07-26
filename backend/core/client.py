@@ -87,47 +87,92 @@ class OKXOutcomesClient:
     async def get_balance(self) -> dict:
         return await self._get("/api/v5/predictions/balance")
 
-    async def get_positions(self, status: str = "open", market_id: str = None) -> dict:
-        params = {"status": status}
-        if market_id:
-            params["marketId"] = market_id
-        return await self._get("/api/v5/predictions/positions", params)
+    async def get_positions(self, status: str = "open", market_id: str = None,
+                            page_size: int = 100) -> dict:
+        """Fetch the complete position list using the documented cursor API."""
+        all_positions = []
+        cursor = None
+        seen_cursors = set()
+        for _ in range(100):
+            params = {
+                "status": status,
+                "limit": str(min(max(int(page_size), 1), 100)),
+            }
+            if market_id:
+                params["marketId"] = market_id
+            if cursor:
+                params["cursor"] = cursor
+            response = await self._get("/api/v5/predictions/positions", params)
+            if str(response.get("code", "")) != "0":
+                return response
+            data = response.get("data", {})
+            if (
+                not isinstance(data, dict)
+                or "list" not in data
+                or not isinstance(data.get("list"), list)
+            ):
+                return {"code": "INVALID_RESPONSE", "msg": "Invalid positions response"}
+            all_positions.extend(data["list"])
+            if not data.get("hasNext"):
+                return {"code": "0", "data": {"list": all_positions}}
+            next_cursor = str(data.get("nextCursor", "") or "")
+            if not next_cursor or next_cursor in seen_cursors:
+                return {
+                    "code": "PAGINATION_ERROR",
+                    "msg": "Positions pagination cursor missing or repeated",
+                }
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        return {"code": "PAGINATION_ERROR", "msg": "Positions pagination limit exceeded"}
 
     async def get_orders(self, status: str = "open", market_id: str = None, page_size: int = 20) -> dict:
-        """Fetch orders with automatic pagination (OKX max 20/page)."""
+        """Fetch orders with automatic pagination (OKX max 50/page)."""
         all_orders = []
         cursor = None
-        for _ in range(50):  # Safety: max 1000 orders
-            params = {"status": status, "pageSize": str(page_size)}
+        for _ in range(50):  # Bound pagination even if the API repeats a cursor.
+            params = {"status": status, "limit": str(min(max(page_size, 1), 50))}
             if market_id:
                 params["marketId"] = market_id
             if cursor:
                 params["cursor"] = cursor
             resp = await self._get("/api/v5/predictions/orders", params)
             if str(resp.get("code", "")) != "0":
-                # Return error as-is on first page, or partial results on later pages
-                if not all_orders:
-                    return resp
-                break
+                # Partial pagination is not a successful snapshot.  Callers
+                # such as risk-control cancellation must fail closed.
+                return resp
             data = resp.get("data", {})
-            page = data.get("list", [])
+            if (
+                not isinstance(data, dict)
+                or "list" not in data
+                or not isinstance(data.get("list"), list)
+            ):
+                return {"code": "INVALID_RESPONSE", "msg": "Invalid orders response"}
+            page = data["list"]
             all_orders.extend(page)
             if not data.get("hasNext"):
-                break
-            cursor = data.get("nextCursor", "")
-            if not cursor:
-                break
-        return {"code": "0", "data": {"list": all_orders}}
+                return {"code": "0", "data": {"list": all_orders}}
+            next_cursor = str(data.get("nextCursor", "") or "")
+            if not next_cursor or next_cursor == cursor:
+                return {
+                    "code": "PAGINATION_ERROR",
+                    "msg": "Orders pagination cursor missing or repeated",
+                }
+            cursor = next_cursor
+        return {"code": "PAGINATION_ERROR", "msg": "Orders pagination limit exceeded"}
 
     async def get_order(self, order_id: str) -> dict:
         return await self._get(f"/api/v5/predictions/orders/{order_id}")
 
     # ─── Write APIs ───
 
+    def generate_client_order_id(self) -> str:
+        return self.signer.generate_client_order_id(region=self._region)
+
     async def place_order(self, asset_id: str, side: str, price: str, size: str,
-                          tif: str = "gtc", reduce_only: bool = False) -> dict:
+                          tif: str = "gtc", reduce_only: bool = False,
+                          client_order_id: str = None) -> dict:
         nonce = self.signer.now_millis()
-        client_order_id = self.signer.generate_client_order_id(region=self._region)
+        client_order_id = client_order_id or self.generate_client_order_id()
 
         order = {
             "assetId": asset_id,

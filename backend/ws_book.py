@@ -1,15 +1,4 @@
-"""
-WebSocket orderbook relay: connects to Poly CLOB WS + OKX WS upstream,
-merges and pushes to frontend in real-time.
-
-Poly WS: wss://ws-subscriptions-clob.polymarket.com/ws/market
-  Subscribe: {"type":"market","assets_id":"<token_id>"}  (Note: uses assets_id not asset_id)
-  Messages: {"event_type":"book","asset_id":"...","market":"...","bids":[...],"asks":[...]}
-
-OKX WS: wss://wspap.okx.com:8443/ws/v5/public (paper) or wss://ws.okx.com:8443/ws/v5/public
-  Subscribe: {"op":"subscribe","args":[{"channel":"pm-books5","instId":"<asset_id>"}]}
-  Messages: {"arg":{"channel":"pm-books5","instId":"..."},"data":[{"bids":[["price","size"]],"asks":[...]}]}
-"""
+"""Relay Polymarket and OKX prediction-market books to the dashboard."""
 import asyncio
 import json
 import time
@@ -21,17 +10,81 @@ import aiohttp
 from aiohttp_socks import ProxyConnector
 
 from .core.database import PROXY_NODES
+from .core.price_utils import as_decimal, format_okx_price, invert_binary_price
 
 logger = logging.getLogger(__name__)
 
 
 def _sort_poly_book(bids, asks, limit=10):
-    sorted_bids = sorted(bids, key=lambda x: float(x.get('price', 0)), reverse=True)[:limit]
-    sorted_asks = sorted(asks, key=lambda x: float(x.get('price', 0)))[:limit]
+    sorted_bids = sorted(bids, key=lambda x: as_decimal(x.get("price", "0")), reverse=True)[:limit]
+    sorted_asks = sorted(asks, key=lambda x: as_decimal(x.get("price", "0")))[:limit]
     return sorted_bids, sorted_asks
 
-# OKX WS endpoints
-OKX_WS_PUBLIC = "wss://ws.okx.com:8443/ws/v5/public"
+
+def _poly_book_maps(bids, asks):
+    bid_map = {as_decimal(row["price"]): dict(row) for row in bids or [] if row.get("price") is not None}
+    ask_map = {as_decimal(row["price"]): dict(row) for row in asks or [] if row.get("price") is not None}
+    return bid_map, ask_map
+
+
+def _apply_poly_price_changes(bid_map, ask_map, changes, token_id=""):
+    """Apply Polymarket incremental price changes to an in-memory book."""
+    changed = False
+    for change in changes or []:
+        change_asset = str(change.get("asset_id", change.get("assetId", "")))
+        if token_id and change_asset and change_asset != str(token_id):
+            continue
+        price_value = change.get("price")
+        if price_value is None:
+            continue
+        price = as_decimal(price_value)
+        size_value = change.get("size", "0")
+        size = as_decimal(size_value or "0")
+        side = str(change.get("side", "")).upper()
+        target = bid_map if side in ("BUY", "BID") else ask_map if side in ("SELL", "ASK") else None
+        if target is None:
+            continue
+        if size <= 0:
+            target.pop(price, None)
+        else:
+            target[price] = {"price": str(price_value), "size": str(size_value)}
+        changed = True
+    return changed
+
+
+def _poly_book_from_maps(bid_map, ask_map, limit=10):
+    return _sort_poly_book(list(bid_map.values()), list(ask_map.values()), limit)
+
+OKX_WS_DEFAULT = "wss://ws.okx.com:8443/ws/v5/business"
+OKX_WS_US = "wss://wsus.okx.com/ws/v5/business"
+
+
+def _okx_ws_endpoint(base_url: str) -> str:
+    return OKX_WS_US if "us.okx.com" in (base_url or "") else OKX_WS_DEFAULT
+
+
+def _okx_book_maps(bids, asks):
+    bid_map = {as_decimal(row[0]): list(row) for row in bids or [] if len(row) >= 2}
+    ask_map = {as_decimal(row[0]): list(row) for row in asks or [] if len(row) >= 2}
+    return bid_map, ask_map
+
+
+def _apply_okx_levels(level_map, rows):
+    for row in rows or []:
+        if len(row) < 2:
+            continue
+        price = as_decimal(row[0])
+        size = as_decimal(row[1])
+        if size <= 0:
+            level_map.pop(price, None)
+        else:
+            level_map[price] = list(row)
+
+
+def _okx_book_from_maps(bid_map, ask_map, limit=10):
+    bids = [bid_map[key] for key in sorted(bid_map, reverse=True)[:limit]]
+    asks = [ask_map[key] for key in sorted(ask_map)[:limit]]
+    return bids, asks
 
 
 def _invert_okx_book_arrays(bids, asks):
@@ -41,16 +94,16 @@ def _invert_okx_book_arrays(bids, asks):
         if not a:
             continue
         row = list(a)
-        row[0] = f"{1 - float(a[0]):.2f}"
+        row[0] = format_okx_price(invert_binary_price(a[0]))
         inv_bids.append(row)
     for b in bids or []:
         if not b:
             continue
         row = list(b)
-        row[0] = f"{1 - float(b[0]):.2f}"
+        row[0] = format_okx_price(invert_binary_price(b[0]))
         inv_asks.append(row)
-    inv_bids.sort(key=lambda x: float(x[0]), reverse=True)
-    inv_asks.sort(key=lambda x: float(x[0]))
+    inv_bids.sort(key=lambda x: as_decimal(x[0]), reverse=True)
+    inv_asks.sort(key=lambda x: as_decimal(x[0]))
     return inv_bids, inv_asks
 
 
@@ -59,6 +112,8 @@ async def poly_ws_relay(ws_out: WebSocket, token_id: str, stop_event: asyncio.Ev
     url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     retry_delay = 1
     while not stop_event.is_set():
+        bid_map = {}
+        ask_map = {}
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(url, heartbeat=15) as ws:
@@ -74,6 +129,7 @@ async def poly_ws_relay(ws_out: WebSocket, token_id: str, stop_event: asyncio.Ev
                                 asks = snap.get("asks", [])
                                 if bids or asks:
                                     sb, sa = _sort_poly_book(bids, asks)
+                                    bid_map, ask_map = _poly_book_maps(bids, asks)
                                     await ws_out.send_json({
                                         "source": "poly",
                                         "ts": int(time.time() * 1000),
@@ -94,19 +150,29 @@ async def poly_ws_relay(ws_out: WebSocket, token_id: str, stop_event: asyncio.Ev
                             break
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
-                                data = json.loads(msg.data)
-                                if data.get("event_type") == "book":
-                                    # Normalize to our format
-                                    bids = data.get("bids", [])
-                                    asks = data.get("asks", [])
-                                    sb, sa = _sort_poly_book(bids, asks)
-                                    out = {
+                                raw = json.loads(msg.data)
+                                items = raw if isinstance(raw, list) else [raw]
+                                for data in items:
+                                    event_type = data.get("event_type")
+                                    if event_type == "book":
+                                        bids = data.get("bids", [])
+                                        asks = data.get("asks", [])
+                                        bid_map, ask_map = _poly_book_maps(bids, asks)
+                                        sb, sa = _sort_poly_book(bids, asks)
+                                    elif event_type == "price_change":
+                                        if not _apply_poly_price_changes(
+                                            bid_map, ask_map, data.get("price_changes", []), token_id
+                                        ):
+                                            continue
+                                        sb, sa = _poly_book_from_maps(bid_map, ask_map)
+                                    else:
+                                        continue
+                                    await ws_out.send_json({
                                         "source": "poly",
                                         "ts": int(time.time() * 1000),
                                         "bids": sb,
                                         "asks": sa,
-                                    }
-                                    await ws_out.send_json(out)
+                                    })
                             except Exception:
                                 pass
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
@@ -120,10 +186,16 @@ async def poly_ws_relay(ws_out: WebSocket, token_id: str, stop_event: asyncio.Ev
             retry_delay *= 2
 
 
-async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str, stop_event: asyncio.Event, invert: bool = False):
-    """Connect to OKX WS and relay pm-books5 updates to frontend."""
+async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str,
+                       base_url: str, stop_event: asyncio.Event,
+                       invert: bool = False):
+    """Connect to OKX business WS and maintain the incremental pm-books book."""
     retry_delay = 1
     while not stop_event.is_set():
+        bid_map = {}
+        ask_map = {}
+        last_seq = None
+        ws_snapshot_received = False
         try:
             connector = None
             if proxy_node and proxy_node in PROXY_NODES:
@@ -132,10 +204,10 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str, stop_e
                     connector = ProxyConnector.from_url(f"socks5://{node['host']}:{node['port']}")
 
             async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.ws_connect(OKX_WS_PUBLIC, heartbeat=20) as ws:
+                async with session.ws_connect(_okx_ws_endpoint(base_url), heartbeat=20) as ws:
                     # Send initial REST snapshot
                     try:
-                        okx_url = f"https://www.okx.com/api/v5/market/pm-books?instId={asset_id}&sz=5"
+                        okx_url = f"{base_url.rstrip('/')}/api/v5/market/pm-books?instId={asset_id}&sz=10"
                         async with session.get(
                             okx_url, timeout=aiohttp.ClientTimeout(total=5)
                         ) as snap_resp:
@@ -145,6 +217,7 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str, stop_e
                                     book = snap["data"][0]
                                     bids = book.get("bids", [])[:10]
                                     asks = book.get("asks", [])[:10]
+                                    bid_map, ask_map = _okx_book_maps(bids, asks)
                                     if invert:
                                         bids, asks = _invert_okx_book_arrays(bids, asks)
                                     await ws_out.send_json({
@@ -156,13 +229,12 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str, stop_e
                     except Exception:
                         pass
 
-                    # Subscribe to pm-books5 for real-time updates
                     sub_msg = json.dumps({
                         "op": "subscribe",
-                        "args": [{"channel": "pm-books5", "instId": asset_id}]
+                        "args": [{"channel": "pm-books", "instId": asset_id}]
                     })
                     await ws.send_str(sub_msg)
-                    logger.info(f"OKX WS subscribed: pm-books5 {asset_id} via {proxy_node}")
+                    logger.info(f"OKX WS subscribed: pm-books {asset_id} via {proxy_node}")
                     retry_delay = 1
 
                     async for msg in ws:
@@ -171,11 +243,32 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str, stop_e
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
                                 data = json.loads(msg.data)
-                                # OKX sends {"arg":...,"data":[{"bids":[...],"asks":[...]}]}
-                                if "data" in data and data.get("arg", {}).get("channel") == "pm-books5":
+                                if "data" in data and data.get("arg", {}).get("channel") == "pm-books":
                                     book = data["data"][0] if data["data"] else {}
-                                    bids = book.get("bids", [])
-                                    asks = book.get("asks", [])
+                                    action = str(data.get("action", "")).lower()
+                                    seq = book.get("seqId", book.get("seq_id"))
+                                    prev_seq = book.get("prevSeqId", book.get("prev_seq_id"))
+                                    if action == "snapshot":
+                                        bid_map, ask_map = _okx_book_maps(
+                                            book.get("bids", []), book.get("asks", [])
+                                        )
+                                        ws_snapshot_received = True
+                                    elif action == "update":
+                                        if not ws_snapshot_received:
+                                            raise RuntimeError("OKX pm-books update before snapshot")
+                                        if last_seq is not None and prev_seq is not None:
+                                            try:
+                                                sequence_is_contiguous = int(prev_seq) == int(last_seq)
+                                            except (TypeError, ValueError) as exc:
+                                                raise RuntimeError("OKX pm-books invalid sequence") from exc
+                                            if not sequence_is_contiguous:
+                                                raise RuntimeError("OKX pm-books sequence gap")
+                                        _apply_okx_levels(bid_map, book.get("bids", []))
+                                        _apply_okx_levels(ask_map, book.get("asks", []))
+                                    else:
+                                        continue
+                                    last_seq = seq
+                                    bids, asks = _okx_book_from_maps(bid_map, ask_map)
                                     if invert:
                                         bids, asks = _invert_okx_book_arrays(bids, asks)
                                     out = {
@@ -185,6 +278,8 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str, stop_e
                                         "asks": asks[:10],
                                     }
                                     await ws_out.send_json(out)
+                            except RuntimeError:
+                                raise
                             except Exception:
                                 pass
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
@@ -198,8 +293,10 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str, stop_e
             retry_delay *= 2
 
 
-async def periodic_refresh(ws_out: WebSocket, poly_token: str, okx_asset: str, proxy_node: str, stop_event: asyncio.Event, invert: bool = False):
-    """Fallback: refresh via REST every 5s to keep data fresh when WS is quiet."""
+async def periodic_refresh(ws_out: WebSocket, poly_token: str, okx_asset: str,
+                           proxy_node: str, base_url: str,
+                           stop_event: asyncio.Event, invert: bool = False):
+    """Refresh both books via REST every three seconds."""
     while not stop_event.is_set():
         await asyncio.sleep(3)
         if stop_event.is_set():
@@ -232,7 +329,7 @@ async def periodic_refresh(ws_out: WebSocket, poly_token: str, okx_asset: str, p
                             if node["host"] is not None:
                                 connector = ProxyConnector.from_url(f"socks5://{node['host']}:{node['port']}")
                         async with aiohttp.ClientSession(connector=connector) as sess2:
-                            url = f"https://www.okx.com/api/v5/market/pm-books?instId={okx_asset}&sz=5"
+                            url = f"{base_url.rstrip('/')}/api/v5/market/pm-books?instId={okx_asset}&sz=10"
                             async with sess2.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
                                 if resp.status == 200:
                                     data = await resp.json()
@@ -278,6 +375,7 @@ def register_ws_routes(app, manager):
 
             inst = manager.get_instance(account_id)
             proxy_node = inst.proxy_node if inst else "JP2"
+            base_url = inst.client.base_url if inst else "https://us.okx.com"
 
             if poly_token:
                 tasks.append(asyncio.create_task(
@@ -285,11 +383,16 @@ def register_ws_routes(app, manager):
                 ))
             if okx_asset:
                 tasks.append(asyncio.create_task(
-                    okx_ws_relay(websocket, okx_query_asset, proxy_node, stop_event, invert_okx)
+                    okx_ws_relay(
+                        websocket, okx_query_asset, proxy_node, base_url,
+                        stop_event, invert_okx,
+                    )
                 ))
-            # Always add periodic refresh as fallback
             tasks.append(asyncio.create_task(
-                periodic_refresh(websocket, poly_token, okx_query_asset, proxy_node, stop_event, invert_okx)
+                periodic_refresh(
+                    websocket, poly_token, okx_query_asset, proxy_node,
+                    base_url, stop_event, invert_okx,
+                )
             ))
 
             if not tasks:
