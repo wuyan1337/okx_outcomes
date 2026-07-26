@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Optional
 from cryptography.fernet import Fernet
 
+from .proxy_nodes import PROXY_NODES
+
 DB_PATH = Path(__file__).parent.parent.parent / "data" / "accounts.db"
 
 # The generated key is stored beside the database; this is local at-rest
@@ -89,22 +91,6 @@ def init_db():
     conn.close()
 
 
-# ─── Proxy Nodes ───
-
-PROXY_NODES = {
-    "JP2": {"label": "JP2 (Tokyo2 - Local)", "host": None, "port": None},  # Direct, no proxy
-    "JP1": {"label": "JP1 (Tokyo1)", "host": "168.138.196.214", "port": 9111},
-    "SYD1": {"label": "SYD1 (Q3 Main)", "host": "192.9.160.224", "port": 9111},
-    "SYD2": {"label": "SYD2 (N Main)", "host": "161.33.232.81", "port": 9111},
-    "SG1": {"label": "SG1 (Singapore)", "host": "13.213.17.198", "port": 9111},
-    "K1": {"label": "K1 (Korea)", "host": "13.125.182.63", "port": 9111},
-    "JP3": {"label": "JP3 (Tokyo3)", "host": "3.112.202.198", "port": 9111},
-    "JP4": {"label": "JP4 (AWS Tokyo)", "host": "127.0.0.1", "port": 9114},
-    "JP5": {"label": "JP5 (AWS Tokyo)", "host": "127.0.0.1", "port": 9115},
-    "OSAKA": {"label": "OSAKA (217.142.250.144)", "host": "217.142.250.144", "port": 9111},
-}
-
-
 def get_used_proxies() -> set:
     """Return set of proxy_node values already in use."""
     conn = get_db()
@@ -117,7 +103,12 @@ def get_available_proxies() -> list:
     """Return proxy nodes not yet assigned to an account."""
     used = get_used_proxies()
     return [
-        {"id": k, "label": v["label"]}
+        {
+            "id": k,
+            "label": v["label"],
+            "location": v["location"],
+            "route": v["route"],
+        }
         for k, v in PROXY_NODES.items()
         if k not in used
     ]

@@ -24,6 +24,14 @@ from .core.database import (
 from .services.account_manager import AccountManager
 from .services.notifier import TelegramNotifier
 from .services.size_utils import normalize_size_str
+from .services.latency_probe import (
+    DEFAULT_WARM_SAMPLES,
+    OKX_BASE_URLS,
+    benchmark_proxy_node,
+    benchmark_proxy_nodes,
+    normalise_region,
+    normalise_samples,
+)
 from .core.price_utils import (
     align_okx_price,
     as_decimal,
@@ -370,6 +378,8 @@ async def get_status(user: str = Depends(verify_auth)):
             "id": inst.account_id,
             "name": inst.name,
             "proxy_node": inst.proxy_node,
+            "proxy_label": PROXY_NODES.get(inst.proxy_node, {}).get("label", inst.proxy_node),
+            "region": "CN" if "www.okx.com" in inst.client.base_url else "AU",
             "running": _account_trading_busy(inst),
             "strategy": running_strategy,
             "orders": acct_orders,
@@ -414,6 +424,7 @@ async def list_accounts(user: str = Depends(verify_auth)):
             "name": acc["name"],
             "proxy_node": acc["proxy_node"],
             "proxy_label": PROXY_NODES.get(acc["proxy_node"], {}).get("label", acc["proxy_node"]),
+            "region": "CN" if "www.okx.com" in acc.get("base_url", "") else "AU",
             "running": running,
             "strategy": strategy,
             "created_at": acc["created_at"],
@@ -433,7 +444,13 @@ async def all_proxy_nodes(user: str = Depends(verify_auth)):
     used = get_used_proxies()
     nodes = []
     for k, v in PROXY_NODES.items():
-        nodes.append({"id": k, "label": v["label"], "used": k in used})
+        nodes.append({
+            "id": k,
+            "label": v["label"],
+            "location": v.get("location", "Unknown"),
+            "route": v.get("route", "direct" if v.get("host") is None else "socks5"),
+            "used": k in used,
+        })
     return {"nodes": nodes}
 
 
@@ -2348,73 +2365,149 @@ async def account_health_v2(account_id: str, user: str = Depends(verify_auth)):
     if not inst:
         raise HTTPException(404, "Account not found")
     errors = []
+    started = time.perf_counter()
     try:
         data = await inst.client.get_balance()
-        if isinstance(data, dict) and data.get("code") and str(data.get("code")) != "0":
-            errors.append(f"OKX API: {data.get('msg')} ({data.get('code')})")
+        if not isinstance(data, dict) or str(data.get("code", "")) != "0":
+            if isinstance(data, dict):
+                errors.append(f"OKX API: {data.get('msg') or 'invalid response'} ({data.get('code', 'missing code')})")
+            else:
+                errors.append("OKX API returned an invalid response")
     except Exception as e:
         errors.append(f"OKX connection failed: {e}")
-    return {"healthy": len(errors) == 0, "errors": errors}
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+    return {
+        "healthy": len(errors) == 0,
+        "errors": errors,
+        "latency_ms": elapsed_ms,
+        "region": "CN" if "www.okx.com" in inst.client.base_url else "AU",
+        "proxy_node": inst.proxy_node,
+        "proxy_label": PROXY_NODES.get(inst.proxy_node, {}).get("label", inst.proxy_node),
+    }
 
 
 # ─── Global routes (proxy latency, global config, notifications) ───
 
+def _latency_probe_headers(
+    account_id: str,
+    region: str,
+    yes_asset_id: str,
+):
+    """Return fresh signed GET headers for an account-scoped book probe."""
+    if not yes_asset_id:
+        return None
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        raise HTTPException(
+            status_code=400,
+            detail="account_id is required for authenticated OKX market probes",
+        )
+    inst = manager.get_instance(account_id)
+    if not inst:
+        raise HTTPException(status_code=404, detail="account not found")
+    account_region = "CN" if "www.okx.com" in inst.client.base_url else "AU"
+    if account_region != region:
+        raise HTTPException(
+            status_code=400,
+            detail="account region does not match the requested probe region",
+        )
+    auth = getattr(inst.client, "auth", None)
+    if auth is None or not callable(getattr(auth, "headers", None)):
+        raise HTTPException(
+            status_code=500,
+            detail="account authentication is unavailable for the market probe",
+        )
+
+    def header_factory(target):
+        signed_path = str(target.get("signed_path") or "")
+        if not signed_path.startswith("/api/v5/market/pm-books?"):
+            raise ValueError("market probe target has no signed path")
+        return auth.headers("GET", signed_path)
+
+    return header_factory
+
 @app.get("/api/proxy/latency")
-async def proxy_latency(user: str = Depends(verify_auth)):
-    """Test latency to OKX via each proxy node."""
-    import aiohttp
-    results = {}
-    for node_id, node in PROXY_NODES.items():
-        entry = {"okx_ms": -1, "jp2_ms": 0 if node["host"] is None else -1}
-        try:
-            if node["host"] is None:
-                # Direct connection
-                async with aiohttp.ClientSession() as sess:
-                    t0 = time.time()
-                    async with sess.get("https://us.okx.com/api/v5/public/time", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        if resp.status == 200:
-                            entry["okx_ms"] = int((time.time() - t0) * 1000)
-            else:
-                # Via SOCKS5 proxy
-                from aiohttp_socks import ProxyConnector
-                connector = ProxyConnector.from_url(f"socks5://{node['host']}:{node['port']}")
-                async with aiohttp.ClientSession(connector=connector) as sess:
-                    t0 = time.time()
-                    async with sess.get("https://us.okx.com/api/v5/public/time", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        if resp.status == 200:
-                            entry["okx_ms"] = int((time.time() - t0) * 1000)
-        except Exception:
-            pass
-        results[node_id] = entry
-    return {"latencies": results}
+async def proxy_latency(
+    region: str = "AU",
+    samples: int = DEFAULT_WARM_SAMPLES,
+    yes_asset_id: str = "",
+    poly_token_id: str = "",
+    account_id: str = "",
+    user: str = Depends(verify_auth),
+):
+    """Benchmark all OKX routes and the one shared Poly direct route."""
+    try:
+        normalised_region = normalise_region(region)
+        header_factory = _latency_probe_headers(
+            account_id,
+            normalised_region,
+            yes_asset_id,
+        )
+        result = await benchmark_proxy_nodes(
+            PROXY_NODES,
+            region=normalised_region,
+            samples=normalise_samples(samples),
+            yes_asset_id=yes_asset_id,
+            poly_token_id=poly_token_id,
+            header_factory=header_factory,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    used = get_used_proxies()
+    assignments = {
+        account.get("proxy_node"): account.get("name", "")
+        for account in get_accounts()
+    }
+    for node_id, entry in result["latencies"].items():
+        entry["used"] = node_id in used
+        if assignments.get(node_id):
+            entry["account_name"] = assignments[node_id]
+    return result
 
 
 @app.get("/api/proxy/latency/{node_id}")
-async def proxy_latency_single(node_id: str, user: str = Depends(verify_auth)):
-    """Test latency to OKX via a single proxy node."""
-    import aiohttp
+async def proxy_latency_single(
+    node_id: str,
+    region: str = "AU",
+    samples: int = DEFAULT_WARM_SAMPLES,
+    yes_asset_id: str = "",
+    account_id: str = "",
+    user: str = Depends(verify_auth),
+):
+    """Benchmark one node; Poly remains a separate shared batch metric."""
     if node_id not in PROXY_NODES:
-        return {"okx_ms": -1, "error": "unknown node"}
-    node = PROXY_NODES[node_id]
-    ms = -1
+        raise HTTPException(status_code=404, detail="unknown proxy node")
     try:
-        if node["host"] is None:
-            async with aiohttp.ClientSession() as sess:
-                t0 = time.time()
-                async with sess.get("https://us.okx.com/api/v5/public/time", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        ms = int((time.time() - t0) * 1000)
-        else:
-            from aiohttp_socks import ProxyConnector
-            connector = ProxyConnector.from_url(f"socks5://{node['host']}:{node['port']}")
-            async with aiohttp.ClientSession(connector=connector) as sess:
-                t0 = time.time()
-                async with sess.get("https://us.okx.com/api/v5/public/time", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        ms = int((time.time() - t0) * 1000)
-    except Exception:
-        pass
-    return {"okx_ms": ms, "node_id": node_id}
+        normalised_region = normalise_region(region)
+        sample_count = normalise_samples(samples)
+        header_factory = _latency_probe_headers(
+            account_id,
+            normalised_region,
+            yes_asset_id,
+        )
+        result = await benchmark_proxy_node(
+            node_id,
+            PROXY_NODES[node_id],
+            region=normalised_region,
+            samples=sample_count,
+            yes_asset_id=yes_asset_id,
+            header_factory=header_factory,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result.update({
+        "schema_version": 2,
+        "region": normalised_region,
+        "okx_base_url": OKX_BASE_URLS[normalised_region],
+        "okx_authenticated": header_factory is not None,
+        "execution_path": {
+            "status": "not_measured",
+            "reason": "Synthetic read RTTs do not measure Poly event to OKX order acknowledgement",
+        },
+        "used": node_id in get_used_proxies(),
+    })
+    return result
 
 
 

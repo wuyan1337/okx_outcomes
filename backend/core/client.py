@@ -36,7 +36,7 @@ class OKXOutcomesClient:
             return None
         node = PROXY_NODES[self._proxy_node]
         if node["host"] is None:
-            return None  # JP2 = direct
+            return None
         proxy_url = f"socks5://{node['host']}:{node['port']}"
         return ProxyConnector.from_url(proxy_url)
 

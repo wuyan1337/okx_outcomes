@@ -12,13 +12,16 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import time
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Dict, Iterable, Optional
 
 import aiohttp
 
+from ..core.proxy_nodes import PROXY_NODES
 from .size_utils import normalize_buy_size_str, normalize_size_str
 
 logger = logging.getLogger(__name__)
@@ -30,6 +33,9 @@ ZERO = Decimal("0")
 ONE = Decimal("1")
 CENT = Decimal("0.01")
 OUTER_TICK = Decimal("0.001")
+UNACKNOWLEDGED_RESPONSE_CODES = frozenset({
+    "", "TIMEOUT", "ERROR", "INVALID", "INVALID_RESPONSE",
+})
 
 
 def _decimal(value: Any, default: Decimal = ZERO) -> Decimal:
@@ -185,6 +191,8 @@ class PolySniper:
         self._lifecycle_lock = asyncio.Lock()
         self._starting = False
         self._persistence_failed = False
+        self._latency_active: Optional[dict] = None
+        self._latency_history: list[dict] = []
 
     @property
     def running(self) -> bool:
@@ -195,12 +203,205 @@ class PolySniper:
         return self._starting
 
     def log(self, message: str):
-        from datetime import datetime
-
         entry = f"[{datetime.now().strftime('%I:%M:%S %p')}] {message}"
         self.state.logs.append(entry)
         self.state.logs = self.state.logs[-100:]
         logger.info("[Sniper:%s] %s", self.account_id, message)
+
+    @staticmethod
+    def _elapsed_ms(started_ns: int) -> float:
+        return round((time.perf_counter_ns() - started_ns) / 1_000_000, 1)
+
+    def _begin_latency_trace(self, target_id: str, signal_ns: Optional[int] = None):
+        target = self._target(target_id)
+        started_ns = signal_ns or time.perf_counter_ns()
+        base_url = str(getattr(self.client, "base_url", ""))
+        proxy_node = str(getattr(self.client, "_proxy_node", "") or "")
+        proxy_name = str(PROXY_NODES.get(proxy_node, {}).get("name", proxy_node))
+        self._latency_active = {
+            "_started_ns": started_ns,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "target_id": target.id,
+            "target_name": target.name,
+            "side": target.side,
+            "region": "CN" if "www.okx.com" in base_url else "AU",
+            "proxy_node": proxy_node,
+            "proxy_name": proxy_name,
+            "stages_ms": {},
+        }
+
+    def _record_latency_stage(self, name: str, started_ns: int):
+        if self._latency_active is not None:
+            self._latency_active["stages_ms"][name] = self._elapsed_ms(started_ns)
+
+    def _mark_latency_order_attempted(self):
+        if self._latency_active is not None:
+            self._latency_active["order_attempted"] = True
+
+    def _finish_latency_trace(
+        self,
+        outcome: str,
+        *,
+        reason: str = "",
+        response_code: str = "",
+        order_ack: bool = False,
+    ):
+        trace = self._latency_active
+        if trace is None:
+            return
+        elapsed = self._elapsed_ms(int(trace.pop("_started_ns")))
+        trace["outcome"] = str(outcome)
+        trace["trigger_to_finish_ms"] = elapsed
+        if order_ack:
+            trace["trigger_to_order_ack_ms"] = elapsed
+        if reason:
+            trace["reason"] = str(reason)[:200]
+        if response_code:
+            trace["response_code"] = str(response_code)[:40]
+        self._latency_history.append(trace)
+        self._latency_history = self._latency_history[-50:]
+        self._latency_active = None
+
+    def _latency_snapshot(self) -> dict:
+        recent = []
+        for saved in self._latency_history[-20:]:
+            if not isinstance(saved, dict):
+                continue
+            item = dict(saved)
+            stages = item.get("stages_ms")
+            item["stages_ms"] = dict(stages) if isinstance(stages, dict) else {}
+            recent.append(item)
+
+        rolling_recent = recent
+        rolling_region = None
+        rolling_proxy_node = None
+        if recent and (
+            "region" in recent[-1] or "proxy_node" in recent[-1]
+        ):
+            rolling_region = str(recent[-1].get("region") or "")
+            rolling_proxy_node = str(recent[-1].get("proxy_node") or "")
+            rolling_recent = [
+                item for item in recent
+                if str(item.get("region") or "") == rolling_region
+                and str(item.get("proxy_node") or "") == rolling_proxy_node
+            ]
+
+        ack_samples = []
+        acknowledged_ids = set()
+        for index, item in enumerate(rolling_recent):
+            value = self._valid_latency_ms(item.get("trigger_to_order_ack_ms"))
+            if value is not None:
+                ack_samples.append(value)
+                acknowledged_ids.add(index)
+        order_attempts = sum(
+            1
+            for index, item in enumerate(rolling_recent)
+            if bool(item.get("order_attempted")) or index in acknowledged_ids
+        )
+        successful = sum(
+            1 for item in rolling_recent
+            if self._valid_latency_ms(item.get("trigger_to_order_ack_ms")) is not None
+            and str(item.get("response_code", "")) == "0"
+        )
+        rolling = {
+            "window": len(rolling_recent),
+            "region": rolling_region,
+            "proxy_node": rolling_proxy_node,
+            "order_attempts": order_attempts,
+            "order_ack_samples": len(ack_samples),
+            "successful_order_responses": successful,
+            "failed_order_responses": len(ack_samples) - successful,
+            "unacknowledged_order_attempts": max(0, order_attempts - len(ack_samples)),
+            "pre_order_exits": max(0, len(rolling_recent) - order_attempts),
+            "ack_rate": round(len(ack_samples) / order_attempts, 3) if order_attempts else None,
+            "attempt_success_rate": round(successful / order_attempts, 3) if order_attempts else None,
+            "success_rate": round(successful / len(ack_samples), 3) if ack_samples else None,
+            "median_ms": None,
+            "min_ms": None,
+            "max_ms": None,
+            "jitter_ms": None,
+        }
+        if ack_samples:
+            ordered = sorted(ack_samples)
+            middle = len(ordered) // 2
+            median = (
+                ordered[middle]
+                if len(ordered) % 2
+                else (ordered[middle - 1] + ordered[middle]) / 2
+            )
+            rolling.update({
+                "median_ms": round(median, 1),
+                "min_ms": round(min(ordered), 1),
+                "max_ms": round(max(ordered), 1),
+                "jitter_ms": round(max(ordered) - min(ordered), 1),
+            })
+        return {
+            "status": "measured" if recent else "no_samples",
+            "last": recent[-1] if recent else None,
+            "rolling": rolling,
+            "recent": recent,
+        }
+
+    @staticmethod
+    def _valid_latency_ms(value: Any) -> Optional[float]:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(number) or number < 0:
+            return None
+        return number
+
+    @classmethod
+    def _restore_latency_history(cls, saved_latency: Any) -> list[dict]:
+        if not isinstance(saved_latency, dict):
+            return []
+        saved_recent = saved_latency.get("recent")
+        if not isinstance(saved_recent, list):
+            return []
+
+        restored = []
+        for raw in saved_recent[-50:]:
+            if not isinstance(raw, dict) or not isinstance(raw.get("outcome"), str):
+                continue
+            trace = dict(raw)
+            # An in-progress monotonic timestamp is process-local and must
+            # never be resumed as a completed latency sample.
+            trace.pop("_started_ns", None)
+            clean_stages = {}
+            stages = trace.get("stages_ms")
+            if isinstance(stages, dict):
+                for name, value in stages.items():
+                    elapsed = cls._valid_latency_ms(value)
+                    if elapsed is not None:
+                        clean_stages[str(name)[:60]] = round(elapsed, 1)
+            trace["stages_ms"] = clean_stages
+            for key in ("trigger_to_finish_ms", "trigger_to_order_ack_ms"):
+                elapsed = cls._valid_latency_ms(trace.get(key))
+                if elapsed is None:
+                    trace.pop(key, None)
+                else:
+                    trace[key] = round(elapsed, 1)
+            response_code = str(trace.get("response_code", ""))[:40]
+            if response_code:
+                trace["response_code"] = response_code
+            if response_code.upper() in UNACKNOWLEDGED_RESPONSE_CODES:
+                # Repair traces written by the brief legacy instrumentation
+                # that labelled local TIMEOUT/ERROR results as exchange ACKs.
+                had_false_ack = "trigger_to_order_ack_ms" in trace
+                trace.pop("trigger_to_order_ack_ms", None)
+                if response_code or had_false_ack or trace.get("order_attempted") is True:
+                    trace["order_attempted"] = True
+                elif "order_attempted" in trace:
+                    trace["order_attempted"] = False
+            elif "trigger_to_order_ack_ms" in trace:
+                trace["order_attempted"] = True
+            elif "order_attempted" in trace:
+                trace["order_attempted"] = trace["order_attempted"] is True
+            restored.append(trace)
+        return restored[-50:]
 
     async def start(
         self,
@@ -313,6 +514,7 @@ class PolySniper:
         self._set_legacy_fields(parsed_targets[0])
         self._runtime = {target.id: TargetRuntime() for target in parsed_targets}
         self._token_targets = {}
+        self._latency_active = None
         for target in parsed_targets:
             self._token_targets.setdefault(target.poly_token_id, []).append(target.id)
 
@@ -568,6 +770,7 @@ class PolySniper:
         await self._process_ws_event({**data, "event_type": "book"})
 
     async def _process_bid(self, token_id: str, current_bid: Decimal):
+        signal_received_ns = time.perf_counter_ns()
         target_ids = self._token_targets.get(token_id, [])
         if current_bid <= ZERO:
             for target_id in target_ids:
@@ -621,18 +824,40 @@ class PolySniper:
             if runtime.baseline > ZERO and current_bid < runtime.baseline * Decimal("0.7"):
                 self.log(f"BOUNCE SKIP: {target_id} remains below 70% of its high watermark")
                 continue
-            task = asyncio.create_task(self._try_trigger(target_id, window_low, current_bid))
+            task = asyncio.create_task(
+                self._try_trigger(
+                    target_id,
+                    window_low,
+                    current_bid,
+                    signal_received_ns=signal_received_ns,
+                )
+            )
             self._trigger_tasks.add(task)
             task.add_done_callback(self._trigger_tasks.discard)
 
-    async def _try_trigger(self, target_id: str, previous_bid: Decimal, current_bid: Decimal):
+    async def _try_trigger(
+        self,
+        target_id: str,
+        previous_bid: Decimal,
+        current_bid: Decimal,
+        signal_received_ns: Optional[int] = None,
+    ):
         async with self._trigger_lock:
             if not self._running or self.state.locked or self.state.status != "monitoring":
                 return
             self.state.locked = True
             self.state.active_target_id = target_id
             self.state.status = "triggered"
-        await self._emit_state_change()
+        self._begin_latency_trace(target_id, signal_received_ns)
+        self._record_latency_stage(
+            "signal_to_lock",
+            signal_received_ns or time.perf_counter_ns(),
+        )
+        persist_started = time.perf_counter_ns()
+        try:
+            await self._emit_state_change()
+        finally:
+            self._record_latency_stage("trigger_persist", persist_started)
 
         try:
             await self._run_trigger(target_id, previous_bid, current_bid)
@@ -652,6 +877,7 @@ class PolySniper:
             or self.state.buy_size > self.state.sold_size
         )
         if has_uncertain_order:
+            self._finish_latency_trace("trigger_error", reason=reason)
             self.log(reason)
             self.state.status = "error"
             self.state.locked = True
@@ -671,14 +897,23 @@ class PolySniper:
         )
         if self.config.settle_ms > 0:
             self.state.status = "settling"
-            current_bid = await self._wait_for_settle(target)
+            settle_started = time.perf_counter_ns()
+            try:
+                current_bid = await self._wait_for_settle(target)
+            finally:
+                self._record_latency_stage("settle", settle_started)
             if not self._running:
+                self._finish_latency_trace("stopped_during_settle")
                 return
             if (current_bid - previous_bid) * Decimal("100") < self.config.threshold_cents:
                 await self._release_trigger("Poly move no longer meets threshold after settle window")
                 return
             self.state.status = "triggered"
-        asks = await self._snapshot_okx_asks(target)
+        book_started = time.perf_counter_ns()
+        try:
+            asks = await self._snapshot_okx_asks(target)
+        finally:
+            self._record_latency_stage("okx_book", book_started)
         if not asks:
             await self._release_trigger("OKX has no usable ask depth")
             return
@@ -721,6 +956,7 @@ class PolySniper:
         return observed
 
     async def _release_trigger(self, reason: str):
+        self._finish_latency_trace("released_before_order", reason=reason)
         self.log(f"Trigger released: {reason}")
         self.state.status = "monitoring" if self._running else "stopped"
         self.state.locked = False
@@ -786,12 +1022,20 @@ class PolySniper:
 
         placement_attempted = False
         try:
-            position_before = await self._query_position_size(target)
+            position_started = time.perf_counter_ns()
+            try:
+                position_before = await self._query_position_size(target)
+            finally:
+                self._record_latency_stage("positions", position_started)
             if position_before is None:
                 self.log("Entry blocked: OKX position baseline is unavailable")
                 return False
             self.state.position_before = position_before
-            balance = await self._available_balance()
+            balance_started = time.perf_counter_ns()
+            try:
+                balance = await self._available_balance()
+            finally:
+                self._record_latency_stage("balance", balance_started)
             budget = target.budget if target.budget is not None else balance * self.config.position_pct / Decimal("100")
             budget = min(budget, balance)
             requested_size = min((budget / max_price).to_integral_value(rounding=ROUND_DOWN), depth_size)
@@ -801,9 +1045,13 @@ class PolySniper:
                 self.log(f"Insufficient balance/depth for {target.id}")
                 return False
 
-            await self._notify(
-                f"⚡ {target.name} {target.side.upper()} {_decimal_text(previous_bid)}→{_decimal_text(current_bid)}"
-            )
+            notify_started = time.perf_counter_ns()
+            try:
+                await self._notify(
+                    f"⚡ {target.name} {target.side.upper()} {_decimal_text(previous_bid)}→{_decimal_text(current_bid)}"
+                )
+            finally:
+                self._record_latency_stage("notify_queue", notify_started)
             client_oid = ""
             oid_factory = getattr(self.client, "generate_client_order_id", None)
             if callable(oid_factory):
@@ -815,7 +1063,12 @@ class PolySniper:
             self.state.status = "entering"
             self.state.entry_placement_attempted = True
             self.state.entry_client_order_id = client_oid
-            if not await self._emit_state_change():
+            persist_started = time.perf_counter_ns()
+            try:
+                persisted = await self._emit_state_change()
+            finally:
+                self._record_latency_stage("pre_order_persist", persist_started)
+            if not persisted:
                 self.state.status = "triggered"
                 self.state.entry_placement_attempted = False
                 self.state.entry_client_order_id = ""
@@ -831,7 +1084,27 @@ class PolySniper:
             )
             if client_oid:
                 order_kwargs["client_order_id"] = client_oid
-            response = await self.client.place_order(**order_kwargs)
+            order_started = time.perf_counter_ns()
+            self._mark_latency_order_attempted()
+            try:
+                response = await self.client.place_order(**order_kwargs)
+            finally:
+                self._record_latency_stage("order_submit", order_started)
+            response_code = str(response.get("code", "")) if isinstance(response, dict) else "INVALID"
+            order_acknowledged = (
+                response_code.upper() not in UNACKNOWLEDGED_RESPONSE_CODES
+            )
+            self._finish_latency_trace(
+                (
+                    "order_ack"
+                    if response_code == "0"
+                    else "order_response_error"
+                    if order_acknowledged
+                    else "order_unacknowledged"
+                ),
+                response_code=response_code,
+                order_ack=order_acknowledged,
+            )
             response_oid = str(response.get("_clientOrderId") or client_oid)
             if response_oid != client_oid:
                 client_oid = response_oid
@@ -908,6 +1181,10 @@ class PolySniper:
             await self._emit_state_change()
             return True
         except Exception as exc:
+            self._finish_latency_trace(
+                "entry_exception",
+                reason=type(exc).__name__,
+            )
             self.log(f"Entry exception: {exc}")
             if placement_attempted:
                 self.state.status = "error"
@@ -1336,6 +1613,7 @@ class PolySniper:
             "market_id": self.state.market_id,
             "poly_url": self.state.poly_url,
             "selected_outcome": self.state.selected_outcome,
+            "latency": self._latency_snapshot(),
             "logs": self.state.logs[-20:],
         }
 
@@ -1396,6 +1674,10 @@ class PolySniper:
             hold_start_epoch_ms=int(holding.get("hold_start_epoch_ms") or 0),
             logs=list(saved_state.get("logs") or [])[-100:],
         )
+        self._latency_history = self._restore_latency_history(
+            saved_state.get("latency")
+        )
+        self._latency_active = None
         self._set_legacy_fields(parsed[0])
         prices = saved_state.get("target_prices") or {}
         for target in parsed:

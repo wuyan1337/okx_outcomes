@@ -147,7 +147,9 @@ SQLite + Fernet key + JSON runtime files
 | `ss.txt` | 本地 OKX Outcome API 文档副本，不是程序运行依赖，当前也不应作为凭据示例。 |
 | `patch_fix.py` | 旧的一次性文本替换补丁，不在启动或测试流程中；重复执行可能误改现有代码。 |
 | `layers` | 空占位文件，当前没有代码读取。 |
-| `scripts/` | 当前为空，运行流程不依赖它。 |
+| `scripts/bootstrap-egress-node.sh` | 在新 Ubuntu 出口 VPS 创建受限 SSH forwarding 用户；只允许 Bot 单 IP、key auth 和 OKX 目标，不启动公网 SOCKS。失败会恢复原 SSH 配置/authorized key。 |
+| `scripts/install-egress-tunnel.sh` | 在 Bot Ubuntu 主机核验 host key，安装 `127.0.0.1` dynamic SOCKS systemd 服务并做 Region 连通检查。 |
+| `scripts/proxy_nodes.py` | 原子管理本机 node registry、列出 backend 实际节点并执行统一延迟 benchmark。 |
 | `data/` | 本地运行数据，Git 已忽略；包含数据库、密钥和策略状态，不能随意清空。 |
 | `*.bak-*`、`*.bak` | 人工历史快照，不会被 Python import；仅用于人工比对或回滚参考。 |
 
@@ -161,7 +163,8 @@ SQLite + Fernet key + JSON runtime files
 | `backend/core/__init__.py` | `backend.core` package 标记。 |
 | `backend/core/auth.py` | OKX HMAC REST 鉴权；写操作使用 msgpack、keccak、EIP-712/ECDSA 生成签名。 |
 | `backend/core/client.py` | OKX Outcomes 异步 REST client；负责代理连接、读写 API、分页、`clientOrderId`、heartbeat 和 session 生命周期。 |
-| `backend/core/database.py` | SQLite 表、账户增删改查、Fernet 加解密、代理节点、全局配置和 Sniper 状态。 |
+| `backend/core/database.py` | SQLite 表、账户增删改查、Fernet 加解密、全局配置和 Sniper 状态。 |
+| `backend/core/proxy_nodes.py` | 内置节点、统一名称、`data/proxy_nodes.json` 本地扩展和节点校验。数据库仍保存稳定的旧 ID。 |
 | `backend/core/price_utils.py` | 所有 cent/`0..1` 转换、OKX tick、方向性对齐、显示格式和二元价格镜像。 |
 | `backend/services/__init__.py` | `backend.services` package 标记。 |
 | `backend/services/account_manager.py` | 为每个账户组装 client、notifier 和全部策略；处理依赖连接、启动/关闭与新版 Sniper 恢复。 |
@@ -173,6 +176,7 @@ SQLite + Fernet key + JSON runtime files
 | `backend/services/poly_sniper_old.py` | 遗留版 Sniper，仅用于兼容和对照。新功能不要继续加在这里。 |
 | `backend/services/notifier.py` | Telegram 异步发送队列和配置刷新。 |
 | `backend/services/size_utils.py` | 数量规范化；买单 share 取整数，卖单保留真实可用的小数数量。 |
+| `backend/services/latency_probe.py` | OKX 各路由与 Poly Direct 的冷/热多次探测、统计和错误分类；不伪装成真实下单延迟。 |
 
 ### 4.3 Frontend
 
@@ -199,6 +203,10 @@ SQLite + Fernet key + JSON runtime files
 | `tests/test_app_cancel_all.py` | 页面 Cancel All/Flash 的撤单、reduce-only IOC 与最终订单/持仓核验。 |
 | `tests/test_app_config_safety.py` | 凭据/region 变更前的本地状态、交易所敞口、agent key 和 client 原子切换。 |
 | `tests/test_poly_monitor_empty_book.py` | Monitor 对 REST/WS 空 bid 的风控、初始空簿拒绝和异常响应忽略。 |
+| `tests/test_latency_probe.py` | Region/真实 endpoint、冷/热采样、统计、失败分类、Poly shared route 和并发隔离。 |
+| `tests/test_proxy_nodes.py` | 稳定节点 ID、canonical 名称、本地 registry、重复名和 tunnel loopback 约束。 |
+| `tests/test_dashboard_latency_ui.py` | Health/Add Account 延迟展示、Region、请求取消、旧响应隔离和 Sniper 真实埋点展示。 |
+| `tests/test_app_latency_api.py` | latency API 参数传递、节点 assignment metadata、账户真实 health code 和零余额。 |
 
 ## 5. 配置与启动
 
@@ -630,6 +638,7 @@ data/
 ├─ accounts.db
 ├─ .key
 ├─ accounts.db-wal / accounts.db-shm     # SQLite 运行时可能出现
+├─ proxy_nodes.json                       # 本机节点扩展/覆盖，部署时必须保留
 ├─ pending_sells_d_{account_id}.json
 ├─ pending_sells_s_{account_id}.json
 ├─ cost_layers_{account_id}.json
@@ -651,7 +660,133 @@ data/
 - pending sells、cost layers 和 `poly_asset_map.json` 也属于恢复所需状态；
 - 不要因为 `data/` 被 Git 忽略就把它当成可删除缓存。
 
-## 15. 部署在根路径
+## 15. 延迟检测、统一节点与新服接入
+
+### 15.1 两类延迟不能混在一起
+
+Dashboard 的 Add Account 和 System Health 使用的是**合成读请求探测**：
+
+- OKX Region 为 AU 时探测账户真实使用的 `https://us.okx.com`；CN 时探测 `https://www.okx.com`；
+- 已有同 Region 账户且能确定 active Sniper target（或只有一个完整 target）时，OKX 请求使用该账户逐次签名，并探测这一组映射的 `/api/v5/market/pm-books?instId=...&sz=10`；Poly 请求使用同一映射的真实 token `/book`。多 target 尚未触发、无法确定唯一映射时退回 connectivity-only，不会拼接两个无关市场；
+- OKX `pm-books` 是鉴权接口：没有同 Region 账户时不能做真实 market read，只能退回 `/api/v5/public/time` 连通性探测，不能把后者标成行情延迟；
+- 没有可用 asset/token 时只探测 `/api/v5/public/time` 和 Poly `/time`，页面明确标为 `Connectivity only`，不能把它当行情或下单速度；
+- 每条路径使用一个 session：第一请求单列为 cold，随后默认 5 次 warm，返回原始样本、median、min、max、jitter、成功/失败/跳过数和错误分类；失败节点不会用少量偶然成功样本参与 `LOWEST RTT` 排名；
+- Poly 从 Bot 主机 Direct 访问，对所有 OKX 出口节点是同一条共享路径，所以只显示一次；不会把同一个 Poly RTT 重复加到每个节点；
+- 页面不再显示没有真实含义的 `jp2_ms` 或简单 `total_ms`，并会在切换 Region/关闭弹窗时取消旧请求，旧响应不能覆盖新结果。
+- 排名徽标写作 `LOWEST RTT`，只表示本轮同类读探测最低，不宣称该节点的真实订单一定最快。
+
+这类 GET 探测能比较 DNS、连接、代理和读路径，**不能测出真实订单 POST 的确认时间**。新版 Sniper 因此另外被动记录生产路径，不会为了测速主动下单：
+
+```text
+本机收到 Poly WS 价格事件
+  → signal_to_lock
+  → trigger persistence / optional settle
+  → OKX book
+  → positions
+  → balance
+  → notification queue
+  → pre-order persistence
+  → sign + order POST
+  → OKX acknowledgement
+```
+
+Sniper 面板显示最后一次各分段、`Trigger→Ack`，以及最近窗口的 p50/min/max/jitter、成功订单响应数、失败率、实测 Region 和当时的 canonical 节点名。每条 trace 还记录稳定 proxy ID；rolling 只聚合同一 Region、同一 proxy route，切换线路后不会把旧线路样本混进新线路。本地 `TIMEOUT`/`ERROR` 不会伪装成 OKX acknowledgement；触发后在下单前被风控释放也单独计数。这里的起点是 Bot **收到** Poly 消息的本机单调时钟，无法凭空推算消息在 Poly 服务端产生后、到达 Bot 前已经消耗的网络时间。
+
+### 15.2 节点名称规则
+
+数据库和 API 内部继续使用已有稳定 ID，避免破坏已保存账户；所有用户界面统一显示 `国家-城市-序号 | 城市 | 路由`：
+
+| 稳定 ID | 统一显示名 |
+| --- | --- |
+| `JP1`…`JP5` | `JP-TYO-01`…`JP-TYO-05` |
+| `OSAKA` | `JP-OSA-01` |
+| `SG1` | `SG-SIN-01` |
+| `K1` | `KR-SEL-01` |
+| `SYD1` / `SYD2` | `AU-SYD-01` / `AU-SYD-02` |
+
+新节点名必须使用 `CC-CITY-NN`，例如 `JP-TYO-06`。`direct`、旧式 `socks5` 和新式 `tunnel` 是路由类型，不再混进节点名。内置旧节点仍保留以兼容现有账户；新节点只允许 Direct 或绑定 `127.0.0.1` 的 SSH tunnel，不允许通过注册工具新增公网裸 SOCKS5。
+
+本机扩展写入 `data/proxy_nodes.json`，升级代码时不要覆盖它。服务在启动时读取 registry，所以注册或替换节点后必须重启这一套单进程 FastAPI 服务。先检查有效配置：
+
+```bash
+python3 scripts/proxy_nodes.py list
+```
+
+registry 损坏时 CLI 会拒绝覆盖；后端则记录错误并保留可用内置节点。canonical 名称、Direct route 和本机 tunnel port 都不能重复。
+
+### 15.3 新 Ubuntu 出口 VPS 的统一安装流程
+
+出口 VPS 和 Bot 主机是两台机器，所以安全安装分为两个脚本。示例增加 `JP-TYO-06`，Bot 本机 tunnel 使用 `9116`：
+
+1. 在 **Bot 主机**生成这个节点专用、无 passphrase 的 Ed25519 key，并通过 VPS 控制台等可信通道把 `.pub` 放到出口 VPS：
+
+   ```bash
+   sudo ssh-keygen -t ed25519 -N '' -f /root/JP-TYO-06 -C okx-JP-TYO-06
+   ```
+
+2. 在**出口 VPS 控制台**运行 bootstrap；`--bot-cidr` 只允许 Bot 公网 IP 登录：
+
+   ```bash
+   sudo bash ./scripts/bootstrap-egress-node.sh \
+     --node-id JP-TYO-06 \
+     --bot-cidr 203.0.113.10/32 \
+     --public-key-file /root/JP-TYO-06.pub
+   ```
+
+3. 仍从 VPS 控制台读取 `/etc/ssh/ssh_host_ed25519_key.pub` 和脚本打印的 `SHA256:...` host fingerprint，通过可信通道分别保存到 Bot 主机。不要在第一次网络连接时盲目接受 host key。
+
+4. 在 **Bot 主机**安装 systemd 持久 tunnel：
+
+   ```bash
+   sudo bash ./scripts/install-egress-tunnel.sh \
+     --node-id JP-TYO-06 \
+     --host 203.0.113.20 \
+     --region AU \
+     --local-port 9116 \
+     --private-key /root/JP-TYO-06 \
+     --host-key-file /root/JP-TYO-06.host-ed25519.pub \
+     --host-key-fingerprint SHA256:REPLACE_WITH_CONSOLE_VALUE
+   ```
+
+5. tunnel 通过对应 Region 的 OKX 连通检查后，在 Bot 项目目录注册并重启 Bot 服务：
+
+   ```bash
+   python3 scripts/proxy_nodes.py add \
+     --id JP-TYO-06 \
+     --location Tokyo \
+     --port 9116
+
+   python3 scripts/proxy_nodes.py list
+   ```
+
+脚本只让 SOCKS 监听 `127.0.0.1`，远端账户只允许 key auth 和指定的 OKX 443/8443 转发。云安全组还应把 SSH 入站限制到 Bot IP。不要开放公网 `9111`，也不要把专用私钥复制进项目、ZIP 或 Git。
+
+节点替换必须显式加 `--replace`。先用 VPS 控制台确认新 host key 和连接信息，再替换；脚本不会在信息不完整时自动信任新主机。
+
+### 15.4 怎样选“最好”的节点
+
+不能只凭城市或一次 ping 下结论。当前代理只改变 **Bot → OKX** 路径，Poly 仍从 Bot Direct 访问。建议按这个顺序选择：
+
+1. 对账户真实 Region 分开测 AU/CN，不跨 endpoint 比数字；
+2. 有真实市场时带 asset/token，先剔除 DNS、TLS、proxy、HTTP 失败和成功率不稳定的节点；
+3. 比较 warm median、max 和 jitter，不用 cold 值或简单相加的 `total_ms` 排名；
+4. 最终以自然发生的 Sniper `Trigger→Ack` rolling 数据和失败率决定，因为它包含下单前查询、持久化、签名和真实 POST；
+5. 至少跨高峰/低峰多个时段，最好观察 24 小时，再把账户固定到节点。
+
+命令行可先做同条件比较：
+
+```bash
+python3 scripts/proxy_nodes.py benchmark \
+  --region AU \
+  --samples 5 \
+  --yes-asset-id REAL_OKX_YES_ASSET_ID \
+  --poly-token-id REAL_POLY_TOKEN_ID \
+  --account-id LOCAL_ACCOUNT_ID
+```
+
+如果当前 Bot 主机确实位于 Tokyo，先把 `JP-TYO-02` Direct 当基线，再测 Tokyo 同城不同供应商；同城通常少一段 Bot→出口 RTT，但并不保证 OKX 的运营商路由最好。Seoul、Singapore、Sydney 只在同 Region、同时间窗口的 warm 和真实 order acknowledgement 数据更好时替换。没有从实际部署主机取得这些数据前，不能诚实地宣布某个现有 IP 永远最快。
+
+## 16. 部署在根路径
 
 配置：
 
@@ -670,7 +805,7 @@ python -m uvicorn backend.app:app --host 127.0.0.1 --port 8899
 
 反向代理到根路径时，要同时支持普通 HTTP 和 WebSocket Upgrade。
 
-## 16. 部署在 `https://xxxx.com/okx`
+## 17. 部署在 `https://xxxx.com/okx`
 
 `base_path` 只填写 URL path，不填写域名：
 
@@ -731,7 +866,7 @@ location /okx/ {
 4. WebSocket 是否连接 `/okx/ws/book/...`；
 5. 上游收到的是剥离前缀后的 `/...`，还是保留前缀的 `/okx/...`。
 
-## 17. 测试与静态检查
+## 18. 测试与静态检查
 
 测试使用 Python 标准库 `unittest`，不需要额外安装 pytest：
 
@@ -739,12 +874,12 @@ location /okx/ {
 python -m unittest discover -s tests -v
 ```
 
-本次本地审查结果为 `150 tests OK`；其中前端测试会提取各 HTML 的 inline JavaScript 并交给 Node.js 做语法检查。
+本次本地审查结果为 `213 tests OK`；其中前端测试会提取各 HTML 的 inline JavaScript 并交给 Node.js 做语法检查。
 
 Python 语法检查：
 
 ```powershell
-python -m compileall backend tests
+python -m compileall backend scripts tests
 ```
 
 Git whitespace 检查：
@@ -755,7 +890,7 @@ git diff --check
 
 部分测试可能因本机未安装可选环境或无法访问外部服务而 skip；任何涉及精度、Sniper 锁、恢复或 base path 的失败都不应在实盘前忽略。
 
-## 18. 常见故障排查
+## 19. 常见故障排查
 
 ### 页面上的 `0.1¢` 显示为 0
 
@@ -831,7 +966,7 @@ Cancel All 只撤单，不会撤销已经发生的 fill。Auto-Rebalance 会尝�
 
 ### `layers` 和 `scripts/`
 
-`layers` 是空占位，`scripts/` 当前也是空目录；两者都不是运行入口。
+`layers` 是空占位，不是运行入口。`scripts/` 现在包含出口 VPS bootstrap、Bot 主机 SSH tunnel 安装和节点 registry/benchmark 工具；应用不会自动执行它们，但新节点接入和生产排障需要保留，使用方法见第 15 章。
 
 ### `auto-push.sh`
 
