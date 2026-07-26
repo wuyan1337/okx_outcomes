@@ -36,28 +36,34 @@ h1{font-size:20px;font-weight:700;margin-bottom:8px;background:linear-gradient(1
 </head>
 <body>
 
-<h1>⚡ Poly Sniper Parameters</h1>
-<p class="subtitle">Cross-market latency arbitrage between Polymarket and OKX<br>跨市场延迟套利参数说明</p>
+<h1>⚡ Poly Sniper Guide</h1>
+<p class="subtitle">Monitor explicit Polymarket signals and trade their mapped OKX outcomes<br>显式映射 Poly 信号与 OKX 下单目标</p>
+
+<div class="card">
+<div class="card-head"><div class="icon icon-levels">↔</div><span class="param-name">Candidate Mapping</span></div>
+<p class="desc-cn">每一行都是独立且明确的映射：选择一个真实 Poly outcome token，再选择 OKX market 和 YES/NO。系统不会自动加入 Poly 的相反方向。</p>
+<div class="example">Poly: Argentina YES → OKX: Argentina wins / YES</div>
+<div class="example">Poly: Australia NO → OKX: Australia wins / NO</div>
+</div>
 
 <div class="card">
 <div class="card-head">
 <div class="icon icon-thresh">¢</div>
 <span class="param-name">Threshold</span><span class="param-id">threshold_cents</span>
 </div>
-<p class="desc">Minimum price jump (in cents) on Poly's best bid to trigger a snipe. Higher = fewer triggers but safer.</p>
-<p class="desc-cn">触发阈值：Poly 最高 bid 在一个 tick 内跳涨多少分（¢）才触发买入。值越大越保守，虚假信号越少。</p>
+<p class="desc">Minimum Poly best-bid increase, in cents, within the configured window.</p>
+<p class="desc-cn">触发阈值：指定 Poly token 的最高 bid 在 Window 内上涨多少 cent 才触发。</p>
 <div class="example">10¢ = Poly bid 从 0.30 跳到 0.40 才触发</div>
-<div class="warn">⚠️ 太低（&lt;5¢）容易被假跳价骗入；太高（&gt;30¢）几乎不触发</div>
 </div>
 
 <div class="card">
 <div class="card-head">
 <div class="icon icon-levels">📊</div>
-<span class="param-name">Ask Levels</span><span class="param-id">ask_levels</span>
+<span class="param-name">Buy Limit</span><span class="param-id">buy_limit_cents</span>
 </div>
-<p class="desc">How many OKX ask levels to eat. 1 = only best ask, 5 = eat through 5 levels of depth.</p>
-<p class="desc-cn">吃单深度：在 OKX 上扫多少层 ask。1 = 只吃最优价，5 = 吃穿 5 层深度。层数越多买到的越多，但均价越高。</p>
-<div class="example">Ask Levels=3, asks=[0.11, 0.12, 0.13] → IOC 限价 0.13，可能全部以 0.11-0.13 成交</div>
+<p class="desc">Maximum OKX entry price, in cents.</p>
+<p class="desc-cn">买入上限：触发后 OKX 的实际买入价格不得超过这个值。</p>
+<div class="example">Buy Limit=50¢ → 只允许在 50¢ 或以下买入</div>
 </div>
 
 <div class="card">
@@ -75,10 +81,10 @@ h1{font-size:20px;font-weight:700;margin-bottom:8px;background:linear-gradient(1
 <div class="icon icon-timeout">⏰</div>
 <span class="param-name">Timeout</span><span class="param-id">timeout_secs</span>
 </div>
-<p class="desc">Max seconds to hold before forced exit. If sell order hasn't filled by then, bot tries to exit at best bid.</p>
-<p class="desc-cn">持仓超时：买入后如果 sell 订单在这个时间内没成交，自动尝试以 best bid 退出。如果 bid < 成本则停止并通知。</p>
-<div class="example">Timeout=10s → 买入后最多持有 10 秒，之后强制平仓</div>
-<div class="warn">⚠️ 太短可能来不及等 sell 成交；太长则价格回落风险增加</div>
+<p class="desc">Maximum holding time before the bot starts submitting IOC exits at the current best bid.</p>
+<p class="desc-cn">持仓超时：买入后到期即按当前 best bid 开始提交 IOC 退出；持仓期间不会预挂 GTC sell。无法确认完全退出时会保留全局锁，等待核对。</p>
+<div class="example">Timeout=10s → 买入 10 秒后开始退出流程</div>
+<div class="warn">⚠️ 太短可能频繁在流动性不足时退出；太长则增加价格回落风险</div>
 </div>
 
 <div class="card">
@@ -86,22 +92,29 @@ h1{font-size:20px;font-weight:700;margin-bottom:8px;background:linear-gradient(1
 <div class="icon icon-settle">🎯</div>
 <span class="param-name">Settle ms</span><span class="param-id">settle_ms</span>
 </div>
-<p class="desc">After detecting a jump, wait until Poly price stops moving for this many milliseconds before executing. Captures the full move.</p>
-<p class="desc-cn">稳定窗口：检测到跳价后，等待 Poly 价格稳定（不再变化）这么多毫秒再执行买入。用于捕捉完整的价格移动，避免只吃到一半。</p>
+<p class="desc">Optional quiet period after a jump; the timer restarts whenever the bid changes.</p>
+<p class="desc-cn">确认等待：检测到跳价后等待指定毫秒，再确认信号仍有效。</p>
 <div class="example">Settle=1000ms → 价格不再变化 1 秒后才执行</div>
 <div class="warn">⚠️ 太短（&lt;500ms）可能在价格还在动时就进场；太长（&gt;3000ms）OKX 可能已跟涨</div>
+</div>
+
+<div class="card">
+<div class="card-head"><div class="icon icon-levels">↔</div><span class="param-name">Window</span><span class="param-id">window_ms</span></div>
+<p class="desc-cn">价格跳幅的检测时间窗口。Threshold 必须在这个窗口内达到。</p>
+<div class="example">Window=150ms → 比较最近 150ms 内的 Poly bid 变化</div>
 </div>
 
 <div class="sep"></div>
 
 <div class="flow">
 <h2>⚙️ Execution Flow / 执行流程</h2>
-<div class="flow-step"><div class="flow-num">1</div><div class="flow-content"><b>Monitor</b> — WS 监听 Poly YES+NO bid 价格变化</div></div>
-<div class="flow-step"><div class="flow-num">2</div><div class="flow-content"><b>Jump Detected</b> — bid 跳幅 ≥ Threshold → 立即快照 OKX orderbook</div></div>
-<div class="flow-step"><div class="flow-num">3</div><div class="flow-content"><b>Settle</b> — 等待价格稳定 Settle ms → 验证跳幅仍有效</div></div>
-<div class="flow-step"><div class="flow-num">4</div><div class="flow-content"><b>Buy</b> — 用快照价格在 OKX 下 IOC 买单（吃 Ask Levels 层）</div></div>
-<div class="flow-step"><div class="flow-num">5</div><div class="flow-content"><b>Sell</b> — 以 Poly 新价挂 GTC 卖单</div></div>
-<div class="flow-step"><div class="flow-num">6</div><div class="flow-content"><b>Exit</b> — sell 成交 = 利润 ✅ | 超时 = 尝试 best bid 退出 | bid < cost = 停止 🚨</div></div>
+<div class="flow-step"><div class="flow-num">1</div><div class="flow-content"><b>Start</b> — 保存全部候选与参数，并锁定配置</div></div>
+<div class="flow-step"><div class="flow-num">2</div><div class="flow-content"><b>Monitor</b> — 同时监听每行指定的真实 Poly token</div></div>
+<div class="flow-step"><div class="flow-num">3</div><div class="flow-content"><b>Trigger</b> — 第一条有效信号取得全局锁，其他候选立即停止触发</div></div>
+<div class="flow-step"><div class="flow-num">4</div><div class="flow-content"><b>Trade</b> — 只交易该行明确映射的 OKX market 和 YES/NO asset</div></div>
+<div class="flow-step"><div class="flow-num">5</div><div class="flow-content"><b>Exit</b> — 只管理当前活动目标，完全退出后重新开始监控</div></div>
+<div class="flow-step"><div class="flow-num">6</div><div class="flow-content"><b>Restore</b> — 刷新页面后从服务端恢复候选、参数、锁和活动目标</div></div>
+<div class="flow-step"><div class="flow-num">7</div><div class="flow-content"><b>Stop</b> — 停止接收新信号并撤销 Sniper 自己未完成的入场单；不会把已持仓当作 Stop 操作自动卖出</div></div>
 </div>
 
 </body>

@@ -1,13 +1,15 @@
 """Account manager: manages OKX client instances and strategies per account."""
 import asyncio
 import logging
+from decimal import Decimal
 from typing import Dict, Optional
 
 from ..core.client import OKXOutcomesClient
+from ..core.price_utils import align_okx_price, as_decimal, price_to_cents
 from ..core.database import (
     get_accounts, get_account_decrypted, create_account, update_account,
     delete_account, get_available_proxies, get_used_proxies, PROXY_NODES,
-    get_global_config, set_global_config
+    get_global_config, set_global_config, get_sniper_state, save_sniper_state
 )
 from .manual_strategy_d import ManualStrategyD
 from .manual_strategy_s import ManualStrategyS
@@ -29,6 +31,7 @@ class AccountInstance:
         self.name = name
         self.client = client
         self.proxy_node = proxy_node
+        self.strategy_lifecycle_lock = asyncio.Lock()
         self.strategy_d = ManualStrategyD(client, account_id=account_id)
         self.strategy_s = ManualStrategyS(client, account_id=account_id)
         self.poly_monitor = PolyMonitor(client, account_id=account_id)
@@ -42,10 +45,15 @@ class AccountInstance:
         self.auto_rebalance.get_strategy_params = self._get_strategy_params
         self.auto_rebalance.restart_strategy = self._restart_strategy
         self.auto_rebalance.restart_monitor = self._restart_monitor
+        self.auto_rebalance.stop_strategy = self._stop_all_strategies
+        self.auto_rebalance.stop_monitor = self.poly_monitor.stop
         self.strategy_s.auto_rebalance = self.auto_rebalance
         # Sniper
         self.sniper = PolySniper(client, account_id=account_id)
         self.sniper.account_name = name
+        self.sniper.on_state_change = self._persist_sniper_snapshot
+        self._sniper_snapshot_corrupt = False
+        self._sniper_snapshot_write_blocked = False
         self.sniper_old = PolySniperOld(client, account_id=account_id)
         self.sniper_old.account_name = name
         self.strategy_d.auto_rebalance = self.auto_rebalance
@@ -57,73 +65,127 @@ class AccountInstance:
             self.sniper.notifier = notifier
             self.sniper_old.notifier = notifier
 
+    def _persist_sniper_snapshot(self, snapshot: Optional[dict] = None) -> bool:
+        if (
+            getattr(self, "_sniper_snapshot_corrupt", False)
+            or getattr(self, "_sniper_snapshot_write_blocked", False)
+        ):
+            logger.error(
+                "Refusing to overwrite unsafe sniper snapshot for %s",
+                self.account_id,
+            )
+            return False
+        try:
+            state = snapshot or self.sniper.get_state()
+            save_sniper_state(
+                self.account_id,
+                self.sniper.get_config(),
+                state,
+                bool(state.get("running")),
+            )
+            return True
+        except Exception as exc:
+            logger.error("Failed to persist sniper state for %s: %s", self.account_id, exc)
+            return False
+
     def _get_strategy_params(self) -> dict:
         """Return current strategy params for auto-rebalance."""
-        if self.strategy_s.state.running or self.strategy_s.state.asset_id:
+        monitor_strategy = getattr(self.poly_monitor, "_strategy_type", "")
+        use_s = self.strategy_s.state.running or (
+            not self.strategy_d.state.running and monitor_strategy == "manual-s"
+        )
+        use_d = self.strategy_d.state.running or (
+            not self.strategy_s.state.running and monitor_strategy == "manual-d"
+        )
+        if not use_s and not use_d:
+            s_started = getattr(self.strategy_s.state, "start_time", 0) or 0
+            d_started = getattr(self.strategy_d.state, "start_time", 0) or 0
+            use_s = bool(self.strategy_s.state.asset_id and s_started >= d_started)
+            use_d = bool(self.strategy_d.state.yes_asset_id and not use_s)
+
+        if use_s:
+            asset_id = str(self.strategy_s.state.asset_id or "")
+            buy_cents = as_decimal(self.strategy_s.state.price_a)
+            sell_cents = as_decimal(self.strategy_s.state.sell_price)
+            mode = self.strategy_s.state.mode or "classic"
             return {
                 "strategy_type": "manual-s",
                 "market_id": self.strategy_s.state.market_id,
                 "yes_asset_id": self.strategy_s.state.yes_asset_id,
                 "no_asset_id": self.strategy_s.state.no_asset_id,
-                "asset_id": self.strategy_s.state.asset_id,
+                "asset_id": asset_id,
                 "side": self.strategy_s.state.side,
-                "price_cents": self.strategy_s.state.price_a,
-                "mode": self.strategy_s.state.mode or "classic",
+                "price_cents": buy_cents,
+                "sell_price_cents": sell_cents,
+                "monitor_price_cents": sell_cents if mode == "bid-sell" else buy_cents,
+                "asset_cost_cents": {asset_id: buy_cents},
+                "mode": mode,
                 "stabilize_secs": self.strategy_s.state.stabilize_secs,
                 "scan_interval": self.strategy_s.state.scan_interval,
+                "start_time": self.strategy_s.state.start_time,
             }
-        elif self.strategy_d.state.running or self.strategy_d.state.yes_asset_id:
+        if use_d:
+            yes_asset_id = str(self.strategy_d.state.yes_asset_id or "")
+            no_asset_id = str(self.strategy_d.state.no_asset_id or "")
+            yes_cost = as_decimal(self.strategy_d.state.price_a)
+            no_cost = as_decimal(self.strategy_d.state.price_b)
             return {
                 "strategy_type": "manual-d",
                 "market_id": self.strategy_d.state.market_id,
-                "yes_asset_id": self.strategy_d.state.yes_asset_id,
-                "no_asset_id": self.strategy_d.state.no_asset_id,
-                "asset_id": self.strategy_d.state.yes_asset_id,
+                "yes_asset_id": yes_asset_id,
+                "no_asset_id": no_asset_id,
+                "asset_id": yes_asset_id,
                 "side": "yes",
-                "price_cents": self.strategy_d.state.price_a,
+                "price_cents": yes_cost,
+                "sell_price_cents": as_decimal(self.strategy_d.state.sell_a),
+                "monitor_price_cents": yes_cost,
+                "asset_cost_cents": {
+                    yes_asset_id: yes_cost,
+                    no_asset_id: no_cost,
+                },
                 "stabilize_secs": self.strategy_d.state.stabilize_secs,
                 "scan_interval": self.strategy_d.state.scan_interval,
+                "start_time": self.strategy_d.state.start_time,
             }
         return {}
 
-    async def _restart_strategy(self, new_price_cents: int, strategy_type: str):
+    async def _restart_strategy(self, new_price_cents: Decimal, strategy_type: str):
         """Restart strategy at new price (called by auto-rebalance)."""
         params = self._get_strategy_params()
         if not params:
-            return
+            raise RuntimeError("Cannot restart: strategy parameters are unavailable")
+        if params.get("strategy_type") != strategy_type:
+            raise RuntimeError("Cannot restart: strategy context changed")
+        new_reference = as_decimal(new_price_cents)
+        target_prices = self.auto_rebalance._target_prices(new_reference, params)
 
         if strategy_type == "manual-s":
+            if self.strategy_s.state.running or self.strategy_s.running:
+                raise RuntimeError("Cannot restart: Manual-S is already running")
             pct = self.strategy_s.state.position_pct if self.strategy_s.state.position_pct else 100
             scan_int = self.strategy_s.state.scan_interval if hasattr(self.strategy_s.state, 'scan_interval') else 10
             stab_secs = self.strategy_s.state.stabilize_secs if hasattr(self.strategy_s.state, 'stabilize_secs') else 10
             mode = self.strategy_s.state.mode or "classic"
-            old_spread = self.strategy_s.state.sell_price - self.strategy_s.state.price_a if self.strategy_s.state.sell_price > 0 else 1
-
-            if mode == "bid-sell":
-                # new_price_cents = stable poly bid = new SELL level
-                new_sell = new_price_cents
-                new_buy = new_price_cents - old_spread
-                if new_buy < 4:
-                    new_buy = 4
-                    new_sell = new_buy + old_spread
-            else:
-                # classic: new_price_cents = stable poly bid = new BUY level
-                new_buy = new_price_cents
-                new_sell = new_price_cents + old_spread
+            new_buy = target_prices["buy"]
+            new_sell = target_prices["sell"]
 
             await self.strategy_s.start(
                 market_id=params["market_id"],
                 yes_asset_id=params["yes_asset_id"],
                 no_asset_id=params["no_asset_id"],
                 side=params["side"],
-                price_a=float(new_buy),
-                sell_price=float(new_sell),
+                price_a=format(new_buy, "f"),
+                sell_price=format(new_sell, "f"),
                 mode=mode,
                 position_pct=pct,
                 scan_interval=scan_int,
                 stabilize_secs=stab_secs,
             )
+            if not self.strategy_s.state.running or not self.strategy_s.running:
+                raise RuntimeError("Manual-S restart did not enter running state")
         elif strategy_type == "manual-d":
+            if self.strategy_d.state.running or self.strategy_d.running:
+                raise RuntimeError("Cannot restart: Manual-D is already running")
             pct = self.strategy_d.state.position_pct if self.strategy_d.state.position_pct else 100
             scan_int = self.strategy_d.state.scan_interval if hasattr(self.strategy_d.state, 'scan_interval') else 10
             stab_secs = self.strategy_d.state.stabilize_secs if hasattr(self.strategy_d.state, 'stabilize_secs') else 10
@@ -131,14 +193,24 @@ class AccountInstance:
                 market_id=params["market_id"],
                 yes_asset_id=params["yes_asset_id"],
                 no_asset_id=params["no_asset_id"],
-                price_a=float(new_price_cents),
+                price_a=format(target_prices["buy"], "f"),
                 position_pct=pct,
                 scan_interval=scan_int,
                 stabilize_secs=stab_secs,
             )
+            if not self.strategy_d.state.running or not self.strategy_d.running:
+                raise RuntimeError("Manual-D restart did not enter running state")
+        else:
+            raise RuntimeError(f"Unsupported strategy type: {strategy_type}")
+        return {"ok": True}
 
-    async def _restart_monitor(self, reference_price: float, poly_token_id: str):
+    async def _restart_monitor(self, reference_price: Decimal, poly_token_id: str):
         """Restart monitor at new reference price."""
+        if getattr(self.poly_monitor, "running", False):
+            raise RuntimeError("Cannot restart monitor: another monitor is already running")
+        depth_threshold = self.poly_monitor.state.depth_threshold
+        if getattr(self.poly_monitor, "_task", None) is not None:
+            await self.poly_monitor.stop()
         # Reset triggered state
         self.poly_monitor.state.triggered = False
         self.poly_monitor.state.trigger_reason = ""
@@ -146,15 +218,31 @@ class AccountInstance:
         self.poly_monitor.state.enabled = False
         # Get strategy context for the monitor
         params = self._get_strategy_params()
-        strategy_type = params.get("strategy_type", "manual-s") if params else "manual-s"
-        price_cents = params.get("price_cents", round(reference_price * 100)) if params else round(reference_price * 100)
+        if not params:
+            raise RuntimeError("Cannot restart monitor: strategy parameters are unavailable")
+        strategy_type = params["strategy_type"]
+        price_cents = price_to_cents(
+            align_okx_price(as_decimal(reference_price), "buy")
+        )
 
         result = await self.poly_monitor.start(
             poly_token_id=poly_token_id,
-            reference_price=reference_price,
+            reference_price=format(as_decimal(reference_price), "f"),
+            depth_threshold=depth_threshold,
         )
-        if result.get("ok"):
-            self.poly_monitor.set_strategy_context(strategy_type, price_cents, params.get("asset_id", "") if params else "", mode=params.get("mode", "classic") if params else "classic")
+        if not isinstance(result, dict) or not result.get("ok"):
+            raise RuntimeError(
+                (result or {}).get("error", "Poly monitor failed to restart")
+                if isinstance(result, dict)
+                else "Poly monitor failed to restart"
+            )
+        self.poly_monitor.set_strategy_context(
+            strategy_type,
+            price_cents,
+            params.get("asset_id", ""),
+            mode=params.get("mode", "classic"),
+        )
+        return result
 
     async def _stop_all_strategies(self):
         """Stop all running strategies (called by monitor on trigger)."""
@@ -162,20 +250,21 @@ class AccountInstance:
             await self.strategy_d.stop()
         if self.strategy_s.running:
             await self.strategy_s.stop()
-        # Clear DB poly state so restart doesn't resurrect stopped strategies
-        try:
-            from ..core.database import set_global_config
-            import json
-            set_global_config(f"poly_state_{self.account_id}", json.dumps({"running": False}))
-        except Exception:
-            pass
 
     async def close(self, cancel_orders: bool = True):
+        sniper_was_running = self.sniper.running
+        # A background rebalance can otherwise outlive the client and restart
+        # strategies or submit orders after account shutdown/removal.
+        if hasattr(self, "auto_rebalance") and self.auto_rebalance:
+            await self.auto_rebalance.cancel()
         if self.strategy_d.running:
             await self.strategy_d.stop()
         if self.strategy_s.running:
             await self.strategy_s.stop()
-        if self.poly_monitor.running:
+        monitor_enabled = bool(
+            getattr(getattr(self.poly_monitor, "state", None), "enabled", False)
+        )
+        if self.poly_monitor.running or monitor_enabled:
             await self.poly_monitor.stop()
         if self.sniper.running:
             await self.sniper.stop()
@@ -188,42 +277,47 @@ class AccountInstance:
                 await self.client.cancel_all()
             except Exception:
                 pass
+        elif sniper_was_running:
+            snapshot = self.sniper.get_state()
+            snapshot["running"] = True
+            self._persist_sniper_snapshot(snapshot)
         await self.client.close()
 
-
+    def install_client(self, client: OKXOutcomesClient) -> OKXOutcomesClient:
+        """Atomically redirect every strategy reference to a prepared client."""
+        previous = self.client
+        self.client = client
+        self.strategy_d.client = client
+        self.strategy_s.client = client
+        self.poly_monitor.client = client
+        self.auto_rebalance.client = client
+        self.sniper.client = client
+        self.sniper_old.client = client
+        return previous
 
     async def reload_client(self):
-        """Reload OKX client with fresh credentials from DB."""
-        from ..core.database import get_account_decrypted, PROXY_NODES
+        """Build and install a fresh client before closing the previous one."""
         acc = get_account_decrypted(self.account_id)
         if not acc:
-            return
-        proxy_node = acc.get("proxy_node", "JP2")
-        from ..core.client import OKXOutcomesClient
-        if self.client and hasattr(self.client, 'close'):
-            try:
-                await self.client.close()
-            except Exception:
-                pass
-        self.client = OKXOutcomesClient(
+            raise RuntimeError("Account not found")
+        if hasattr(self, "auto_rebalance") and self.auto_rebalance:
+            await self.auto_rebalance.cancel()
+        replacement = OKXOutcomesClient(
             api_key=acc["api_key"],
             secret_key=acc["secret_key"],
             passphrase=acc["passphrase"],
             agent_private_key=acc["agent_private_key"],
             base_url=acc.get("base_url", "https://us.okx.com"),
-            proxy_node=proxy_node,
+            proxy_node=acc.get("proxy_node", "JP2"),
         )
-        # Propagate to strategies
-        if hasattr(self, 'strategy_d'):
-            self.strategy_d.client = self.client
-        if hasattr(self, 'strategy_s'):
-            self.strategy_s.client = self.client
-        if hasattr(self, 'poly_monitor'):
-            self.poly_monitor.client = self.client
-        if hasattr(self, 'sniper') and self.sniper:
-            self.sniper.client = self.client
-        if hasattr(self, 'sniper_old') and self.sniper_old:
-            self.sniper_old.client = self.client
+        if not replacement.signer.address:
+            raise ValueError("Invalid agent private key")
+        previous = self.install_client(replacement)
+        if previous and hasattr(previous, "close"):
+            try:
+                await previous.close()
+            except Exception as exc:
+                logger.warning("Failed to close previous client for %s: %s", self.account_id, exc)
 
 class AccountManager:
     """Manages all account instances."""
@@ -272,6 +366,40 @@ class AccountManager:
             notifier=self.notifier,
         )
         self.instances[acc["id"]] = instance
+        saved_sniper = get_sniper_state(acc["id"])
+        if saved_sniper:
+            if saved_sniper.get("corrupt"):
+                instance._sniper_snapshot_corrupt = True
+                instance._sniper_snapshot_write_blocked = True
+                instance.sniper.state.status = "error"
+                instance.sniper.state.locked = True
+                logger.error(
+                    "Sniper snapshot for %s is corrupt (%s); preserving the database row and blocking writes",
+                    acc["id"],
+                    ", ".join(saved_sniper.get("corrupt_fields") or ["unknown field"]),
+                )
+                return instance
+            restore_state = dict(saved_sniper.get("runtime") or {})
+            restore_state.update(saved_sniper.get("config") or {})
+            result = await instance.sniper.restore(
+                restore_state,
+                resume=bool(saved_sniper.get("running")),
+            )
+            if not result.get("ok"):
+                instance.sniper.state.status = "error"
+                instance.sniper.state.locked = True
+                semantic_failure = not result.get("needs_reconciliation", False)
+                if semantic_failure:
+                    # Parsing/config validation failed before a trustworthy
+                    # runtime could be restored. Preserve the original row.
+                    instance._sniper_snapshot_write_blocked = True
+                logger.error(
+                    "Sniper restore for %s requires attention: %s",
+                    acc["id"],
+                    result.get("error", "unknown error"),
+                )
+                return instance
+            instance._persist_sniper_snapshot()
         return instance
 
     async def add_account(self, name: str, api_key: str, secret_key: str,
@@ -339,11 +467,28 @@ class AccountManager:
                 if isinstance(positions, dict) and str(positions.get("code", "")) == "0":
                     raw_p = positions.get("data", {})
                     pos_l = raw_p.get("list", []) if isinstance(raw_p, dict) else raw_p if isinstance(raw_p, list) else []
-                    total_positions += len([p for p in pos_l if float(p.get("pos", "0")) != 0])
+                    for position in pos_l:
+                        try:
+                            if as_decimal(position.get("size", "0")) != 0:
+                                total_positions += 1
+                        except ValueError:
+                            continue
             except Exception:
                 pass
 
-            if inst.strategy_d.running or inst.strategy_s.running:
+            sniper = getattr(inst, "sniper", None)
+            poly_monitor = getattr(inst, "poly_monitor", None)
+            if (
+                getattr(getattr(inst, "strategy_d", None), "running", False)
+                or getattr(getattr(inst, "strategy_s", None), "running", False)
+                or getattr(sniper, "running", False)
+                or getattr(getattr(sniper, "state", None), "locked", False)
+                or getattr(sniper, "_persistence_failed", False)
+                or getattr(getattr(inst, "sniper_old", None), "running", False)
+                or getattr(poly_monitor, "running", False)
+                or getattr(getattr(poly_monitor, "state", None), "enabled", False)
+                or getattr(getattr(inst, "auto_rebalance", None), "_rebalancing", False)
+            ):
                 running_count += 1
 
         return {

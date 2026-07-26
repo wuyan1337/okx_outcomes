@@ -3,27 +3,38 @@
 Logic:
 - User picks either Yes OR No side and sets price a.
 - Buy {side}@a¢
-- When Buy fills → post Sell {side}@(a+1)¢
+- When Buy fills → post the configured Sell for the same outcome asset
 - When Sell fills → balance freed → re-deploy
-- Same 1¢ spread profit per round-trip, but only one side.
+- The default Sell target is one cent above the normalized Buy price.
 
 Persistence: pending_sells saved to JSON file to survive restarts.
 """
+from __future__ import annotations
+
 import asyncio
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 import json
 import logging
-import os
-from typing import Optional, Set, Dict
+from pathlib import Path
+from typing import TYPE_CHECKING, Optional, Set, Dict
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from ..core.client import OKXOutcomesClient
+from ..core.price_utils import (
+    align_cents_for_okx,
+    as_decimal,
+    format_okx_cents,
+    price_to_cents,
+)
 from .size_utils import normalize_size_str
+
+if TYPE_CHECKING:
+    from ..core.client import OKXOutcomesClient
 
 logger = logging.getLogger(__name__)
 
 MAX_CONSECUTIVE_FAILURES = 5
-SELLS_FILE_S = "data/pending_sells_s_{account_id}.json"
+SELLS_FILE_S = Path(__file__).resolve().parents[2] / "data" / "pending_sells_s_{account_id}.json"
 
 
 @dataclass
@@ -31,14 +42,16 @@ class ManualStateS:
     running: bool = False
     mode: str = "classic"     # "classic" (MS) or "bid-sell" (BS)
     side: str = ""            # "yes" or "no"
-    price_a: int = 0          # Buy price in cents
-    sell_price: int = 0       # Sell price
+    price_a: float = 0.0
+    sell_price: float = 0.0
     market_id: str = ""
     yes_asset_id: str = ""
     no_asset_id: str = ""
     asset_id: str = ""        # The one we're trading (yes or no asset)
     pending_sells: Dict[str, float] = field(default_factory=dict)
     posted_sells: Set[str] = field(default_factory=set)  # sell order IDs we posted
+    sell_retry_counts: Dict[str, int] = field(default_factory=dict)
+    sell_retry_after: Dict[str, float] = field(default_factory=dict)
     start_time: int = 0
     total_sells_posted: int = 0
     total_profit: float = 0.0
@@ -63,15 +76,15 @@ class ManualStrategyS:
         self.notifier = None
         self.running = False
         self.cycles = 0
-        self.auto_rebalance = None  # Set by AccountInstance for cost layer tracking
-        self._sells_file = SELLS_FILE_S.format(account_id=account_id)
+        self.auto_rebalance = None
+        self._sells_file = Path(str(SELLS_FILE_S).format(account_id=account_id))
         self._load_pending_sells()
 
     def _load_pending_sells(self):
         """Load pending_sells from disk."""
         try:
-            if os.path.exists(self._sells_file):
-                with open(self._sells_file, "r") as f:
+            if self._sells_file.exists():
+                with open(self._sells_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 raw = data.get("oids", [])
                 if isinstance(raw, dict):
@@ -86,8 +99,8 @@ class ManualStrategyS:
     def _save_pending_sells(self):
         """Persist pending_sells to disk."""
         try:
-            os.makedirs(os.path.dirname(self._sells_file), exist_ok=True)
-            with open(self._sells_file, "w") as f:
+            self._sells_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._sells_file, "w", encoding="utf-8") as f:
                 json.dump({
                     "oids": dict(self.state.pending_sells),
                     "start_time": self.state.start_time,
@@ -108,10 +121,18 @@ class ManualStrategyS:
         if self.state.running:
             return
 
-        a = int(price_a)
-        if a < 4 or a > 95:
-            self.log(f"价格 {a} 超出范围 (4-95)", "ERROR")
-            return
+        mode = str(mode).strip().lower()
+        if mode not in ("classic", "bid-sell"):
+            raise ValueError("mode must be classic or bid-sell")
+
+        a, actual_sell = self._derive_prices(price_a, sell_price)
+        if mode == "bid-sell":
+            if a < Decimal("0.1"):
+                raise ValueError("bid-sell buy price must be at least 0.1¢")
+            if actual_sell - a != Decimal("1"):
+                raise ValueError(
+                    "bid-sell requires an executable sell-buy spread of exactly 1.0¢"
+                )
 
         side = side.lower()
         if side not in ("yes", "no"):
@@ -125,8 +146,8 @@ class ManualStrategyS:
         self.state.no_asset_id = no_asset_id
         self.state.side = side
         self.state.asset_id = yes_asset_id if side == "yes" else no_asset_id
-        self.state.price_a = a
-        self.state.sell_price = int(sell_price) if sell_price > 0 else a + 1
+        self.state.price_a = float(a)
+        self.state.sell_price = float(actual_sell)
         self.state.mode = mode
         self.state.position_pct = max(1, min(100, position_pct))
         self.state.scan_interval = max(0.3, min(120.0, float(scan_interval)))
@@ -138,7 +159,7 @@ class ManualStrategyS:
         self._save_pending_sells()
 
         label = "Yes" if side == "yes" else "No"
-        self.log(f"Manual-S started: Buy {label}@{a}¢ → Sell {label}@{a+1}¢")
+        self.log(f"Manual-S started: Buy {label}@{a}¢ → Sell {label}@{actual_sell}¢")
 
         # Pre-seed notified_fills with existing closed orders so we don't spam old fills on start
         self._main_task = asyncio.create_task(self._seed_then_run())
@@ -282,19 +303,27 @@ class ManualStrategyS:
                 new_fill = filled - prev_processed
                 if new_fill < 0.01:
                     continue
+                if self.state.sell_retry_after.get(oid, 0.0) > asyncio.get_running_loop().time():
+                    continue
 
-                # Use configured sell price
                 sell_cents = self.state.sell_price
-                sell_price = self._cents_to_price_str(sell_cents)
+                sell_price = self._cents_to_price_str(sell_cents, "sell")
                 label = "Yes" if self.state.side == "yes" else "No"
 
                 size_str = f"{new_fill:.10f}".rstrip("0").rstrip(".")
-                # Minimum order check: price * size must >= 1 xp
-                sell_notional = (sell_cents / 100.0) * new_fill
-                if sell_notional < 1.0:
-                    # Accumulate - don't post undersized sell, wait for more fills
-                    self.log(f"Sell too small: {new_fill:.0f} x {sell_cents}\u00a2 = {sell_notional:.2f} xp < 1 xp, deferring")
-                    continue
+                sell_notional = as_decimal(sell_cents) / Decimal("100") * as_decimal(new_fill)
+                if sell_notional < Decimal("1"):
+                    if await self._is_full_available_position(self.state.asset_id, new_fill):
+                        self.log(
+                            f"Sell {label} @{sell_price} x{size_str} uses OKX sell-all exception"
+                        )
+                    else:
+                        self._defer_failed_sell(
+                            oid,
+                            label,
+                            f"{size_str} x {sell_cents}\u00a2 = {sell_notional:.2f} xp below 1 xp minimum",
+                        )
+                        continue
                 sell_resp = await self.client.place_order(
                     asset_id=self.state.asset_id,
                     side="sell",
@@ -303,14 +332,10 @@ class ManualStrategyS:
                     tif="gtc",
                 )
 
-                # OKX sometimes rejects freshly filled decimal residue with generic
-                # "Invalid request parameters" (precision/oversell by tiny float).
-                # Retry once with whole shares floored; better to hedge most exposure
-                # than leave a naked position and spam Telegram.
                 if str(sell_resp.get("code", "")) != "0" and "Invalid request parameters" in str(sell_resp.get("message", "")):
                     safe_units = int(new_fill)
-                    safe_notional = (sell_cents / 100.0) * safe_units
-                    if safe_units >= 1 and safe_notional >= 1.0 and str(safe_units) != size_str:
+                    safe_notional = as_decimal(sell_cents) / Decimal("100") * safe_units
+                    if safe_units >= 1 and safe_notional >= Decimal("1") and str(safe_units) != size_str:
                         self.log(f"Sell {label} 参数失败，降级整数重试: {size_str} -> {safe_units}")
                         sell_resp = await self.client.place_order(
                             asset_id=self.state.asset_id,
@@ -320,31 +345,39 @@ class ManualStrategyS:
                             tif="gtc",
                         )
                         if str(sell_resp.get("code", "")) == "0":
-                            # Mark only the amount actually posted; decimal residue will be
-                            # retried later once more fills accumulate above min notional.
                             filled = prev_processed + safe_units
                             new_fill = float(safe_units)
                             size_str = str(safe_units)
 
                 if str(sell_resp.get("code", "")) == "0":
                     self.state.pending_sells[oid] = filled
+                    self.state.sell_retry_counts.pop(oid, None)
+                    self.state.sell_retry_after.pop(oid, None)
                     sell_oid = sell_resp.get("data", {}).get("oid", "") or sell_resp.get("data", {}).get("orderId", "")
                     if sell_oid:
                         self.state.posted_sells.add(sell_oid)
                     self.state.total_sells_posted += 1
                     self.state.consecutive_failures = 0
                     changed = True
-                    # Track in cost layers for auto-rebalance
                     if self.auto_rebalance:
-                        self.auto_rebalance.add_to_layer(self.state.price_a, new_fill)
+                        buy_cents = (
+                            price_to_cents(o["price"])
+                            if o.get("price")
+                            else as_decimal(self.state.price_a)
+                        )
+                        self.auto_rebalance.add_to_layer(
+                            self.state.asset_id,
+                            buy_cents,
+                            new_fill,
+                            market_id=self.state.market_id,
+                        )
                     self.log(f"挂 Sell {label} @{sell_price} x{size_str}")
                     if self.notifier:
                         asyncio.create_task(self.notifier.send(f"[{self.account_name}] ✅ Buy {label} 成交 x{size_str} → 挂 Sell @{sell_price}"))
                 else:
-                    msg = sell_resp.get("message", "")
+                    msg = str(sell_resp.get("message") or sell_resp.get("msg") or "unknown error")
                     if "Insufficient" in msg or "Minimum" in msg:
-                        self.state.pending_sells[oid] = filled
-                        changed = True
+                        self._defer_failed_sell(oid, label, msg)
                     else:
                         self._record_failure(f"Sell {label} 失败: {msg}")
                         if self.notifier:
@@ -410,10 +443,13 @@ class ManualStrategyS:
                 self.state.total_profit += profit
                 # Remove from cost layers (sell filled = position closed)
                 if self.auto_rebalance:
-                    self.auto_rebalance.remove_from_highest_layer(new_sell_fill)
+                    self.auto_rebalance.remove_from_highest_layer(
+                        self.state.asset_id,
+                        new_sell_fill,
+                        market_id=self.state.market_id,
+                    )
                 if status == "FILLED":
                     self.state.posted_sells.discard(oid)
-                    pass  # keep in tracked to prevent re-notify
                 label = "Yes" if self.state.side == "yes" else "No"
                 self.log(f"\U0001f4b0 Sell {label} \u6210\u4ea4 x{normalize_size_str(new_sell_fill)} @{price} | +{profit:.2f} xp")
                 if self.notifier:
@@ -477,39 +513,35 @@ class ManualStrategyS:
             balance = await self.client.get_balance()
             available = self._parse_available(balance)
 
-            # Calculate how much is already locked in open BUY orders
-            locked_in_buys = 0.0
+            locked_in_buys = Decimal("0")
             try:
                 resp_open = await self.client.get_orders(status="open")
                 if str(resp_open.get("code", "")) == "0":
                     for o in resp_open.get("data", {}).get("list", []):
                         if o.get("side", "").upper() == "BUY" and o.get("assetId", "") == self.state.asset_id:
-                            sz = float(o.get("size", "0") or "0") - float(o.get("filledSize", "0") or "0")
-                            px = float(o.get("price", "0") or "0")
+                            sz = as_decimal(o.get("size", "0") or "0") - as_decimal(o.get("filledSize", "0") or "0")
+                            px = as_decimal(o.get("price", "0") or "0")
                             locked_in_buys += sz * px
             except Exception:
                 pass
 
-            # total_capital = available + locked; max to deploy = total * pct%
             total_capital = available + locked_in_buys
-            max_deploy = total_capital * self.state.position_pct / 100.0
-            # How much more we can deploy = max - already deployed
+            max_deploy = total_capital * self.state.position_pct / Decimal("100")
             remaining_budget = max_deploy - locked_in_buys
             if remaining_budget <= 0:
                 return
 
-            cost_per_unit = self.state.price_a / 100.0
-            units = int(remaining_budget / cost_per_unit)
+            cost_per_unit = as_decimal(self.state.price_a) / Decimal("100")
+            units = int((remaining_budget / cost_per_unit).to_integral_value(rounding=ROUND_FLOOR))
 
             if units < 1:
                 return
 
-            # Min order = 1 xp notional
-            min_units = max(1, int(1.0 / cost_per_unit) + 1)
+            min_units = max(1, int((Decimal("1") / cost_per_unit).to_integral_value(rounding=ROUND_CEILING)))
             if units < min_units:
                 return
 
-            price_str = self._cents_to_price_str(self.state.price_a)
+            price_str = self._cents_to_price_str(self.state.price_a, "buy")
             label = "Yes" if self.state.side == "yes" else "No"
 
             resp = await self.client.place_order(
@@ -535,6 +567,61 @@ class ManualStrategyS:
 
         except Exception as e:
             self._record_failure(f"Deploy 异常: {e}")
+
+    def _defer_failed_sell(self, oid: str, label: str, message: str):
+        attempt = self.state.sell_retry_counts.get(oid, 0) + 1
+        delay = min(60, 2 ** min(attempt, 6))
+        self.state.sell_retry_counts[oid] = attempt
+        self.state.sell_retry_after[oid] = asyncio.get_running_loop().time() + delay
+        warning = (
+            f"Sell {label} 失败 ({attempt}): {message}; 裸仓风险，"
+            f"{delay}s 后重试"
+        )
+        self.log(warning, "ERROR")
+        if self.notifier:
+            asyncio.create_task(self.notifier.send(f"[{self.account_name}] ⚠️ {warning}"))
+
+    async def _is_full_available_position(self, asset_id: str, quantity) -> bool:
+        """Confirm the order would sell the asset's entire unfrozen position."""
+        try:
+            response = await self.client.get_positions(
+                status="open",
+                market_id=self.state.market_id or None,
+            )
+            if str(response.get("code", "")) != "0":
+                raise RuntimeError(
+                    response.get("message") or response.get("msg") or "position query failed"
+                )
+            raw = response.get("data") or {}
+            positions = raw.get("list", []) if isinstance(raw, dict) else raw
+            if not isinstance(positions, list):
+                raise ValueError("invalid position response")
+
+            total = Decimal("0")
+            available = Decimal("0")
+            matched = False
+            for position in positions:
+                position_asset_id = str(position.get("assetId") or "")
+                if not position_asset_id:
+                    market_id = str(position.get("marketId") or "")
+                    token_index = str(position.get("tokenIndex") or "")
+                    token_name = str(position.get("tokenName") or "").upper()
+                    if market_id:
+                        is_no = token_index == "2" or token_name == "NO"
+                        position_asset_id = f"{market_id}{'100' if is_no else '000'}"
+                if position_asset_id != str(asset_id):
+                    continue
+                if "size" not in position or "availableSize" not in position:
+                    return False
+                matched = True
+                total += as_decimal(position["size"])
+                available += as_decimal(position["availableSize"])
+
+            requested = as_decimal(quantity)
+            return matched and requested > 0 and requested == available == total
+        except Exception as exc:
+            self.log(f"Sell-all position check failed: {exc}", "WARN")
+            return False
 
     # ─── Failure tracking ───
 
@@ -568,18 +655,25 @@ class ManualStrategyS:
         except asyncio.CancelledError:
             pass
 
-    def _parse_available(self, balance_resp: dict) -> float:
+    def _parse_available(self, balance_resp: dict) -> Decimal:
         if str(balance_resp.get("code", "")) != "0":
-            return 0.0
+            return Decimal("0")
         data = balance_resp.get("data", [])
         for entry in data:
             if entry.get("oddsType") == "points":
-                return float(entry.get("available", "0"))
-        return 0.0
+                return as_decimal(entry.get("available", "0"))
+        return Decimal("0")
 
-    def _cents_to_price_str(self, cents: int) -> str:
-        price = cents / 100.0
-        return f"{price:.2f}" if 4 <= cents <= 96 else f"{price:.3f}"
+    @staticmethod
+    def _derive_prices(price_a, sell_price=0):
+        a = align_cents_for_okx(price_a, "buy")
+        requested_sell = as_decimal(sell_price)
+        if requested_sell <= 0:
+            requested_sell = a + Decimal("1")
+        return a, align_cents_for_okx(requested_sell, "sell")
+
+    def _cents_to_price_str(self, cents, side="nearest") -> str:
+        return format_okx_cents(cents, side)
 
     def get_state(self) -> dict:
         return {

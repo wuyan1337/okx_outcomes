@@ -1,15 +1,16 @@
 """SQLite database for multi-account management."""
 import sqlite3
 import json
-import hashlib
 from pathlib import Path
 from typing import Optional
 from cryptography.fernet import Fernet
-import base64
+
+from .proxy_nodes import PROXY_NODES
 
 DB_PATH = Path(__file__).parent.parent.parent / "data" / "accounts.db"
 
-# Derive encryption key from a fixed seed (stored alongside DB - this protects at-rest only)
+# The generated key is stored beside the database; this is local at-rest
+# protection, not a replacement for host-level access control.
 _KEY_FILE = Path(__file__).parent.parent.parent / "data" / ".key"
 
 
@@ -76,25 +77,18 @@ def init_db():
             key TEXT PRIMARY KEY,
             value TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS sniper_state (
+            account_id TEXT PRIMARY KEY,
+            config_json TEXT NOT NULL DEFAULT '{}',
+            runtime_json TEXT NOT NULL DEFAULT '{}',
+            running INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+        );
     """)
     conn.commit()
     conn.close()
-
-
-# ─── Proxy Nodes ───
-
-PROXY_NODES = {
-    "JP2": {"label": "JP2 (Tokyo2 - Local)", "host": None, "port": None},  # Direct, no proxy
-    "JP1": {"label": "JP1 (Tokyo1)", "host": "168.138.196.214", "port": 9111},
-    "SYD1": {"label": "SYD1 (Q3 Main)", "host": "192.9.160.224", "port": 9111},
-    "SYD2": {"label": "SYD2 (N Main)", "host": "161.33.232.81", "port": 9111},
-    "SG1": {"label": "SG1 (Singapore)", "host": "13.213.17.198", "port": 9111},
-    "K1": {"label": "K1 (Korea)", "host": "13.125.182.63", "port": 9111},
-    "JP3": {"label": "JP3 (Tokyo3)", "host": "3.112.202.198", "port": 9111},
-    "JP4": {"label": "JP4 (AWS Tokyo)", "host": "127.0.0.1", "port": 9114},
-    "JP5": {"label": "JP5 (AWS Tokyo)", "host": "127.0.0.1", "port": 9115},
-    "OSAKA": {"label": "OSAKA (217.142.250.144)", "host": "217.142.250.144", "port": 9111},
-}
 
 
 def get_used_proxies() -> set:
@@ -109,7 +103,12 @@ def get_available_proxies() -> list:
     """Return proxy nodes not yet assigned to an account."""
     used = get_used_proxies()
     return [
-        {"id": k, "label": v["label"]}
+        {
+            "id": k,
+            "label": v["label"],
+            "location": v["location"],
+            "route": v["route"],
+        }
         for k, v in PROXY_NODES.items()
         if k not in used
     ]
@@ -184,10 +183,14 @@ def update_account(account_id: str, **kwargs) -> bool:
         values.append(v)
     sets.append("updated_at = datetime('now')")
     values.append(account_id)
-    conn.execute(f"UPDATE accounts SET {', '.join(sets)} WHERE id = ?", values)
-    conn.commit()
-    conn.close()
-    return True
+    try:
+        cursor = conn.execute(
+            f"UPDATE accounts SET {', '.join(sets)} WHERE id = ?", values
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
 
 
 def delete_account(account_id: str) -> bool:
@@ -215,3 +218,72 @@ def set_global_config(key: str, value: str):
     )
     conn.commit()
     conn.close()
+
+
+def get_sniper_state(account_id: str) -> Optional[dict]:
+    """Return the persisted sniper configuration and last runtime snapshot."""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT config_json, runtime_json, running, updated_at FROM sniper_state WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    corrupt_fields = []
+
+    def _load_object(field_name: str) -> dict:
+        raw_value = row[field_name]
+        if not raw_value:
+            corrupt_fields.append(field_name)
+            return {}
+        try:
+            value = json.loads(raw_value)
+        except (TypeError, json.JSONDecodeError):
+            corrupt_fields.append(field_name)
+            return {}
+        if not isinstance(value, dict):
+            corrupt_fields.append(field_name)
+            return {}
+        return value
+
+    config_data = _load_object("config_json")
+    runtime_data = _load_object("runtime_json")
+    return {
+        "config": config_data,
+        "runtime": runtime_data,
+        "running": bool(row["running"]),
+        "updated_at": row["updated_at"],
+        "corrupt": bool(corrupt_fields),
+        "corrupt_fields": corrupt_fields,
+    }
+
+
+def save_sniper_state(account_id: str, config_data: dict, runtime_data: dict,
+                       running: bool) -> None:
+    """Atomically persist a sniper snapshot for page and process recovery."""
+    config_json = json.dumps(
+        config_data or {}, ensure_ascii=False, separators=(",", ":")
+    )
+    runtime_json = json.dumps(
+        runtime_data or {}, ensure_ascii=False, separators=(",", ":")
+    )
+    conn = get_db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO sniper_state (account_id, config_json, runtime_json, running, updated_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(account_id) DO UPDATE SET
+                config_json = excluded.config_json,
+                runtime_json = excluded.runtime_json,
+                running = excluded.running,
+                updated_at = datetime('now')
+            """,
+            (account_id, config_json, runtime_json, 1 if running else 0),
+        )
+        conn.commit()
+    finally:
+        conn.close()

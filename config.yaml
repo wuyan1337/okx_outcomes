@@ -1,4 +1,5 @@
 server:
+  base_path: ''
   host: 127.0.0.1
   password: '114514'
   port: 8899
