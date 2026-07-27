@@ -232,6 +232,7 @@
 
 - API：`backend/app.py` 的 `sniper_start()`、`sniper_stop()`、`sniper_status()`。
 - 引擎：`backend/services/poly_sniper.py` 的 `PolySniper`。
+- Dashboard：`frontend/dashboard.html` 的 `viewSniperTarget()`、`syncSniperBookView()`、`syncSniperBookBinding()`。
 - 主要方法：`start()`、`_process_bid()`、`_try_trigger()`、`_run_trigger()`、`_execute_entry()`、`_holding_loop()`、`_exit_position()`、`stop()`、`restore()`。
 
 ### 7.1 每一行 Target 表示什么
@@ -241,6 +242,11 @@
 3. 后端保存 `poly_token_id → marketId + yes_asset_id + no_asset_id + side` 的完整映射。
 4. 同一个 Poly token 不能在两行重复；缺 market、缺 side asset、ID 重复或 budget 非正数都会拒绝启动。
 5. 新版不会根据一个市场自动派生“同时狙击 YES 和 NO”；要监听哪个 outcome，必须单独加一行。
+6. Dashboard 每行的 `View Book` 只选择当前显示的 Poly + OKX pair，不改变 target 配置、监听 token、active target 或交易判断。
+7. Dashboard 只有一个 viewer WebSocket；`backend/ws_book.py` 只转发当前查看 pair，真实多 target 监听由 `PolySniper` 自己的一条 Poly WebSocket 完成。
+8. monitoring 时可以查看任意 target；active target 出现后 viewer 每次状态同步都固定 active 行，其他 `View Book` 禁用。
+9. 同一页面会话内完全退出后恢复触发前查看行；浏览器刷新后 active 仍从后端恢复，但纯前端查看偏好不写入 Sniper SQLite ledger。
+10. Sniper idle 时不会从 Manual、Bid-Sell 或 Sniper Old 抢共享 Order Book；Sniper running 时其他页面的市场选择也不能覆盖 Sniper viewer。
 
 ### 7.2 行情检测顺序
 
@@ -250,19 +256,20 @@
 4. 变化乘以 100 得到 cent jump；低于 `threshold_cents` 只记录 `below_threshold`，继续监听。
 5. 达到阈值后执行 bounce filter：若当前价仍低于窗口高水位的 70%，判定为大跌后的噪音反弹，不下单。
 6. 通过过滤的候选生成 `trace_id` 并尝试取得全局 trigger lock。
+7. 判断使用原始 `Decimal` best bid，不先按 Dashboard 的两位 cent 显示做四舍五入。
 
 ### 7.3 多候选全局锁
 
 1. 空闲时所有 target 同时监听。
 2. 第一条有效信号取得 `_trigger_lock` 后，写入 `active_target_id`，Sniper 进入 locked/triggered。
-3. Argentina 已触发、进入下单或持仓后，Australia、Draw 等其他 target 仍可记录行情，但判断结果是 `observed_while_locked`，不能再入场。
+3. Argentina 已触发、进入下单或持仓后，Australia、Draw 等其他 target 的非空报价只更新最新 `last_bid` 并记录 `observed_while_locked`；不更新 trigger window、不读取 OKX snapshot、不创建 trigger task，也不能入场。空盘口仍会立刻清空该 target 的校准、baseline 和 window。
 4. 系统任何时刻只管理一个 Sniper 仓位，避免多个噪音信号同时消耗余额或互相破坏仓位基准。
-5. 只有 active target 完全退出并完成 position 对账后，才清全局锁并恢复全部 target 的入场判断。
+5. 只有 active target 完全退出并完成 position 对账后，才清全局锁并恢复全部 target 的入场判断；恢复时清空所有旧 window，用锁定期间最新 `last_bid` 重新建立 baseline，避免锁内噪音立即触发。
 
 ### 7.4 触发到 BUY
 
-1. 可选 `settle_ms`：Poly 价格必须连续不变达到该时长；settle 后若相对原 window low 已不足阈值，释放锁，不下单。
-2. 查询 OKX YES book；target 为 NO 时，从 YES bids 构造 NO asks。
+1. 可选 `settle_ms`：Poly 价格必须连续不变达到该时长；settle 后若相对原 window low 已不足阈值，释放锁，不下单。`settle_ms=0` 时不会在 IOC 前再次读取 Poly；`settle_ms>0` 当前没有额外最大等待上限，等待期间保持全局锁。
+2. settle 后读取新的 OKX REST depth=10 YES book；Dashboard viewer 和持续 trace WS 不参与下单决策。target 为 NO 时，从 YES bids 构造 NO asks。
 3. 价格上限为 `min(当前 Poly bid, Buy Limit)`；只保留同时不高于上限、并且严格低于当前 Poly bid 的 OKX asks。
 4. 如果没有合格 asks，释放锁，继续监听其他信号。
 5. 下单前查询该 target 的真实 OKX position，保存 `position_before`；查询失败时不入场。
@@ -276,13 +283,14 @@
 ### 7.5 持仓和退出
 
 1. holding 起点和买入均价先持久化。
-2. 持仓约满 `1s` 时读取一次真实 Poly target best bid；如果 OKX 买入均价高于 Poly bid，立即进入 stoploss exit。
-3. 未触发该检查时，达到 `timeout_secs` 进入 timeout exit。
-4. exit 查询当前 target 的真实 OKX best bid；NO target 从 YES asks 镜像得到 NO bid。
-5. 每次退出先持久化新的 exit `clientOrderId`，再提交 reduce-only IOC SELL。
-6. 最多进行 5 次退出尝试，每次按自己的 cloid 核对终态和增量成交；未知结果立即停止并锁住，不盲目重复卖出。
-7. 订单账本显示已卖完后，还要查询真实 position；只有 position 回到 `position_before` 才算完全退出。
-8. 完全退出后清 active target、买卖数量、订单 ID 和计时，解除全局锁，所有候选重新具备触发资格。
+2. `timeout_secs` 从 IOC 最终成交确认并且 holding 起点成功持久化后开始；settle、OKX snapshot、position/balance、下单和订单终态确认都不计入 timeout。
+3. 持仓约满 `1s` 时读取一次真实 Poly target best bid；如果 OKX 买入均价高于 Poly bid，立即进入 stoploss exit。
+4. 1 秒 stoploss 检查没有触发退出时，达到 `timeout_secs` 进入 timeout exit。
+5. exit 查询当前 target 的真实 OKX best bid；NO target 从 YES asks 镜像得到 NO bid。
+6. 每次退出先持久化新的 exit `clientOrderId`，再提交 reduce-only IOC SELL。
+7. 最多进行 5 次退出尝试，每次按自己的 cloid 核对终态和增量成交；未知结果立即停止并锁住，不盲目重复卖出。
+8. 订单账本显示已卖完后，还要查询真实 position；只有 position 回到 `position_before` 才算完全退出。
+9. 完全退出后清 active target、买卖数量、订单 ID 和计时，解除全局锁，所有候选重新具备触发资格。
 
 ### 7.6 Stop、页面刷新和服务重启
 
@@ -291,8 +299,9 @@
 3. Stop 不主动平掉已经存在的 Sniper 持仓；有剩余持仓、未决 entry/exit 或未知终态时保留 `locked`。
 4. 运行配置、targets、active target、position baseline、entry/exit cloid、成交量和持仓起点保存在 SQLite `sniper_state`。
 5. 页面刷新只重新读取状态，running 时配置输入锁定，不能边运行边修改。
-6. 服务重启时先恢复 snapshot，再与 OKX open/closed orders 和 positions 对账；只有可证明安全才恢复 monitoring/holding。
-7. snapshot 损坏、关键写盘失败或状态无法归属时保持 error/locked，不能启动新 Sniper 或其他增加敞口的策略。
+6. `View Book` 是显示控件而不是交易配置；monitoring 时可切换，active 时强制固定，浏览器刷新不会改变后端 active/locked 状态。
+7. 服务重启时先恢复 snapshot，再与 OKX open/closed orders 和 positions 对账；holding 使用持久化的 `hold_start_epoch_ms` 重建已持仓时间，timeout 不会从零重新计时；只有可证明安全才恢复 monitoring/holding。
+8. snapshot 损坏、关键写盘失败或状态无法归属时保持 error/locked，不能启动新 Sniper 或其他增加敞口的策略。
 
 ### 7.7 Sniper 延迟日志
 

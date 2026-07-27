@@ -189,7 +189,7 @@ SQLite + Fernet key + JSON runtime files
 | 路径 | 覆盖重点 |
 | --- | --- |
 | `tests/test_price_precision.py` | Poly/OKX 显示、边界 tick、0.1¢ 和方向性对齐。 |
-| `tests/test_poly_sniper.py` | 多候选、全局锁、NO 镜像、信号、partial fill 和退出行为。 |
+| `tests/test_poly_sniper.py` | 多候选、全局锁、locked observation、timeout、window/baseline 恢复、NO 镜像、partial fill 和退出行为。 |
 | `tests/test_poly_sniper_old.py` | Sniper Old 精确 cloid、partial fill、Stop、SQLite ledger 与恢复行为。 |
 | `tests/test_sniper_persistence.py` | Sniper SQLite 状态保存、刷新/重启恢复与锁定恢复。 |
 | `tests/test_account_manager_sniper_shutdown.py` | AccountManager 关闭时保留 Sniper 恢复语义，不做意外账户级撤单。 |
@@ -197,7 +197,7 @@ SQLite + Fernet key + JSON runtime files
 | `tests/test_ws_base_path.py` | OKX WS snapshot/序列处理、HTTP/WS 子路径和前端 JavaScript 语法。 |
 | `tests/test_rebalance_hardening.py` | 成本层隔离、双资产对账、撤单终态、protective sell 和失败关闭。 |
 | `tests/test_manual_strategy_safety.py` | D/S 单边失败、撤单确认、sell 重试、Bid-Sell spread 和 sell-all 例外。 |
-| `tests/test_dashboard_sniper_active_target.py` | Sniper active target 切换、页面价格/数量格式和手工下单保护。 |
+| `tests/test_dashboard_sniper_active_target.py` | Sniper active target、`View Book`、共享 Order Book ownership、页面价格/数量格式和手工下单保护。 |
 | `tests/test_app_cancel_all.py` | 页面 Cancel All/Flash 的撤单、reduce-only IOC 与最终订单/持仓核验。 |
 | `tests/test_app_config_safety.py` | 凭据/region 变更前的本地状态、交易所敞口、agent key 和 client 原子切换。 |
 | `tests/test_poly_monitor_empty_book.py` | Monitor 对 REST/WS 空 bid 的风控、初始空簿拒绝和异常响应忽略。 |
@@ -300,6 +300,12 @@ Telegram token/chat 配置是全局共享的；各账户策略引用同一个 no
 - 当页面选择 OKX NO 时，后端/前端按 YES 簿镜像成真实 NO bid/ask；
 - Poly 固定显示两位 cent；
 - OKX 根据当前价格区间显示整数或一位小数 cent。
+
+新版 Sniper 可以同时监听多个 Candidate，但 Dashboard 仍只有一组 Poly + OKX Order Book 面板和一个 viewer WebSocket。每一行的 `View Book` 只决定这组面板当前显示哪一条映射，不会改变后端监听、threshold 判断、active target 或订单目标。修改未查看行的下拉框不会再抢走盘口；盘口标题会显示当前 Poly outcome、OKX market 和 OKX side。
+
+Sniper 正在 monitoring、尚未触发时可以切换查看任意 Candidate。出现 `active_target_id` 后，两块 Order Book 强制固定到 active Candidate，其他行的 `View Book` 暂时禁用；同一页面会话内完整退出后恢复触发前查看项。浏览器若在交易期间刷新，后端 active target 仍会恢复并继续固定盘口，但之前纯前端的查看偏好不会作为交易状态写入后端。Sniper 未运行时只在 Poly Sniper tab 且没有其他运行策略时拥有共享盘口；Manual、Bid-Sell 和 Sniper Old 的运行盘口不会被空闲 Sniper 状态轮询覆盖。
+
+这套 viewer relay 与策略行情源相互独立：`backend/ws_book.py` 只转发当前展示 pair；`backend/services/poly_sniper.py` 自己用一条 Poly WebSocket 订阅全部 Candidate token。关闭页面、切换 `View Book` 或 viewer WebSocket 重连，不会停止真实 Sniper 监听。
 
 OKX WS 必须先收到 `snapshot` 才接受 `update`。如果 update 早于 snapshot，或 `prevSeqId/seqId` 出现断链，relay 会主动重连，避免继续展示失真的本地簿。
 
@@ -522,12 +528,15 @@ data/cost_layers_{account_id}.json
 3. 每行选择一个真实 Poly outcome；
 4. 每行选择对应 OKX market；
 5. 每行选择要买的 OKX YES 或 NO；
-6. 设置 jump threshold、Buy Limit、Position %、timeout、settle 和 window；
-7. 点击 `Start Sniper`。
+6. 用该行的 `View Book` 检查 Poly token、OKX market 和 YES/NO 镜像是否正确；
+7. 设置 jump threshold、Buy Limit、Position %、timeout、settle 和 window；
+8. 点击 `Start Sniper`。
 
 同一 Poly token 不能重复出现在两行；重复信号会造成候选含义不确定，后端会拒绝启动。同一账户的所有策略 Start/Stop、Cancel All 和 Flash 操作由账户级生命周期锁串行执行，Sniper 自身还有独立 start/stop 锁，防止多个浏览器页同时启动出两套监听任务。
 
 运行中或 locked 时所有配置输入会锁定，避免浏览器显示值和后端实际运行配置发生偏差。刷新页面后，页面从后端状态恢复 targets、参数、运行状态、active target 和 locked 状态。Poly URL 解析和状态轮询都带请求序号，旧请求晚返回时不会覆盖较新的 URL、target 或盘口绑定。
+
+`View Book` 不是配置字段：monitoring 时可以在已锁定的 Candidate 行之间切换显示；它不会修改或重启策略。active target 出现后，页面每次状态同步都会重新固定 active 盘口，其他策略页面的市场下拉也不能短暂抢走这组共享 Order Book。
 
 界面只保留简单的 Start/Stop 语义，没有 Pause New Entries、Stop Target、Close Target 或 Close All。
 
@@ -551,21 +560,27 @@ Unlock and monitor all candidates again
 因此 Argentina 已经触发、入场或持仓时：
 
 - Australia 和 Draw 不能再触发入场；
-- 它们的行情消息即使继续到达，也没有入场资格；
+- 它们的非空行情消息仍会更新各自最新 `last_bid` 并写日志，但不会更新 trigger window、读取 OKX snapshot、创建 trigger task 或下单；空盘口仍会立即清空该 Candidate 的校准和 window；
 - 系统不会同时管理第二个 Sniper 仓位；
 - 只有 active target 完整退出并与 position baseline 对账成功后才解锁。
 
 这道锁是为了防止一笔持仓期间被其他噪音信号连续击中，不是为了让多个候选同时开仓。
+
+完整退出后不会把锁定期间的价格变化补算成一次 jump。系统会清空所有 Candidate 的旧 window，并用锁定期间收到的最新 `last_bid` 重新建立 baseline；下一次新行情从这个基准继续判断。
 
 ### 12.3 信号
 
 - 在 `window_ms` 时间窗内记录该 Poly token 的 best bid；
 - 以窗口 low 到 current 的上涨判断 jump；
 - jump 必须达到 threshold；
+- 判断直接使用原始 `Decimal` best bid，不会先按页面显示精度四舍五入；
 - `settle_ms > 0` 时，价格还要保持不变达到 settle 时间；
-- 最终 entry 价必须同时低于 Poly 当前信号价和 Buy Limit；
+- settle 完成后才读取一份新的 OKX REST depth=10 snapshot；Dashboard Order Book 和持续维护的 OKX trace WS 都不参与下单价格决策；
+- 最终 entry ask 必须不高于 Poly 信号价、不高于 Buy Limit，并且严格低于 Poly 信号价；
 - 每个候选使用自己的真实 Poly token，Poly NO 不从 YES 推导。
 - Poly 订单簿变空时，该候选会立刻失去校准并清空 jump window；报价重新出现后的第一笔只用于重新校准，不会把断档前后的价格拼成一次假跳；WS 重连也采用相同规则。
+
+两个时间边界必须分清：`settle_ms=0` 时触发后不会在提交 IOC 前再次读取 Poly 复核；`settle_ms>0` 时当前实现要求价格连续静止，但没有额外的 settle 最大等待时间。两种情况下全局锁都已经取得，其他 Candidate 都不能入场。
 
 ### 12.4 入场、持仓和退出
 
@@ -575,6 +590,7 @@ Unlock and monitor all candidates again
 - 买入 share 规范为整数；
 - 名义额不足 `1 xp` 不下单；
 - partial fill 会保留并进入持仓管理，不能当成整单失败；
+- `timeout_secs` 从 IOC 最终成交确认、holding 起点成功持久化后才开始，不包含 settle、OKX snapshot、position/balance 查询、下单请求和订单终态确认；
 - 约持仓 1 秒时执行一次 Poly stoploss 检查；
 - timeout 到达后，按 OKX 当前 best bid 提交 reduce-only IOC；
 - 最多尝试 5 次退出；
@@ -698,7 +714,7 @@ data/
 Dashboard 的 Add Account 和 System Health 使用的是**合成读请求探测**：
 
 - OKX Region 为 AU 时探测账户真实使用的 `https://us.okx.com`；CN 时探测 `https://www.okx.com`；
-- 已有同 Region 账户且能确定 active Sniper target（或只有一个完整 target）时，OKX 请求使用该账户逐次签名，并探测这一组映射的 `/api/v5/market/pm-books?instId=...&sz=10`；Poly 请求使用同一映射的真实 token `/book`。多 target 尚未触发、无法确定唯一映射时退回 connectivity-only，不会拼接两个无关市场；
+- 已有同 Region 账户时，System Health 按 `active target → 当前 View Book target → 唯一完整 target` 的顺序选择真实映射。找到映射后，OKX 请求使用该账户逐次签名，并探测 `/api/v5/market/pm-books?instId=...&sz=10`；Poly 请求使用同一映射的真实 token `/book`。确实无法确定映射时才退回 connectivity-only，不会拼接两个无关市场；
 - OKX `pm-books` 是鉴权接口：没有同 Region 账户时不能做真实 market read，只能退回 `/api/v5/public/time` 连通性探测，不能把后者标成行情延迟；
 - 没有可用 asset/token 时只探测 `/api/v5/public/time` 和 Poly `/time`，页面明确标为 `Connectivity only`，不能把它当行情或下单速度；
 - 每条路径使用一个 session：第一请求单列为 cold，随后默认 5 次 warm，返回原始样本、median、min、max、jitter、成功/失败/跳过数和错误分类；失败节点不会用少量偶然成功样本参与 `LOWEST RTT` 排名；
@@ -1253,8 +1269,10 @@ git diff --check
 
 ### Order Book 不更新
 
+- 多 Candidate 不会同时铺开多套盘口；先确认目标行显示 `Viewing`。active 交易存在时只能查看 active 行；
+- 检查盘口标题中的 Poly outcome、OKX market 和 YES/NO 是否与目标行一致；
 - 检查 Nginx WebSocket Upgrade；
-- 检查 `/okx` 是否同时作用于 HTTP 和 WS；
+- 当前生产站使用根路径；只有明确配置了自定义 `base_path` 时，才检查该前缀是否同时作用于 HTTP 和 WS；
 - 检查 OKX business WS 是否可经该账户代理访问；
 - 查看是否出现 update-before-snapshot 或 seq gap 重连；
 - Poly token 和 OKX yesAssetId 是否被混用。
@@ -1293,8 +1311,9 @@ Cancel All 只撤单，不会撤销已经发生的 fill。Auto-Rebalance 会尝�
 - [ ] 验证 Manual-S NO 的 OKX 镜像 bid/ask；
 - [ ] 用小单演练 partial fill、Stop、Cancel All 和 Flash；
 - [ ] 配置多个 Sniper candidates，确认第一条触发后其他候选被锁；
+- [ ] monitoring 时逐行点击 `View Book`，确认未查看行的编辑不会抢盘口，active 时盘口固定，完整退出后恢复原查看项；
 - [ ] 在 holding 状态刷新页面并重启服务，确认恢复和 position 对账；
-- [ ] 验证 `/okx/api/...` 和 `/okx/ws/...` 都能通过反向代理；
+- [ ] 当前根路径部署验证 `/api/...` 和 `/ws/...`；只有显式启用自定义 `base_path` 时再验证对应前缀；
 - [ ] 一起备份 `data/accounts.db`、`data/.key` 和策略 JSON 状态；
 - [ ] 检查 OKX Open Orders、Closed Orders、Positions 与本地日志一致。
 
