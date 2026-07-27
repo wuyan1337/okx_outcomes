@@ -305,7 +305,7 @@ Telegram token/chat 配置是全局共享的；各账户策略引用同一个 no
 
 OKX WS 必须先收到 `snapshot` 才接受 `update`。如果 update 早于 snapshot，或 `prevSeqId/seqId` 出现断链，relay 会主动重连，避免继续展示失真的本地簿。
 
-当前已知限制：`pm-books` 序列 gap 会被检测并重连，但还没有对 OKX checksum 做独立校验；REST fallback 与 WebSocket 更新之间仍可能出现很短的显示竞态，最终应以重新同步后的订单簿和 OKX 真实订单状态为准。
+`pm-books` 的 `seqId/prevSeqId` 会做严格连续性检查，gap 会在应用该帧前丢弃本地连接并重连。服务端 `checksum` 也会原样写入市场日志，但 OKX Outcomes 官方文档和官方 SDK 没有公开 canonical book 的拼接顺序、档数、字段和小数文本规范，所以日志明确标记 `checksum_verified=false` 及 `checksum_verification_reason`，不会套用其他 OKX 频道的 CRC 规则制造假告警。REST fallback 与 WebSocket 更新之间仍可能出现很短的显示竞态，最终应以重新同步后的订单簿和 OKX 真实订单状态为准。
 
 ### 6.3 Active Orders、Cancel All 和 Flash
 
@@ -866,7 +866,293 @@ location /okx/ {
 4. WebSocket 是否连接 `/okx/ws/book/...`；
 5. 上游收到的是剥离前缀后的 `/...`，还是保留前缀的 `/okx/...`。
 
-## 18. 测试与静态检查
+## 18. 本地日志与实盘排障
+
+日志系统同时保留适合人工阅读的文本日志和适合按交易链路查询的 JSONL 日志。日志写入使用有界异步队列；策略热路径会同步复制并脱敏本次事件字段，然后入队，但不等待文件写盘。为满足事后逐项还原，原始行情帧不会按 50 条截断，因此超大帧的复制成本也会计入 Sniper 的收包到 ACK 耗时。服务正常关闭时会排空队列并 `fsync`，队列拥塞时则优先保证交易任务不被日志 I/O 卡住。
+
+### 18.1 四个日志文件
+
+| 文件 | 格式 | 主要内容 | 首选用途 |
+| --- | --- | --- | --- |
+| `bot.log` | UTF-8 文本 | 应用启动/停止、普通 Python logger、策略摘要、WS 重连和 DEBUG/INFO/WARN | 先看服务整体发生了什么 |
+| `error.log` | UTF-8 文本 | WARNING/ERROR/CRITICAL、异常堆栈，以及 WARNING/ERROR 级审计事件 | 快速定位警告和明确错误 |
+| `audit.jsonl` | 每行一个 JSON | HTTP 请求、OKX REST、下单/撤单、订单核验、策略生命周期、持久化、Monitor、Rebalance | 按账户、运行批次、触发链路和订单 ID 还原交易过程 |
+| `market_data.jsonl` | 每行一个 JSON | Poly/OKX REST/WS snapshot、真实增量更新、top-of-book、delta、序列号和策略判断输入 | 对齐信号到达、盘口变化和下单时刻 |
+
+`error.log` 不是 `audit.jsonl` 的替代品：它便于人眼快速看异常，但结构化订单参数、相关 ID 和阶段耗时仍应回到 `audit.jsonl` 查询。Dashboard 内的小型日志窗口也不是完整历史，只用于即时状态展示。
+
+### 18.2 日志目录和配置优先级
+
+默认目录是项目根目录下的 `logs/`。例如：
+
+- Linux 项目位于 `/opt/okx-outcomes-bot` 时：`/opt/okx-outcomes-bot/logs/`；
+- 当前 Windows 项目位于 `D:\备份\Kevin\SRC\okx-outcomes-bot` 时：`D:\备份\Kevin\SRC\okx-outcomes-bot\logs\`。
+
+目录选择优先级为：
+
+1. 进程环境变量 `OKX_BOT_LOG_DIR`；
+2. `config.yaml` 的 `logging.directory`；
+3. 默认的项目根目录 `logs/`。
+
+Linux：
+
+```bash
+export OKX_BOT_LOG_DIR=/var/log/okx-outcomes-bot
+export OKX_BOT_LOG_LEVEL=DEBUG
+python -m uvicorn backend.app:app --host 127.0.0.1 --port 8899
+```
+
+Windows PowerShell：
+
+```powershell
+$env:OKX_BOT_LOG_DIR = "D:\okx-bot-logs"
+$env:OKX_BOT_LOG_LEVEL = "DEBUG"
+python -m uvicorn backend.app:app --host 127.0.0.1 --port 8899
+```
+
+也可以写入 `config.yaml`：
+
+```yaml
+logging:
+  directory: "logs"
+  level: "DEBUG"
+  console: true
+  console_level: "INFO"
+```
+
+相对目录以项目根目录解析。自定义 `/var/log/...` 时，必须先确保运行 Bot 的 systemd 用户能够创建目录和写文件；程序会尽力把目录设为 `0750`、文件设为 `0640`。环境变量修改后必须重启服务才会生效。
+
+### 18.3 默认轮转和磁盘上限
+
+轮转采用“当前文件 + 固定数量备份”，达到 `max_bytes` 后生成 `.1`、`.2` 等文件。默认值为：
+
+| 类别 | 单文件上限 | 备份数 | 当前文件也计入后的理论上限 |
+| --- | ---: | ---: | ---: |
+| general / `bot.log` | 32 MiB | 10 | 352 MiB |
+| error / `error.log` | 16 MiB | 12 | 208 MiB |
+| audit / `audit.jsonl` | 32 MiB | 12 | 416 MiB |
+| market / `market_data.jsonl` | 128 MiB | 16 | 2176 MiB |
+
+四类合计理论上限约为 `3152 MiB`，即 `3.08 GiB`。单条正在写入的记录和文件系统元数据可能让瞬时占用略高于该数字。市场活跃度越高，同样的容量能保留的时间越短，因此不能把“16 个备份”理解成固定保留 16 天。
+
+需要调整时使用字节数：
+
+```yaml
+logging:
+  files:
+    general:
+      max_bytes: 33554432
+      backup_count: 10
+    error:
+      max_bytes: 16777216
+      backup_count: 12
+    audit:
+      max_bytes: 33554432
+      backup_count: 12
+    market:
+      max_bytes: 134217728
+      backup_count: 16
+```
+
+不要把备份数设得很大来代替磁盘监控。生产机仍应监控分区剩余空间；磁盘满时，交易任务会继续运行，但日志时间线会不完整。
+
+### 18.4 JSONL 字段和相关 ID
+
+`audit.jsonl` 与 `market_data.jsonl` 的每一行都是独立、完整的 JSON。公共字段包括：
+
+| 字段 | 含义 |
+| --- | --- |
+| `schema_version` | 日志结构版本 |
+| `process_instance_id` | 本次 Python 进程的唯一 ID；跨轮转文件关联同一次运行 |
+| `timestamp` / `timestamp_unix_ns` | Bot 本机 UTC 墙钟时间，保留纳秒字段 |
+| `monotonic_ns` | 本进程单调钟；用于计算阶段间隔，不受 NTP 调时影响 |
+| `sequence` | 本进程所有结构化事件的全局顺序 |
+| `channel_sequence` | audit 或 market 各自的顺序；发现缺口时检查队列丢弃 |
+| `channel` / `event` / `source` | 日志类别、事件名称和 Poly/OKX/内部来源 |
+| `context` | 当前账户、策略运行、触发链路等继承上下文 |
+| `data` | 该事件自己的安全参数、结果、耗时、盘口或状态摘要 |
+
+排障时常用的相关 ID：
+
+| ID | 用途 |
+| --- | --- |
+| `process_instance_id` | 区分服务重启前后的事件 |
+| `context.request_id` | 浏览器到 FastAPI 的一次 HTTP 请求 |
+| `data.request_id` | OKX client 的一次逻辑 REST 请求；重试 attempt 共用该 ID |
+| `account_id` | 定位具体账户，可能位于 `context` 或 `data` |
+| `run_id` | 一次 Manual、Monitor 或 Sniper 运行批次 |
+| `frame_id` / `poly_frame_id` | 一条实际收到的 Poly WebSocket 帧；把原始帧、判断和后续 trigger 对齐 |
+| `trace_id` | 一次 Sniper/风控触发到后续动作的链路 |
+| `rebalance_id` | 一次 Auto-Rebalance 的撤单、对账、重挂和重启链路 |
+| `clientOrderId` / `client_order_id` | 将下单尝试、ACK、撤单和 closed-order 对账连接起来 |
+| `target_id` / `market_id` / `asset_id` / `token_id` | 定位 Sniper target、OKX market/outcome 和真实 Poly outcome |
+
+同一笔问题不要只搜时间或错误文案。优先拿到 `clientOrderId`，再找对应 `trace_id/run_id/account_id`，最后把同一时间窗口的市场数据拼进来。
+
+Sniper 的触发候选在收到 Poly 帧时就保存 `frame_id` 和单调钟起点，随后同一个 `trace_id` 进入抢锁、持久化、OKX 查询和订单 ACK。因此 `trigger_to_order_ack_ms` 包含 JSON 解析、行情日志快照和信号判断耗时，而不是从判断完成后才开始计时；未赢得全局锁的候选也会留下带同一 `trace_id` 的 rejected 事件。
+
+Market 事件还会包含 `received_wall_ns`、`received_monotonic_ns`、上游 `source_timestamp`、OKX `sequence/previous_sequence`、`top`、`delta` 或 snapshot `levels`。选择 OKX NO 时，日志会标记 `inverted=true`，并保留原始 YES top，避免把派生 NO 盘口误当成 OKX 单独发布的 NO book。
+
+策略链路会保留完整的原始 Poly `price_changes`、OKX 增量 bids/asks 和 WS snapshot，不再按 50 条截断；同时另存有界 top-of-book，便于日常查询。大帧会更快消耗 `market_data.jsonl` 的固定轮转容量，但不会突破上面的磁盘上限。OKX `checksum_reported` 是服务端原值；在官方未公开 `pm-books` canonicalization 之前，`checksum_verified=false` 只表示“无法按官方规则复算”，不表示盘口已经损坏，确定性的完整性判断仍看 `seqId/prevSeqId`。
+
+### 18.5 “纳秒时间戳”不等于伪造每 1ms 采样
+
+系统记录的是 **每一条实际收到并被代码接受的上游数据**：
+
+- Poly/OKX 真正发来 snapshot 或增量 update 时写一条；
+- 策略主动执行 REST snapshot 时写一条；
+- 上游没有发新数据时，不会为了让图看起来连续而伪造每 1ms 一条记录；
+- timestamp 的纳秒精度表示本机记录格式精细，不代表交易所每纳秒发布，也不代表网络测量具备纳秒准确度；
+- `source_timestamp` 是平台自己的时间，`received_wall_ns` 是 Bot 收到数据的本机墙钟，两者不能在未确认时钟基准时直接当成单程网络延迟；
+- 同一进程内计算阶段耗时优先使用 `monotonic_ns`。
+
+Dashboard orderbook relay 只在浏览器 WebSocket 连接存在时运行，其日志带 `consumer=dashboard_relay`。Sniper/Monitor 自己的行情事件不依赖 Dashboard 是否打开。看到两条相近 snapshot 时先检查 `consumer`、`strategy` 和 `transport`，不要把 Dashboard relay 与策略自己的 REST/WS 观察误认为重复触发。
+
+### 18.6 查看日志状态
+
+经过 Basic Auth 后可以读取：
+
+```text
+GET /api/logging/status
+```
+
+根路径部署示例：
+
+```bash
+curl -u operator http://127.0.0.1:8899/api/logging/status | jq
+```
+
+子路径部署则使用：
+
+```bash
+curl -u operator https://xxxx.com/okx/api/logging/status | jq
+```
+
+`curl -u operator` 会交互式询问密码，避免把密码直接写进 shell history。返回值包括：
+
+- `active`：日志系统是否运行；
+- `directory` 和四个真实文件路径；
+- 各文件的 `max_bytes`、`backup_count`；
+- system/audit/market 队列的 `size`、`capacity` 和累计 `dropped_records`。
+
+`dropped_records > 0` 表示曾经因写盘跟不上而丢弃日志，不代表交易请求被丢弃。队列恢复后，下一条成功日志会带 `queue_dropped_before`；该时间段不能再声称行情时间线完整。
+
+Windows PowerShell：
+
+```powershell
+curl.exe -u operator http://127.0.0.1:8899/api/logging/status |
+  ConvertFrom-Json |
+  Format-List
+```
+
+### 18.7 实时查看和查询示例
+
+Linux 持续跟随文本日志，`-F` 可以在文件轮转后重新打开当前文件：
+
+```bash
+cd /opt/okx-outcomes-bot
+tail -F logs/bot.log
+tail -F logs/error.log
+```
+
+实时只看某账户的 audit：
+
+```bash
+ACCOUNT_ID='replace-with-account-id'
+tail -F logs/audit.jsonl | jq -c --arg id "$ACCOUNT_ID" \
+  'select((.context.account_id // .data.account_id // "") == $id)'
+```
+
+实时查看 Poly best bid 和真实 delta：
+
+```bash
+tail -F logs/market_data.jsonl | jq -c \
+  'select(.source == "poly_ws") |
+   {time:.timestamp, account:(.data.account_id // .context.account_id),
+    token:.data.token_id, top:.data.top, delta:.data.delta}'
+```
+
+实时查看 OKX 序列、top 和接收时间：
+
+```bash
+tail -F logs/market_data.jsonl | jq -c \
+  'select(.source == "okx_ws") |
+   {time:.timestamp, asset:.data.asset_id,
+    seq:.data.sequence, prev:.data.previous_sequence,
+    received_ns:.data.received_wall_ns, top:.data.top, delta:.data.delta}'
+```
+
+按 `trace_id` 查一次触发链路：
+
+```bash
+TRACE_ID='replace-with-trace-id'
+jq -c --arg id "$TRACE_ID" \
+  'select((.context.trace_id // .data.trace_id // "") == $id)' \
+  logs/audit.jsonl
+```
+
+不知道字段嵌套位置时，直接跨当前文件和轮转备份搜索 `clientOrderId` 最可靠：
+
+```bash
+CLIENT_ORDER_ID='replace-with-client-order-id'
+rg -n --glob 'audit.jsonl*' --fixed-strings "$CLIENT_ORDER_ID" logs
+```
+
+Windows PowerShell 实时查看：
+
+```powershell
+Get-Content .\logs\bot.log -Tail 100 -Wait
+Get-Content .\logs\error.log -Tail 100 -Wait
+```
+
+解析 market JSONL 并过滤 OKX WS：
+
+```powershell
+Get-Content .\logs\market_data.jsonl -Tail 100 -Wait |
+  ForEach-Object { $_ | ConvertFrom-Json } |
+  Where-Object { $_.source -eq "okx_ws" } |
+  Select-Object timestamp,
+    @{Name="asset"; Expression={$_.data.asset_id}},
+    @{Name="seq"; Expression={$_.data.sequence}},
+    @{Name="top"; Expression={$_.data.top}}
+```
+
+跨轮转文件查订单 ID：
+
+```powershell
+$clientOrderId = "replace-with-client-order-id"
+Select-String -Path .\logs\audit.jsonl* -SimpleMatch $clientOrderId
+```
+
+`Get-Content -Wait` 在 Windows 文件被轮转重命名后不一定像 Linux `tail -F` 一样自动重新打开；发现停止输出时重新运行命令。
+
+### 18.8 建议故障排查顺序
+
+出现“没下单、挂单不对、Stop 后状态异常、触发时间看不懂”时按以下顺序检查：
+
+1. 请求 `/api/logging/status`，确认 `active=true`、目录正确、队列未持续接近 capacity，并记录 `dropped_records`；
+2. 检查磁盘剩余空间、目录权限和文件最后更新时间；
+3. 先看 `error.log`，确定是否有异常、超时、持久化失败、WS sequence gap 或重连；
+4. 在 `audit.jsonl` 按 `account_id` 找到对应 `run_id/trace_id/rebalance_id`；
+5. 有订单时以 `clientOrderId` 为主键，对齐 request、OKX ACK、cancel、open/closed query 和最终 fill；
+6. 在相同 UTC 时间窗口查询 `market_data.jsonl`，比较 Poly/OKX top、delta、source timestamp、接收时间和 OKX seq；
+7. 若发现 `queue_dropped_before` 或 status 的 dropped 递增，先处理磁盘/CPU/日志量问题，该窗口不能做逐 tick 结论；
+8. 最后登录 OKX 核对真实 Open Orders、Closed Orders、filledSize/filledAmount 和 Positions；本地日志不能替代交易所终态；
+9. 如果日志在应用初始化前就停止，查看 `journalctl -u okx-bot`（服务名不同时替换 `okx-bot`）或 Uvicorn 控制台启动错误。
+
+不要因为 POST 返回 `code=0` 就在日志里推断订单已经 ACTIVE/FILLED；ACK 和订单终态是不同事件。`TIMEOUT/ERROR` 也只证明本地没有取得明确响应，必须继续用同一个 `clientOrderId` 查 open/closed 和 position。
+
+### 18.9 生产限制、隐私和部署包
+
+- 必须保持单 worker、单实例。交易状态本身不支持多 worker，同一个 `RotatingFileHandler` 也不支持多个进程安全地同时轮转同一文件；不要使用 `uvicorn --workers 2`，也不要使用 `--reload` 跑生产。
+- 日志会脱敏常见 API key、secret、passphrase、private key、Authorization、OKX 签名和 Telegram token，但仍包含账户 ID、订单 ID、市场、价格、数量、持仓摘要和策略行为，仍属于敏感运营数据。
+- 不要通过静态 Web 目录公开 `logs/`，`/api/logging/status` 只返回路径、容量和队列健康，不返回日志正文。
+- `.gitignore` 必须保留 `logs/`。注意 `zip -r`、资源管理器压缩和某些部署工具不会自动读取 `.gitignore`。
+- 升级包/部署包不得包含 `logs/`、`bot.log*`、`error.log*`、`audit.jsonl*`、`market_data.jsonl*`；目标机启动时会自行创建空日志文件。
+- 同样不要把 `data/`、真实 `config.yaml` 凭据、私钥、`.key` 或历史 `.bak-*` 混进通用代码升级包。运行数据应走单独、受控的备份流程。
+- 部署后先调用 `/api/logging/status`，再制造一条无风险页面请求，确认 `bot.log` 和 `audit.jsonl` 的修改时间更新；不要等到第一次实盘异常才发现目录不可写。
+
+## 19. 测试与静态检查
 
 测试使用 Python 标准库 `unittest`，不需要额外安装 pytest：
 
@@ -890,7 +1176,7 @@ git diff --check
 
 部分测试可能因本机未安装可选环境或无法访问外部服务而 skip；任何涉及精度、Sniper 锁、恢复或 base path 的失败都不应在实盘前忽略。
 
-## 19. 常见故障排查
+## 20. 常见故障排查
 
 ### 页面上的 `0.1¢` 显示为 0
 
@@ -946,7 +1232,7 @@ git diff --check
 
 Cancel All 只撤单，不会撤销已经发生的 fill。Auto-Rebalance 会尝试捕获 partial fill 并对账持仓，但仍须人工检查。`Flash` 的 IOC 也可能只成交一部分。
 
-## 19. 遗留代码与生产边界
+## 21. 遗留代码与生产边界
 
 ### `poly_sniper_old.py`
 
@@ -976,7 +1262,7 @@ Cancel All 只撤单，不会撤销已经发生的 fill。Auto-Rebalance 会尝�
 
 这是本地 OKX Outcome API 文档副本，用于对照协议；程序不读取它。正式维护时应以当前官方文档和实际 API 响应为最终依据。
 
-## 20. 上线前检查清单
+## 22. 上线前检查清单
 
 - [ ] 使用独立、小资金 OKX Outcomes 账户；
 - [ ] 修改默认 Web 登录密码并启用 HTTPS；

@@ -15,6 +15,7 @@ import asyncio
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 import json
 import logging
+import secrets
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Set, Dict
 from dataclasses import dataclass, field
@@ -26,6 +27,7 @@ from ..core.price_utils import (
     format_okx_cents,
     price_to_cents,
 )
+from ..core.logging_config import audit_event, log_context
 from .size_utils import normalize_size_str
 
 if TYPE_CHECKING:
@@ -77,6 +79,7 @@ class ManualStrategyS:
         self.running = False
         self.cycles = 0
         self.auto_rebalance = None
+        self._run_id = ""
         self._sells_file = Path(str(SELLS_FILE_S).format(account_id=account_id))
         self._load_pending_sells()
 
@@ -105,21 +108,57 @@ class ManualStrategyS:
                     "oids": dict(self.state.pending_sells),
                     "start_time": self.state.start_time,
                 }, f)
+            audit_event(
+                "manual.pending_sells_saved",
+                account_id=self.account_id,
+                strategy="manual-s",
+                run_id=self._run_id,
+                path=self._sells_file,
+                pending_count=len(self.state.pending_sells),
+            )
         except Exception as e:
             logger.warning(f"[S] Failed to save pending sells: {e}")
+            audit_event(
+                "manual.pending_sells_save_failed",
+                level=logging.ERROR,
+                account_id=self.account_id,
+                strategy="manual-s",
+                run_id=self._run_id,
+                error=e,
+            )
 
     def log(self, msg: str, level: str = "INFO"):
-        entry = f"[{datetime.now().strftime('%I:%M:%S %p')}] {level} {msg}"
+        now = datetime.now()
+        entry = f"[{now.strftime('%I:%M:%S')}.{now.microsecond // 1000:03d} {now.strftime('%p')}] {level} {msg}"
         self.state.logs.append(entry)
         if len(self.state.logs) > 200:
             self.state.logs = self.state.logs[-200:]
-        logger.info(msg)
+        level_name = str(level).upper()
+        log_level = {
+            "DEBUG": logging.DEBUG,
+            "WARN": logging.WARNING,
+            "WARNING": logging.WARNING,
+            "ERROR": logging.ERROR,
+            "CRITICAL": logging.CRITICAL,
+        }.get(level_name, logging.INFO)
+        logger.log(log_level, "[Manual-S:%s run=%s] %s", self.account_id, self._run_id, msg)
+        audit_event(
+            "strategy.message",
+            level=log_level,
+            account_id=self.account_id,
+            strategy="manual-s",
+            run_id=self._run_id,
+            mode=self.state.mode,
+            message=msg,
+        )
 
     async def start(self, market_id: str, yes_asset_id: str, no_asset_id: str,
                     side: str, price_a: float, sell_price: float = 0, mode: str = "classic", size: int = 0, position_pct: int = 100, scan_interval: float = 0.3, stabilize_secs: float = 0.3):
         """Start single-side strategy."""
         if self.state.running:
             return
+
+        self._run_id = secrets.token_hex(8)
 
         mode = str(mode).strip().lower()
         if mode not in ("classic", "bid-sell"):
@@ -162,8 +201,27 @@ class ManualStrategyS:
         self.log(f"Manual-S started: Buy {label}@{a}¢ → Sell {label}@{actual_sell}¢")
 
         # Pre-seed notified_fills with existing closed orders so we don't spam old fills on start
-        self._main_task = asyncio.create_task(self._seed_then_run())
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        audit_event(
+            "strategy.started",
+            account_id=self.account_id,
+            strategy="manual-s",
+            run_id=self._run_id,
+            mode=self.state.mode,
+            market_id=market_id,
+            asset_id=self.state.asset_id,
+            side=self.state.side,
+            buy_price_cents=str(self.state.price_a),
+            sell_price_cents=str(self.state.sell_price),
+            scan_interval=self.state.scan_interval,
+        )
+        with log_context(
+            account_id=self.account_id,
+            strategy="manual-s",
+            run_id=self._run_id,
+            mode=self.state.mode,
+        ):
+            self._main_task = asyncio.create_task(self._seed_then_run())
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def _seed_then_run(self):
         """Seed notified_fills + _notified_amounts with existing orders so we don't spam old fills."""
@@ -216,6 +274,14 @@ class ManualStrategyS:
         self.running = False
         self._save_pending_sells()
         self.log("已停止 (挂单保留)")
+        audit_event(
+            "strategy.stopped",
+            account_id=self.account_id,
+            strategy="manual-s",
+            run_id=self._run_id,
+            mode=self.state.mode,
+            pending_count=len(self.state.pending_sells),
+        )
         for task in [self._main_task, self._heartbeat_task]:
             if task:
                 task.cancel()
@@ -648,7 +714,21 @@ class ManualStrategyS:
         try:
             while self.state.running:
                 try:
-                    await self.client.heartbeat()
+                    result = await self.client.heartbeat()
+                    if str(result.get("code", "")) != "0":
+                        self.log(
+                            "Heartbeat failed: "
+                            + str(result.get("message") or result.get("msg") or result.get("code")),
+                            "WARN",
+                        )
+                    else:
+                        audit_event(
+                            "strategy.heartbeat_ok",
+                            account_id=self.account_id,
+                            strategy="manual-s",
+                            run_id=self._run_id,
+                            mode=self.state.mode,
+                        )
                 except Exception as e:
                     self.log(f"心跳异常: {e}", "WARN")
                 await asyncio.sleep(120)

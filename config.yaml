@@ -9,3 +9,25 @@ telegram:
   chat_ids:
   - '5704353082'
   - '7056424250'
+logging:
+  directory: logs
+  level: DEBUG
+  console_level: INFO
+  console: true
+  queues:
+    system_size: 20000
+    audit_size: 20000
+    market_size: 100000
+  files:
+    general:
+      max_bytes: 33554432
+      backup_count: 10
+    error:
+      max_bytes: 16777216
+      backup_count: 12
+    audit:
+      max_bytes: 33554432
+      backup_count: 12
+    market:
+      max_bytes: 134217728
+      backup_count: 16

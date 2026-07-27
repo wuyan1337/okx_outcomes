@@ -40,20 +40,22 @@ from .core.price_utils import (
     invert_binary_price,
     price_to_cents,
 )
-
-# Configure application-level logging so notifier/strategy messages appear in journalctl
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+from .core.logging_config import (
+    audit_event,
+    configure_logging,
+    flush_logging,
+    get_logging_status,
+    log_context,
+    shutdown_logging,
 )
-
-logger = logging.getLogger(__name__)
 
 # Load file-backed server settings and the one-time Telegram migration source.
 config_path = Path(__file__).parent.parent / "config.yaml"
 with open(config_path, encoding="utf-8") as f:
     config = yaml.safe_load(f)
+
+LOG_PATHS = configure_logging(config)
+logger = logging.getLogger(__name__)
 
 manager = AccountManager()
 
@@ -236,19 +238,39 @@ def verify_auth(request: Request, credentials: Optional[HTTPBasicCredentials] = 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
-    telegram_config = config.get("telegram", {})
-    if not get_global_config("tg_token", "") and telegram_config.get("bot_token"):
-        set_global_config("tg_token", str(telegram_config.get("bot_token", "")))
-    if not get_global_config("tg_chats", "") and telegram_config.get("chat_ids"):
-        set_global_config(
-            "tg_chats",
-            ",".join(str(chat_id) for chat_id in telegram_config.get("chat_ids", [])),
+    active_log_paths = configure_logging(config)
+    audit_event("application.starting", log_directory=active_log_paths.directory)
+    try:
+        init_db()
+        telegram_config = config.get("telegram", {})
+        if not get_global_config("tg_token", "") and telegram_config.get("bot_token"):
+            set_global_config("tg_token", str(telegram_config.get("bot_token", "")))
+        if not get_global_config("tg_chats", "") and telegram_config.get("chat_ids"):
+            set_global_config(
+                "tg_chats",
+                ",".join(str(chat_id) for chat_id in telegram_config.get("chat_ids", [])),
+            )
+        await manager.init()
+        audit_event(
+            "application.started",
+            account_count=len(manager.instances),
+            log_status=get_logging_status(),
         )
-    await manager.init()
-
-    yield
-    await manager.close_all()
+        yield
+    except Exception:
+        logger.exception("Application lifecycle failed")
+        audit_event("application.lifecycle_failed", level=logging.ERROR)
+        raise
+    finally:
+        audit_event("application.stopping", account_count=len(manager.instances))
+        try:
+            await manager.close_all()
+        except Exception:
+            logger.exception("Account shutdown failed")
+            audit_event("application.account_shutdown_failed", level=logging.ERROR)
+        audit_event("application.stopped")
+        flush_logging(timeout=10.0, fsync=True)
+        shutdown_logging(restore_previous=True)
 
 
 def _normalise_base_path(value: str) -> str:
@@ -292,6 +314,122 @@ class BasePathMiddleware:
 
 app = FastAPI(title="OKX Outcomes Bot", lifespan=lifespan, root_path=APP_BASE_PATH)
 app.add_middleware(BasePathMiddleware, configured_prefix=APP_BASE_PATH)
+
+
+_HTTP_LOG_MAX_QUERY_KEYS = 32
+_HTTP_LOG_MAX_QUERY_KEY_LENGTH = 64
+_HTTP_LOG_MAX_PATH_LENGTH = 512
+
+
+def _bounded_log_text(value, limit: int) -> tuple[str, bool]:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text, False
+    return text[:limit] + "…", True
+
+
+def _safe_request_metadata(request: Request) -> dict:
+    """Return bounded request metadata without recording any query values."""
+    raw_query = request.scope.get("query_string", b"") or b""
+    if not isinstance(raw_query, bytes):
+        raw_query = bytes(raw_query)
+    # Work directly from the ASGI bytes.  Accessing request.query_params would
+    # parse and allocate every attacker-controlled value just to discard it.
+    from urllib.parse import unquote_plus
+
+    pair_count = raw_query.count(b"&") + 1 if raw_query else 0
+    query_keys = []
+    truncated = pair_count > _HTTP_LOG_MAX_QUERY_KEYS
+    offset = 0
+    for _ in range(min(pair_count, _HTTP_LOG_MAX_QUERY_KEYS)):
+        pair_end = raw_query.find(b"&", offset)
+        if pair_end < 0:
+            pair_end = len(raw_query)
+        key_end = raw_query.find(b"=", offset, pair_end)
+        if key_end < 0:
+            key_end = pair_end
+        encoded_key = raw_query[offset:min(key_end, offset + 256)]
+        try:
+            key = unquote_plus(encoded_key.decode("utf-8", errors="replace"))
+        except Exception:
+            key = "<invalid-query-key>"
+        safe_key, key_truncated = _bounded_log_text(
+            key, _HTTP_LOG_MAX_QUERY_KEY_LENGTH
+        )
+        query_keys.append(safe_key)
+        truncated = truncated or key_truncated or key_end - offset > 256
+        offset = pair_end + 1
+    path, path_truncated = _bounded_log_text(
+        request.url.path, _HTTP_LOG_MAX_PATH_LENGTH
+    )
+    return {
+        "path": path,
+        "path_truncated": path_truncated,
+        "query_keys": query_keys,
+        "query_key_count": pair_count,
+        "query_length": len(raw_query),
+        "query_truncated": truncated,
+    }
+
+
+@app.middleware("http")
+async def request_audit_middleware(request: Request, call_next):
+    """Record one correlation-friendly timeline entry for every HTTP request."""
+    request_id = secrets.token_hex(8)
+    started_ns = time.perf_counter_ns()
+    client_host = request.client.host if request.client else "unknown"
+    client_host, _client_truncated = _bounded_log_text(client_host, 128)
+    content_length, _content_length_truncated = _bounded_log_text(
+        request.headers.get("content-length", ""), 32
+    )
+    request.state.request_id = request_id
+    safe_request = _safe_request_metadata(request)
+    with log_context(request_id=request_id):
+        audit_event(
+            "http.request.started",
+            method=request.method,
+            **safe_request,
+            client=client_host,
+            content_length=content_length,
+        )
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter_ns() - started_ns) / 1_000_000, 3)
+            logger.exception(
+                "HTTP request failed request_id=%s method=%s path=%s elapsed_ms=%.3f",
+                request_id,
+                request.method,
+                safe_request["path"],
+                elapsed_ms,
+            )
+            audit_event(
+                "http.request.failed",
+                level=logging.ERROR,
+                method=request.method,
+                **safe_request,
+                elapsed_ms=elapsed_ms,
+                error=exc,
+            )
+            raise
+        elapsed_ms = round((time.perf_counter_ns() - started_ns) / 1_000_000, 3)
+        response.headers["X-Request-ID"] = request_id
+        response_level = (
+            logging.ERROR
+            if response.status_code >= 500
+            else logging.WARNING
+            if response.status_code >= 400
+            else logging.INFO
+        )
+        audit_event(
+            "http.request.completed",
+            level=response_level,
+            method=request.method,
+            **safe_request,
+            status_code=response.status_code,
+            elapsed_ms=elapsed_ms,
+        )
+        return response
 
 # Register WebSocket routes for real-time orderbook
 from .ws_book import register_ws_routes
@@ -390,6 +528,12 @@ async def get_status(user: str = Depends(verify_auth)):
         **stats,
         "accounts": accounts_info,
     }
+
+
+@app.get("/api/logging/status")
+async def logging_status(user: str = Depends(verify_auth)):
+    """Expose local log paths, rotation bounds and queue/drop health."""
+    return get_logging_status()
 
 
 @app.get("/api/accounts")
@@ -878,6 +1022,7 @@ async def stop_strategy(account_id: str, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
+    await inst.auto_rebalance.cancel()
     if inst.strategy_d.running:
         await inst.strategy_d.stop()
     if inst.strategy_s.running:
@@ -1777,6 +1922,7 @@ async def account_manual_stop_v2(account_id: str, user: str = Depends(verify_aut
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
+    await inst.auto_rebalance.cancel()
     if inst.strategy_d.running:
         await inst.strategy_d.stop()
     # Stop monitor (bound to strategy)
@@ -1846,6 +1992,8 @@ async def account_rebalance_toggle(account_id: str, request: Request, user: str 
                 "error": "Auto-Rebalance setting could not be persisted",
             },
         )
+    if not enabled:
+        await inst.auto_rebalance.cancel()
     return {"ok": True, "enabled": inst.auto_rebalance.enabled}
 
 
@@ -2182,6 +2330,7 @@ async def account_manual_s_stop(account_id: str, user: str = Depends(verify_auth
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
+    await inst.auto_rebalance.cancel()
     if inst.strategy_s.running:
         await inst.strategy_s.stop()
     # Stop monitor (bound to strategy)

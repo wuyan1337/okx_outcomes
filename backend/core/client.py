@@ -2,6 +2,10 @@
 import json
 import asyncio
 import logging
+import re
+import secrets
+import time
+import traceback
 from typing import Optional
 
 import aiohttp
@@ -9,10 +13,15 @@ from aiohttp_socks import ProxyConnector
 
 from .auth import OKXAuth, OKXSigner
 from .database import PROXY_NODES
+from .logging_config import audit_event
 
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=5)
+_LOG_MAX_TEXT = 512
+_LOG_MAX_PARAM_KEYS = 32
+_LOG_MAX_ACTION_ITEMS = 50
+_QUERY_IN_TEXT_RE = re.compile(r"\?[^\s'\"<>]+")
 
 
 class OKXOutcomesClient:
@@ -52,6 +61,132 @@ class OKXOutcomesClient:
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+
+    def _log_context(self) -> dict:
+        return {
+            "account_id": str(getattr(self, "_account_id", "") or ""),
+            "base_url": self._bounded_text(self.base_url),
+            "region": "AU" if self._region == 1 else "CN",
+            "proxy_node": str(self._proxy_node or "Direct"),
+        }
+
+    @staticmethod
+    def _elapsed_ms(started_ns: int) -> float:
+        return round((time.perf_counter_ns() - started_ns) / 1_000_000, 3)
+
+    @staticmethod
+    def _bounded_text(value, limit: int = _LOG_MAX_TEXT) -> str:
+        text = str(value or "")
+        return text if len(text) <= limit else text[:limit] + "…"
+
+    @classmethod
+    def _safe_message(cls, value, limit: int = _LOG_MAX_TEXT) -> str:
+        """Bound diagnostic text and remove any embedded query values."""
+        without_queries = _QUERY_IN_TEXT_RE.sub("?<query-redacted>", str(value or ""))
+        return cls._bounded_text(without_queries, limit)
+
+    @classmethod
+    def _safe_error_summary(cls, error: BaseException) -> dict:
+        frames = traceback.extract_tb(error.__traceback__)[-12:]
+        return {
+            "type": type(error).__name__,
+            "message": cls._safe_message(error),
+            "stack": [
+                {
+                    "file": cls._bounded_text(frame.filename, 256),
+                    "line": frame.lineno,
+                    "function": cls._bounded_text(frame.name, 128),
+                }
+                for frame in frames
+            ],
+        }
+
+    @classmethod
+    def _safe_param_summary(cls, params: Optional[dict]) -> dict:
+        """Describe a query without storing its values or unbounded keys."""
+        if not isinstance(params, dict):
+            return {"keys": [], "count": 0, "truncated": False}
+        keys = list(params.keys())
+        return {
+            "keys": [cls._bounded_text(key, 64) for key in keys[:_LOG_MAX_PARAM_KEYS]],
+            "count": len(keys),
+            "truncated": len(keys) > _LOG_MAX_PARAM_KEYS
+            or any(len(str(key)) > 64 for key in keys[:_LOG_MAX_PARAM_KEYS]),
+        }
+
+    @staticmethod
+    def _response_metadata(response) -> dict:
+        headers = getattr(response, "headers", {}) or {}
+        content_type = getattr(response, "content_type", "") or ""
+        return {
+            "http_status": getattr(response, "status", None),
+            "content_type": str(content_type)[:128],
+            "content_length": str(headers.get("Content-Length", ""))[:32]
+            if hasattr(headers, "get")
+            else "",
+        }
+
+    @staticmethod
+    def _safe_action_summary(body: dict) -> dict:
+        """Keep order diagnostics while excluding signatures and credentials."""
+        action = body.get("action") if isinstance(body, dict) else {}
+        action = action if isinstance(action, dict) else {}
+        summary = {
+            "type": OKXOutcomesClient._bounded_text(action.get("type", ""), 64),
+            "grouping": OKXOutcomesClient._bounded_text(
+                action.get("grouping", ""), 64
+            ),
+            "nonce": body.get("nonce"),
+            "expires_after": body.get("expiresAfter"),
+        }
+        for key in ("assetIds", "marketId", "size"):
+            if key in action:
+                value = action[key]
+                if isinstance(value, list):
+                    summary[key] = [
+                        OKXOutcomesClient._bounded_text(item, 160)
+                        for item in value[:_LOG_MAX_ACTION_ITEMS]
+                    ]
+                    summary[f"{key}_count"] = len(value)
+                    summary[f"{key}_truncated"] = len(value) > _LOG_MAX_ACTION_ITEMS
+                else:
+                    summary[key] = OKXOutcomesClient._bounded_text(value, 160)
+        if isinstance(action.get("orders"), list):
+            summary["orders"] = [
+                {
+                    key: (
+                        order.get(key)
+                        if isinstance(order.get(key), (bool, int, float))
+                        else OKXOutcomesClient._bounded_text(order.get(key), 160)
+                    )
+                    for key in (
+                        "assetId", "side", "price", "size", "sizeType",
+                        "clientOrderId", "reduceOnly", "orderType",
+                    )
+                    if key in order
+                }
+                for order in action["orders"][:_LOG_MAX_ACTION_ITEMS]
+                if isinstance(order, dict)
+            ]
+            summary["orders_count"] = len(action["orders"])
+            summary["orders_truncated"] = (
+                len(action["orders"]) > _LOG_MAX_ACTION_ITEMS
+            )
+        if isinstance(action.get("cancels"), list):
+            summary["cancels"] = [
+                {
+                    key: OKXOutcomesClient._bounded_text(cancel.get(key), 160)
+                    for key in ("assetId", "oid", "clientOrderId")
+                    if key in cancel
+                }
+                for cancel in action["cancels"][:_LOG_MAX_ACTION_ITEMS]
+                if isinstance(cancel, dict)
+            ]
+            summary["cancels_count"] = len(action["cancels"])
+            summary["cancels_truncated"] = (
+                len(action["cancels"]) > _LOG_MAX_ACTION_ITEMS
+            )
+        return summary
 
     # ─── Read APIs ───
 
@@ -327,55 +462,347 @@ class OKXOutcomesClient:
     async def _get(self, path: str, params: dict = None) -> dict:
         query = ""
         if params:
-            from urllib.parse import urlencode as _urlencode; query = "?" + _urlencode(params)
+            from urllib.parse import urlencode as _urlencode
+            query = "?" + _urlencode(params)
         full_path = path + query
-        headers = self.auth.headers("GET", full_path)
+        request_id = secrets.token_hex(8)
+        safe_path = self._bounded_text(path, 256)
+        query_summary = self._safe_param_summary(params)
 
         for attempt in range(2):
-            session = await self._get_session()
+            started_ns = time.perf_counter_ns()
+            audit_event(
+                "okx.http.request",
+                method="GET",
+                path=safe_path,
+                query=query_summary,
+                request_id=request_id,
+                attempt=attempt + 1,
+                **self._log_context(),
+            )
             try:
+                session = await self._get_session()
+                # Refresh time-sensitive authentication on a connection retry.
+                headers = self.auth.headers("GET", full_path)
                 async with session.get(self.base_url + full_path, headers=headers) as resp:
-                    data = await resp.json()
+                    response_metadata = self._response_metadata(resp)
+                    try:
+                        data = await resp.json()
+                    except (aiohttp.ContentTypeError, json.JSONDecodeError, UnicodeError, ValueError) as exc:
+                        audit_event(
+                            "okx.http.invalid_json",
+                            level=logging.ERROR,
+                            method="GET",
+                            path=safe_path,
+                            query=query_summary,
+                            request_id=request_id,
+                            attempt=attempt + 1,
+                            elapsed_ms=self._elapsed_ms(started_ns),
+                            acknowledged=False,
+                            response_received=True,
+                            error=self._safe_error_summary(exc),
+                            **response_metadata,
+                            **self._log_context(),
+                        )
+                        return {
+                            "code": "INVALID_RESPONSE",
+                            "msg": "OKX returned invalid JSON",
+                        }
+                    if not isinstance(data, dict) or "code" not in data:
+                        audit_event(
+                            "okx.http.invalid_response",
+                            level=logging.ERROR,
+                            method="GET",
+                            path=safe_path,
+                            query=query_summary,
+                            request_id=request_id,
+                            attempt=attempt + 1,
+                            elapsed_ms=self._elapsed_ms(started_ns),
+                            acknowledged=False,
+                            response_received=True,
+                            response_type=type(data).__name__,
+                            **response_metadata,
+                            **self._log_context(),
+                        )
+                        return {
+                            "code": "INVALID_RESPONSE",
+                            "msg": "OKX returned an invalid response shape",
+                        }
+                    code = str(data.get("code", ""))
+                    response_level = (
+                        logging.INFO
+                        if code == "0" and int(getattr(resp, "status", 0) or 0) < 400
+                        else logging.WARNING
+                    )
+                    audit_event(
+                        "okx.http.response",
+                        level=response_level,
+                        method="GET",
+                        path=safe_path,
+                        query=query_summary,
+                        request_id=request_id,
+                        code=code,
+                        message=self._safe_message(
+                            data.get("message") or data.get("msg", "")
+                        ),
+                        elapsed_ms=self._elapsed_ms(started_ns),
+                        attempt=attempt + 1,
+                        acknowledged=True,
+                        response_received=True,
+                        **response_metadata,
+                        **self._log_context(),
+                    )
                     return data
             except asyncio.TimeoutError:
-                logger.error(f"GET {path} timed out")
+                logger.error("GET %s timed out request_id=%s", safe_path, request_id)
+                audit_event(
+                    "okx.http.timeout",
+                    level=logging.ERROR,
+                    method="GET",
+                    path=safe_path,
+                    query=query_summary,
+                    request_id=request_id,
+                    elapsed_ms=self._elapsed_ms(started_ns),
+                    attempt=attempt + 1,
+                    retrying=False,
+                    acknowledged=False,
+                    response_received=False,
+                    **self._log_context(),
+                )
                 return {"code": "TIMEOUT", "msg": "Request timed out"}
             except (aiohttp.ClientError, OSError) as e:
                 # Connection error — close stale session and retry once
+                safe_error = self._safe_error_summary(e)
+                audit_event(
+                    "okx.http.connection_error",
+                    level=logging.WARNING if attempt == 0 else logging.ERROR,
+                    method="GET",
+                    path=safe_path,
+                    query=query_summary,
+                    request_id=request_id,
+                    elapsed_ms=self._elapsed_ms(started_ns),
+                    attempt=attempt + 1,
+                    retrying=attempt == 0,
+                    acknowledged=False,
+                    response_received=False,
+                    error=safe_error,
+                    **self._log_context(),
+                )
                 if attempt == 0:
-                    logger.warning(f"GET {path} connection error, rebuilding session: {e}")
+                    logger.warning(
+                        "GET %s connection error, rebuilding session request_id=%s: %s",
+                        safe_path,
+                        request_id,
+                        safe_error["message"],
+                    )
                     await self.close()
                     continue
-                logger.error(f"GET {path} failed after retry: {e}")
+                logger.error(
+                    "GET %s failed after retry request_id=%s: %s",
+                    safe_path,
+                    request_id,
+                    safe_error["message"],
+                )
                 return {"code": "ERROR", "msg": str(e)}
             except Exception as e:
-                logger.error(f"GET {path} failed: {e}")
+                safe_error = self._safe_error_summary(e)
+                logger.error(
+                    "GET %s failed request_id=%s error_type=%s: %s",
+                    safe_path,
+                    request_id,
+                    safe_error["type"],
+                    safe_error["message"],
+                )
+                audit_event(
+                    "okx.http.exception",
+                    level=logging.ERROR,
+                    method="GET",
+                    path=safe_path,
+                    query=query_summary,
+                    request_id=request_id,
+                    elapsed_ms=self._elapsed_ms(started_ns),
+                    attempt=attempt + 1,
+                    acknowledged=False,
+                    error=safe_error,
+                    **self._log_context(),
+                )
                 return {"code": "ERROR", "msg": str(e)}
         return {"code": "ERROR", "msg": "Unexpected"}
 
     async def _post(self, path: str, body: dict) -> dict:
         body_str = json.dumps(body, separators=(",", ":"))
-        headers = self.auth.headers("POST", path, body_str)
+        request_id = secrets.token_hex(8)
+        safe_path = self._bounded_text(path, 256)
+        action = self._safe_action_summary(body)
 
         for attempt in range(2):
-            session = await self._get_session()
+            started_ns = time.perf_counter_ns()
+            audit_event(
+                "okx.write.request",
+                method="POST",
+                path=safe_path,
+                request_id=request_id,
+                attempt=attempt + 1,
+                action=action,
+                acknowledged=False,
+                **self._log_context(),
+            )
             try:
+                session = await self._get_session()
+                headers = self.auth.headers("POST", path, body_str)
                 async with session.post(
                     self.base_url + path, headers=headers, data=body_str
                 ) as resp:
-                    data = await resp.json()
+                    response_metadata = self._response_metadata(resp)
+                    try:
+                        data = await resp.json()
+                    except (aiohttp.ContentTypeError, json.JSONDecodeError, UnicodeError, ValueError) as exc:
+                        audit_event(
+                            "okx.write.invalid_json",
+                            level=logging.ERROR,
+                            method="POST",
+                            path=safe_path,
+                            request_id=request_id,
+                            elapsed_ms=self._elapsed_ms(started_ns),
+                            attempt=attempt + 1,
+                            action=action,
+                            acknowledged=False,
+                            response_received=True,
+                            order_status_confirmed=False,
+                            error=self._safe_error_summary(exc),
+                            **response_metadata,
+                            **self._log_context(),
+                        )
+                        return {
+                            "code": "INVALID_RESPONSE",
+                            "msg": "OKX returned invalid JSON",
+                        }
+                    if not isinstance(data, dict) or "code" not in data:
+                        audit_event(
+                            "okx.write.invalid_response",
+                            level=logging.ERROR,
+                            method="POST",
+                            path=safe_path,
+                            request_id=request_id,
+                            elapsed_ms=self._elapsed_ms(started_ns),
+                            attempt=attempt + 1,
+                            action=action,
+                            acknowledged=False,
+                            response_received=True,
+                            order_status_confirmed=False,
+                            response_type=type(data).__name__,
+                            **response_metadata,
+                            **self._log_context(),
+                        )
+                        return {
+                            "code": "INVALID_RESPONSE",
+                            "msg": "OKX returned an invalid response shape",
+                        }
+                    response_data = data.get("data", {})
+                    code = str(data.get("code", ""))
+                    http_status = int(getattr(resp, "status", 0) or 0)
+                    audit_event(
+                        "okx.write.response",
+                        level=(
+                            logging.INFO
+                            if code == "0" and http_status < 400
+                            else logging.WARNING
+                        ),
+                        method="POST",
+                        path=safe_path,
+                        request_id=request_id,
+                        code=code,
+                        message=self._safe_message(
+                            data.get("message") or data.get("msg", "")
+                        ),
+                        tx_hash=self._bounded_text(
+                            response_data.get("txHash", ""), 160
+                        ) if isinstance(response_data, dict) else "",
+                        elapsed_ms=self._elapsed_ms(started_ns),
+                        attempt=attempt + 1,
+                        action=action,
+                        acknowledged=True,
+                        response_received=True,
+                        request_accepted=code == "0",
+                        order_status_confirmed=False,
+                        **response_metadata,
+                        **self._log_context(),
+                    )
                     return data
             except asyncio.TimeoutError:
-                logger.error(f"POST {path} timed out")
+                logger.error("POST %s timed out request_id=%s", safe_path, request_id)
+                audit_event(
+                    "okx.write.timeout",
+                    level=logging.ERROR,
+                    method="POST",
+                    path=safe_path,
+                    request_id=request_id,
+                    elapsed_ms=self._elapsed_ms(started_ns),
+                    attempt=attempt + 1,
+                    action=action,
+                    retrying=False,
+                    acknowledged=False,
+                    response_received=False,
+                    order_status_confirmed=False,
+                    **self._log_context(),
+                )
                 return {"code": "TIMEOUT", "msg": "Request timed out"}
             except (aiohttp.ClientError, OSError) as e:
+                safe_error = self._safe_error_summary(e)
+                audit_event(
+                    "okx.write.connection_error",
+                    level=logging.WARNING if attempt == 0 else logging.ERROR,
+                    method="POST",
+                    path=safe_path,
+                    request_id=request_id,
+                    elapsed_ms=self._elapsed_ms(started_ns),
+                    attempt=attempt + 1,
+                    retrying=attempt == 0,
+                    action=action,
+                    acknowledged=False,
+                    response_received=False,
+                    order_status_confirmed=False,
+                    error=safe_error,
+                    **self._log_context(),
+                )
                 if attempt == 0:
-                    logger.warning(f"POST {path} connection error, rebuilding session: {e}")
+                    logger.warning(
+                        "POST %s connection error, rebuilding session request_id=%s: %s",
+                        safe_path,
+                        request_id,
+                        safe_error["message"],
+                    )
                     await self.close()
                     continue
-                logger.error(f"POST {path} failed after retry: {e}")
+                logger.error(
+                    "POST %s failed after retry request_id=%s: %s",
+                    safe_path,
+                    request_id,
+                    safe_error["message"],
+                )
                 return {"code": "ERROR", "msg": str(e)}
             except Exception as e:
-                logger.error(f"POST {path} failed: {e}")
+                safe_error = self._safe_error_summary(e)
+                logger.error(
+                    "POST %s failed request_id=%s error_type=%s: %s",
+                    safe_path,
+                    request_id,
+                    safe_error["type"],
+                    safe_error["message"],
+                )
+                audit_event(
+                    "okx.write.exception",
+                    level=logging.ERROR,
+                    method="POST",
+                    path=safe_path,
+                    request_id=request_id,
+                    elapsed_ms=self._elapsed_ms(started_ns),
+                    attempt=attempt + 1,
+                    action=action,
+                    acknowledged=False,
+                    order_status_confirmed=False,
+                    error=safe_error,
+                    **self._log_context(),
+                )
                 return {"code": "ERROR", "msg": str(e)}
         return {"code": "ERROR", "msg": "Unexpected"}

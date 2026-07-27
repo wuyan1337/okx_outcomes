@@ -83,21 +83,35 @@ class PolyMonitorEmptyBookTests(unittest.IsolatedAsyncioTestCase):
         monitor = PolyMonitor(object(), "empty-ws")
         monitor._check_price = mock.AsyncMock()
 
-        observed = await monitor._observe_book_payload(
-            {"bids": [], "asks": []},
-            "poly_ws",
-        )
+        with mock.patch(
+            "backend.services.poly_monitor.market_event"
+        ) as market_log:
+            observed = await monitor._observe_book_payload(
+                {"bids": [], "asks": [], "timestamp": "1700000000000"},
+                "poly_ws",
+                received_wall_ns=1_700_000_000_123_456_789,
+                received_monotonic_ns=987_654_321,
+            )
 
         self.assertTrue(observed)
         self.assertEqual(monitor.state.last_poly_bid, 0.0)
         monitor._check_price.assert_awaited_once_with(0.0, [], "poly_ws")
+        trace = market_log.call_args
+        self.assertEqual(trace.args, ("polymarket", "monitor.book"))
+        self.assertEqual(trace.kwargs["source_timestamp"], "1700000000000")
+        self.assertEqual(
+            trace.kwargs["received_wall_ns"], 1_700_000_000_123_456_789
+        )
+        self.assertEqual(trace.kwargs["received_monotonic_ns"], 987_654_321)
 
     async def test_zero_bid_triggers_drop_against_positive_reference(self):
         monitor = PolyMonitor(object(), "empty-drop")
         monitor.state.reference_price = 0.55
+        monitor.state.enabled = True
+        monitor._running = True
         reasons = []
 
-        async def record_trigger(reason):
+        async def record_trigger(reason, generation=None):
             reasons.append(reason)
 
         monitor._trigger = record_trigger

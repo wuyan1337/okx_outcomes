@@ -2,6 +2,7 @@
 import asyncio
 from decimal import Decimal, ROUND_FLOOR
 import logging
+import secrets
 import time
 from typing import Optional
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from dataclasses import dataclass
 import aiohttp
 
 from ..core.price_utils import as_decimal, okx_tick
+from ..core.logging_config import audit_event, log_context, market_event
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,10 @@ class PolyMonitor:
         self.account_name = ""
         self.state = MonitorState()
         self._task: Optional[asyncio.Task] = None
+        self._trigger_task: Optional[asyncio.Task] = None
+        self._lifecycle_generation = 0
+        self._run_id = ""
+        self._trigger_trace_id = ""
         self.notifier = None
         self._running = False
         self.on_trigger_callback = None
@@ -53,8 +59,13 @@ class PolyMonitor:
 
     async def start(self, poly_token_id: str, reference_price: float = 0.0, depth_threshold: float = 10000.0):
         """Start monitoring. If reference_price=0, fetch current Poly best bid as reference."""
-        if self._running:
+        if self._running or (
+            self._trigger_task is not None and not self._trigger_task.done()
+        ):
             return {"ok": False, "error": "Monitor already running"}
+
+        self._run_id = secrets.token_hex(8)
+        self._trigger_trace_id = ""
 
         self.state.poly_token_id = poly_token_id
         self.state.depth_threshold = float(as_decimal(depth_threshold))
@@ -71,9 +82,24 @@ class PolyMonitor:
         else:
             self.state.reference_price = float(reference)
 
+        self._lifecycle_generation += 1
         self._running = True
         self.state.enabled = True
-        self._task = asyncio.create_task(self._monitor_loop())
+        audit_event(
+            "monitor.started",
+            account_id=self.account_id,
+            strategy="poly-monitor",
+            run_id=self._run_id,
+            poly_token_id=poly_token_id,
+            reference_price=str(self.state.reference_price),
+            depth_threshold=str(self.state.depth_threshold),
+        )
+        with log_context(
+            account_id=self.account_id,
+            strategy="poly-monitor",
+            run_id=self._run_id,
+        ):
+            self._task = asyncio.create_task(self._monitor_loop())
         logger.info(f"[PolyMonitor] Started for {self.account_id}, ref_price={self.state.reference_price}")
         return {"ok": True, "reference_price": self.state.reference_price}
 
@@ -84,18 +110,91 @@ class PolyMonitor:
         self._strategy_asset_id = asset_id
         self._strategy_mode = mode
 
-    async def stop(self):
-        """Stop monitoring."""
+    async def stop(self, *, cancel_rebalance: bool = True):
+        """Stop and await every task owned by this monitor.
+
+        Rebalance teardown calls this with ``cancel_rebalance=False`` to avoid
+        recursively cancelling the rebalance task that is performing cleanup.
+        User-facing stop paths keep the default and cancel rebalance first-class.
+        """
+        self._lifecycle_generation += 1
         self._running = False
         self.state.enabled = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
+
+        current = asyncio.current_task()
+        monitor_task = self._task
+        trigger_task = self._trigger_task
+        pending = []
+        for task in (monitor_task, trigger_task):
+            if task is not None and task is not current and not task.done():
+                task.cancel()
+                pending.append(task)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        if self._task is monitor_task and monitor_task is not current:
             self._task = None
+        if self._trigger_task is trigger_task and trigger_task is not current:
+            self._trigger_task = None
+
+        if cancel_rebalance and self.auto_rebalance is not None:
+            await self.auto_rebalance.cancel()
         logger.info(f"[PolyMonitor] Stopped for {self.account_id}")
+        audit_event(
+            "monitor.stopped",
+            account_id=self.account_id,
+            strategy="poly-monitor",
+            run_id=self._run_id,
+            trigger_trace_id=self._trigger_trace_id,
+            triggered=self.state.triggered,
+            cancel_rebalance=cancel_rebalance,
+        )
+
+    def _schedule_trigger(self, reason: str) -> Optional[asyncio.Task]:
+        """Schedule one owned trigger for the current monitor generation."""
+        if not self._running or not self.state.enabled or self.state.triggered:
+            return None
+        if self._trigger_task is not None and not self._trigger_task.done():
+            return self._trigger_task
+
+        generation = self._lifecycle_generation
+        self._trigger_trace_id = secrets.token_hex(8)
+        audit_event(
+            "monitor.trigger_scheduled",
+            account_id=self.account_id,
+            strategy="poly-monitor",
+            run_id=self._run_id,
+            trace_id=self._trigger_trace_id,
+            reason=reason,
+            lifecycle_generation=generation,
+        )
+        task = asyncio.create_task(self._trigger(reason, generation=generation))
+        self._trigger_task = task
+
+        def _trigger_done(done: asyncio.Task) -> None:
+            if self._trigger_task is done:
+                self._trigger_task = None
+            if done.cancelled():
+                return
+            try:
+                error = done.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                logger.error(
+                    "[PolyMonitor] Trigger task failed for %s: %s",
+                    self.account_id,
+                    error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(_trigger_done)
+        return task
+
+    def _trigger_generation_active(self, generation: Optional[int]) -> bool:
+        return generation is None or (
+            generation == self._lifecycle_generation and self.state.enabled
+        )
 
     async def _get_poly_best_bid(self, token_id: str) -> Optional[float]:
         """Fetch current Poly best bid price."""
@@ -119,7 +218,14 @@ class PolyMonitor:
         )
         return float(as_decimal(bids[0].get("price", "0"))), bids
 
-    async def _observe_book_payload(self, data: dict, source: str) -> bool:
+    async def _observe_book_payload(
+        self,
+        data: dict,
+        source: str,
+        *,
+        received_wall_ns: Optional[int] = None,
+        received_monotonic_ns: Optional[int] = None,
+    ) -> bool:
         """Apply one valid full-book observation to monitor state and risk checks."""
         try:
             best_bid, bids = self._best_bid_from_payload(data)
@@ -127,20 +233,77 @@ class PolyMonitor:
             return False
         self.state.last_poly_bid = best_bid
         self.state.last_check_ts = int(time.time() * 1000)
+        market_event(
+            "polymarket",
+            "monitor.book",
+            component="poly-monitor",
+            account_id=self.account_id,
+            run_id=self._run_id,
+            poly_token_id=self.state.poly_token_id,
+            feed_source=source,
+            source_timestamp=data.get("timestamp", data.get("ts", "")),
+            received_wall_ns=received_wall_ns or time.time_ns(),
+            received_monotonic_ns=(
+                received_monotonic_ns or time.monotonic_ns()
+            ),
+            best_bid=str(best_bid),
+            bids=bids,
+            asks=data.get("asks") or [],
+        )
         await self._check_price(best_bid, bids, source)
         return True
 
     async def _get_poly_best_bid_with_depth(self, token_id: str):
         """Fetch current Poly best bid price and full bids list (sorted high->low)."""
+        started_ns = time.perf_counter_ns()
         try:
             async with aiohttp.ClientSession() as sess:
                 url = POLY_CLOB_BOOK.format(token_id=token_id)
                 async with sess.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        return self._best_bid_from_payload(data)
+                        received_wall_ns = time.time_ns()
+                        received_monotonic_ns = time.monotonic_ns()
+                        best_bid, bids = self._best_bid_from_payload(data)
+                        market_event(
+                            "polymarket",
+                            "monitor.rest_book",
+                            component="poly-monitor",
+                            account_id=self.account_id,
+                            run_id=self._run_id,
+                            poly_token_id=token_id,
+                            source_timestamp=data.get("timestamp", data.get("ts", "")),
+                            received_wall_ns=received_wall_ns,
+                            received_monotonic_ns=received_monotonic_ns,
+                            http_status=resp.status,
+                            elapsed_ms=round((time.perf_counter_ns() - started_ns) / 1_000_000, 3),
+                            best_bid=str(best_bid),
+                            bids=bids,
+                            asks=data.get("asks") or [],
+                        )
+                        return best_bid, bids
+                    market_event(
+                        "polymarket",
+                        "monitor.rest_error",
+                        level=logging.WARNING,
+                        component="poly-monitor",
+                        account_id=self.account_id,
+                        run_id=self._run_id,
+                        poly_token_id=token_id,
+                        http_status=resp.status,
+                        elapsed_ms=round((time.perf_counter_ns() - started_ns) / 1_000_000, 3),
+                    )
         except Exception as e:
             logger.warning(f"[PolyMonitor] Failed to get Poly bid: {e}")
+            audit_event(
+                "monitor.poly_rest_failed",
+                level=logging.WARNING,
+                account_id=self.account_id,
+                run_id=self._run_id,
+                poly_token_id=token_id,
+                elapsed_ms=round((time.perf_counter_ns() - started_ns) / 1_000_000, 3),
+                error=e,
+            )
         return None, []
 
     async def _monitor_loop(self):
@@ -192,6 +355,8 @@ class PolyMonitor:
                         retry_delay = 1
 
                         async for msg in ws:
+                            received_wall_ns = time.time_ns()
+                            received_monotonic_ns = time.monotonic_ns()
                             if not self._running or self.state.triggered:
                                 break
                             if msg.type == aiohttp.WSMsgType.TEXT:
@@ -200,9 +365,26 @@ class PolyMonitor:
                                     items = raw if isinstance(raw, list) else [raw]
                                     for data in items:
                                         if data.get("event_type") == "book":
-                                            await self._observe_book_payload(data, "poly_ws")
+                                            await self._observe_book_payload(
+                                                data,
+                                                "poly_ws",
+                                                received_wall_ns=received_wall_ns,
+                                                received_monotonic_ns=received_monotonic_ns,
+                                            )
                                         elif data.get("event_type") == "price_change":
                                             changes = data.get("price_changes", [])
+                                            market_event(
+                                                "polymarket",
+                                                "monitor.price_change",
+                                                component="poly-monitor",
+                                                account_id=self.account_id,
+                                                run_id=self._run_id,
+                                                poly_token_id=token_id,
+                                                source_timestamp=data.get("timestamp", data.get("ts", "")),
+                                                received_wall_ns=received_wall_ns,
+                                                received_monotonic_ns=received_monotonic_ns,
+                                                changes=changes,
+                                            )
                                             if any(
                                                 str(change.get("asset_id", change.get("assetId", ""))) in ("", str(token_id))
                                                 for change in changes
@@ -213,7 +395,7 @@ class PolyMonitor:
                                                     self.state.last_check_ts = int(time.time() * 1000)
                                                     await self._check_price(best_bid, bids, "poly_ws_change")
                                 except Exception:
-                                    pass
+                                    logger.debug("[PolyMonitor] Invalid WS payload", exc_info=True)
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
             except asyncio.CancelledError:
@@ -241,14 +423,9 @@ class PolyMonitor:
            Only trigger if depth at new best bid >= threshold (confirms real move).
            For bid-sell mode: ROSE also triggers (need to rebalance up to capture higher spread).
         """
+        raw_current_bid = as_decimal(current_bid)
         current_bid = self._risk_bid_price(current_bid)
         ref = self._risk_bid_price(self.state.reference_price)
-        if ref <= 0:
-            return
-
-        if current_bid == ref:
-            return
-
         # Calculate depth at best bid level (used for logging + condition B)
         best_bid_size = Decimal("0")
         if bids:
@@ -262,6 +439,31 @@ class PolyMonitor:
         self.state.last_poly_bid_size = float(best_bid_size)
         self.state.last_poly_bid_value = float(best_bid_value)
 
+        relation = "invalid_reference" if ref <= 0 else (
+            "equal" if current_bid == ref else "dropped" if current_bid < ref else "rose"
+        )
+        market_event(
+            "polymarket",
+            "monitor.risk_observation",
+            component="poly-monitor",
+            account_id=self.account_id,
+            run_id=self._run_id,
+            trace_id=self._trigger_trace_id,
+            poly_token_id=self.state.poly_token_id,
+            feed_source=source,
+            raw_bid=str(raw_current_bid),
+            risk_bid=str(current_bid),
+            raw_reference=str(self.state.reference_price),
+            risk_reference=str(ref),
+            best_bid_size=str(best_bid_size),
+            best_bid_value=str(best_bid_value),
+            depth_threshold=str(self.state.depth_threshold),
+            relation=relation,
+            bids=bids,
+        )
+        if ref <= 0 or current_bid == ref:
+            return
+
         # CONDITION A: Price dropped (bid < reference)
         # Reference price disappeared from bids → immediate trigger
         if current_bid < ref:
@@ -269,7 +471,7 @@ class PolyMonitor:
                 f"Poly bid DROPPED: {ref:.3f} -> {current_bid:.3f} "
                 f"(reference gone from bid side) [{source}]"
             )
-            asyncio.ensure_future(asyncio.shield(self._trigger(reason)))
+            self._schedule_trigger(reason)
             return
 
         # CONDITION B: Price rose (bid > reference)
@@ -282,27 +484,58 @@ class PolyMonitor:
                     f"[PolyMonitor] Bid rose {ref:.2f}->{current_bid:.2f} "
                     f"but value {best_bid_value:.0f} xp < {threshold:.0f} xp, ignoring"
                 )
+                audit_event(
+                    "monitor.signal_ignored_depth",
+                    account_id=self.account_id,
+                    run_id=self._run_id,
+                    poly_token_id=self.state.poly_token_id,
+                    risk_bid=str(current_bid),
+                    bid_value=str(best_bid_value),
+                    threshold=str(threshold),
+                )
                 return
             reason = (
                 f"Poly bid ROSE: {ref:.3f} -> {current_bid:.3f} "
                 f"({best_bid_value:,.0f} xp at new bid >= {threshold:,.0f} xp threshold) [{source}]"
             )
-            asyncio.ensure_future(asyncio.shield(self._trigger(reason)))
+            self._schedule_trigger(reason)
 
-    async def _trigger(self, reason: str):
+    async def _trigger(self, reason: str, generation: Optional[int] = None):
         """Price deviated - CANCEL FIRST, then stop strategy, then notify."""
-        if self.state.triggered:
+        if self.state.triggered or not self._trigger_generation_active(generation):
             return
 
         self.state.triggered = True
         self.state.trigger_reason = reason
         self._running = False
         logger.warning(f"[PolyMonitor] TRIGGERED: {reason}")
+        audit_event(
+            "monitor.triggered",
+            level=logging.WARNING,
+            account_id=self.account_id,
+            strategy="poly-monitor",
+            run_id=self._run_id,
+            trace_id=self._trigger_trace_id,
+            reason=reason,
+            lifecycle_generation=generation,
+        )
 
         # Step 1: CANCEL ALL ORDERS IMMEDIATELY (highest priority)
         cancelled = await self._fast_cancel_all()
         logger.info(f"[PolyMonitor] Final cancel result: {cancelled}")
         cancel_confirmed = bool(cancelled.get("ok"))
+        audit_event(
+            "monitor.cancel_all_verified",
+            level=logging.INFO if cancel_confirmed else logging.ERROR,
+            account_id=self.account_id,
+            run_id=self._run_id,
+            trace_id=self._trigger_trace_id,
+            result=cancelled,
+        )
+
+        if not self._trigger_generation_active(generation):
+            logger.info("[PolyMonitor] Trigger stopped before strategy callback")
+            return
 
         # Step 2: Bound the strategy-stop wait to five seconds.
         strategies_stopped = False
@@ -319,6 +552,10 @@ class PolyMonitor:
                 logger.error(
                     f"[PolyMonitor] Strategy stop failed; auto-rebalance blocked: {e}"
                 )
+
+        if not self._trigger_generation_active(generation):
+            logger.info("[PolyMonitor] Trigger stopped before notification/rebalance")
+            return
 
         # TG notification
         if self.notifier:
@@ -345,6 +582,10 @@ class PolyMonitor:
                 logger.error(f"[PolyMonitor] TG notify failed: {e}")
         else:
             logger.warning("[PolyMonitor] No notifier configured!")
+
+        if not self._trigger_generation_active(generation):
+            logger.info("[PolyMonitor] Trigger stopped before auto-rebalance")
+            return
 
         # Auto-rebalance: on any price move (DROPPED or ROSE)
         if (

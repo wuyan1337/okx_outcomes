@@ -1,10 +1,12 @@
 """Account manager: manages OKX client instances and strategies per account."""
 import asyncio
 import logging
+import time
 from decimal import Decimal
 from typing import Dict, Optional
 
 from ..core.client import OKXOutcomesClient
+from ..core.logging_config import audit_event as _emit_audit_event
 from ..core.price_utils import align_okx_price, as_decimal, price_to_cents
 from ..core.database import (
     get_accounts, get_account_decrypted, create_account, update_account,
@@ -22,6 +24,18 @@ from .notifier import TelegramNotifier
 logger = logging.getLogger(__name__)
 
 
+def audit_event(event: str, *, level: int = logging.INFO, **fields) -> None:
+    """Emit account audit data without letting logging affect lifecycle work."""
+    try:
+        _emit_audit_event(event, level=level, **fields)
+    except Exception:
+        logger.exception("Account audit logging failed for event %s", event)
+
+
+def _elapsed_ms(started_ns: int) -> float:
+    return round((time.perf_counter_ns() - started_ns) / 1_000_000, 3)
+
+
 class AccountInstance:
     """A live account instance with its own client and strategies."""
 
@@ -30,6 +44,7 @@ class AccountInstance:
         self.account_id = account_id
         self.name = name
         self.client = client
+        self.client._account_id = account_id
         self.proxy_node = proxy_node
         self.strategy_lifecycle_lock = asyncio.Lock()
         self.strategy_d = ManualStrategyD(client, account_id=account_id)
@@ -46,7 +61,7 @@ class AccountInstance:
         self.auto_rebalance.restart_strategy = self._restart_strategy
         self.auto_rebalance.restart_monitor = self._restart_monitor
         self.auto_rebalance.stop_strategy = self._stop_all_strategies
-        self.auto_rebalance.stop_monitor = self.poly_monitor.stop
+        self.auto_rebalance.stop_monitor = self._stop_monitor_for_rebalance
         self.strategy_s.auto_rebalance = self.auto_rebalance
         # Sniper
         self.sniper = PolySniper(client, account_id=account_id)
@@ -64,8 +79,25 @@ class AccountInstance:
             self.auto_rebalance.notifier = notifier
             self.sniper.notifier = notifier
             self.sniper_old.notifier = notifier
+        audit_event(
+            "account.instance_created",
+            account_id=self.account_id,
+            proxy_node=self.proxy_node,
+            base_url=getattr(self.client, "base_url", ""),
+            notifier_enabled=bool(notifier),
+        )
+
+    @staticmethod
+    def _elapsed_ms(started_ns: int) -> float:
+        return _elapsed_ms(started_ns)
 
     def _persist_sniper_snapshot(self, snapshot: Optional[dict] = None) -> bool:
+        started_ns = time.perf_counter_ns()
+        audit_event(
+            "sniper.persistence_started",
+            account_id=self.account_id,
+            supplied_snapshot=snapshot is not None,
+        )
         if (
             getattr(self, "_sniper_snapshot_corrupt", False)
             or getattr(self, "_sniper_snapshot_write_blocked", False)
@@ -74,18 +106,42 @@ class AccountInstance:
                 "Refusing to overwrite unsafe sniper snapshot for %s",
                 self.account_id,
             )
+            audit_event(
+                "sniper.persistence_blocked",
+                level=logging.ERROR,
+                account_id=self.account_id,
+                elapsed_ms=self._elapsed_ms(started_ns),
+            )
             return False
         try:
             state = snapshot or self.sniper.get_state()
+            config = self.sniper.get_config()
             save_sniper_state(
                 self.account_id,
-                self.sniper.get_config(),
+                config,
                 state,
                 bool(state.get("running")),
+            )
+            audit_event(
+                "sniper.state_persisted",
+                account_id=self.account_id,
+                running=bool(state.get("running")),
+                status=state.get("status", ""),
+                locked=bool(state.get("locked")),
+                active_target_id=state.get("active_target_id", ""),
+                target_count=len((config or {}).get("targets", [])),
+                elapsed_ms=self._elapsed_ms(started_ns),
             )
             return True
         except Exception as exc:
             logger.error("Failed to persist sniper state for %s: %s", self.account_id, exc)
+            audit_event(
+                "sniper.persistence_failed",
+                level=logging.ERROR,
+                account_id=self.account_id,
+                error=exc,
+                elapsed_ms=self._elapsed_ms(started_ns),
+            )
             return False
 
     def _get_strategy_params(self) -> dict:
@@ -210,7 +266,7 @@ class AccountInstance:
             raise RuntimeError("Cannot restart monitor: another monitor is already running")
         depth_threshold = self.poly_monitor.state.depth_threshold
         if getattr(self.poly_monitor, "_task", None) is not None:
-            await self.poly_monitor.stop()
+            await self.poly_monitor.stop(cancel_rebalance=False)
         # Reset triggered state
         self.poly_monitor.state.triggered = False
         self.poly_monitor.state.trigger_reason = ""
@@ -244,6 +300,10 @@ class AccountInstance:
         )
         return result
 
+    async def _stop_monitor_for_rebalance(self):
+        """Stop monitor state without recursively cancelling Auto-Rebalance."""
+        await self.poly_monitor.stop(cancel_rebalance=False)
+
     async def _stop_all_strategies(self):
         """Stop all running strategies (called by monitor on trigger)."""
         if self.strategy_d.running:
@@ -252,39 +312,107 @@ class AccountInstance:
             await self.strategy_s.stop()
 
     async def close(self, cancel_orders: bool = True):
+        started_ns = time.perf_counter_ns()
+        stage = "start"
+        account_id = getattr(self, "account_id", "")
         sniper_was_running = self.sniper.running
-        # A background rebalance can otherwise outlive the client and restart
-        # strategies or submit orders after account shutdown/removal.
-        if hasattr(self, "auto_rebalance") and self.auto_rebalance:
-            await self.auto_rebalance.cancel()
-        if self.strategy_d.running:
-            await self.strategy_d.stop()
-        if self.strategy_s.running:
-            await self.strategy_s.stop()
-        monitor_enabled = bool(
-            getattr(getattr(self.poly_monitor, "state", None), "enabled", False)
+        audit_event(
+            "account.close_started",
+            account_id=account_id,
+            cancel_orders=cancel_orders,
+            strategy_d_running=bool(self.strategy_d.running),
+            strategy_s_running=bool(self.strategy_s.running),
+            monitor_running=bool(self.poly_monitor.running),
+            sniper_running=bool(sniper_was_running),
+            sniper_old_running=bool(self.sniper_old.running),
+            rebalance_running=bool(
+                getattr(getattr(self, "auto_rebalance", None), "_rebalancing", False)
+            ),
         )
-        if self.poly_monitor.running or monitor_enabled:
-            await self.poly_monitor.stop()
-        if self.sniper.running:
-            await self.sniper.stop()
-        if self.sniper_old.running:
-            await self.sniper_old.stop()
-        # Manual account removal can still cancel, but app/service shutdown must not
-        # wipe live exchange orders. Lifespan close_all passes cancel_orders=False.
-        if cancel_orders:
-            try:
-                await self.client.cancel_all()
-            except Exception:
-                pass
-        elif sniper_was_running:
-            snapshot = self.sniper.get_state()
-            snapshot["running"] = True
-            self._persist_sniper_snapshot(snapshot)
-        await self.client.close()
+        try:
+            # A background rebalance can otherwise outlive the client and restart
+            # strategies or submit orders after account shutdown/removal.
+            stage = "cancel_rebalance"
+            if hasattr(self, "auto_rebalance") and self.auto_rebalance:
+                await self.auto_rebalance.cancel()
+            stage = "stop_manual_d"
+            if self.strategy_d.running:
+                await self.strategy_d.stop()
+            stage = "stop_manual_s"
+            if self.strategy_s.running:
+                await self.strategy_s.stop()
+            monitor_enabled = bool(
+                getattr(getattr(self.poly_monitor, "state", None), "enabled", False)
+            )
+            stage = "stop_poly_monitor"
+            if self.poly_monitor.running or monitor_enabled:
+                await self.poly_monitor.stop()
+            stage = "stop_sniper"
+            if self.sniper.running:
+                await self.sniper.stop()
+            stage = "stop_sniper_old"
+            if self.sniper_old.running:
+                await self.sniper_old.stop()
+            # Manual account removal can still cancel, but app/service shutdown must not
+            # wipe live exchange orders. Lifespan close_all passes cancel_orders=False.
+            if cancel_orders:
+                stage = "cancel_exchange_orders"
+                cancel_started_ns = time.perf_counter_ns()
+                try:
+                    cancel_result = await self.client.cancel_all()
+                    audit_event(
+                        "account.close_cancel_all_response",
+                        account_id=account_id,
+                        code=(cancel_result or {}).get("code", "")
+                        if isinstance(cancel_result, dict)
+                        else "",
+                        elapsed_ms=self._elapsed_ms(cancel_started_ns),
+                    )
+                except Exception as exc:
+                    audit_event(
+                        "account.close_cancel_all_failed",
+                        level=logging.ERROR,
+                        account_id=account_id,
+                        error=exc,
+                        elapsed_ms=self._elapsed_ms(cancel_started_ns),
+                    )
+            elif sniper_was_running:
+                stage = "persist_resume_marker"
+                snapshot = self.sniper.get_state()
+                snapshot["running"] = True
+                self._persist_sniper_snapshot(snapshot)
+            stage = "close_client"
+            await self.client.close()
+        except asyncio.CancelledError:
+            audit_event(
+                "account.close_cancelled",
+                level=logging.WARNING,
+                account_id=account_id,
+                stage=stage,
+                elapsed_ms=self._elapsed_ms(started_ns),
+            )
+            raise
+        except Exception as exc:
+            audit_event(
+                "account.close_failed",
+                level=logging.ERROR,
+                account_id=account_id,
+                stage=stage,
+                elapsed_ms=self._elapsed_ms(started_ns),
+                error=exc,
+            )
+            raise
+        audit_event(
+            "account.close_completed",
+            account_id=account_id,
+            cancel_orders=cancel_orders,
+            resume_marker_preserved=bool(not cancel_orders and sniper_was_running),
+            elapsed_ms=self._elapsed_ms(started_ns),
+        )
 
     def install_client(self, client: OKXOutcomesClient) -> OKXOutcomesClient:
         """Atomically redirect every strategy reference to a prepared client."""
+        client._account_id = self.account_id
         previous = self.client
         self.client = client
         self.strategy_d.client = client
@@ -293,31 +421,92 @@ class AccountInstance:
         self.auto_rebalance.client = client
         self.sniper.client = client
         self.sniper_old.client = client
+        audit_event(
+            "account.client_installed",
+            account_id=self.account_id,
+            previous_base_url=getattr(previous, "base_url", ""),
+            new_base_url=getattr(client, "base_url", ""),
+            previous_proxy_node=getattr(previous, "_proxy_node", ""),
+            new_proxy_node=getattr(client, "_proxy_node", ""),
+        )
         return previous
 
     async def reload_client(self):
         """Build and install a fresh client before closing the previous one."""
-        acc = get_account_decrypted(self.account_id)
-        if not acc:
-            raise RuntimeError("Account not found")
-        if hasattr(self, "auto_rebalance") and self.auto_rebalance:
-            await self.auto_rebalance.cancel()
-        replacement = OKXOutcomesClient(
-            api_key=acc["api_key"],
-            secret_key=acc["secret_key"],
-            passphrase=acc["passphrase"],
-            agent_private_key=acc["agent_private_key"],
-            base_url=acc.get("base_url", "https://us.okx.com"),
-            proxy_node=acc.get("proxy_node", "JP2"),
+        started_ns = time.perf_counter_ns()
+        stage = "load_account_config"
+        audit_event("account.reload_started", account_id=self.account_id)
+        try:
+            acc = get_account_decrypted(self.account_id)
+            if not acc:
+                raise RuntimeError("Account not found")
+            audit_event(
+                "account.reload_config_loaded",
+                account_id=self.account_id,
+                base_url=acc.get("base_url", "https://us.okx.com"),
+                proxy_node=acc.get("proxy_node", "JP2"),
+            )
+            stage = "cancel_rebalance"
+            if hasattr(self, "auto_rebalance") and self.auto_rebalance:
+                await self.auto_rebalance.cancel()
+            stage = "build_client"
+            replacement = OKXOutcomesClient(
+                api_key=acc["api_key"],
+                secret_key=acc["secret_key"],
+                passphrase=acc["passphrase"],
+                agent_private_key=acc["agent_private_key"],
+                base_url=acc.get("base_url", "https://us.okx.com"),
+                proxy_node=acc.get("proxy_node", "JP2"),
+            )
+            if not replacement.signer.address:
+                raise ValueError("Invalid agent private key")
+            stage = "install_client"
+            previous = self.install_client(replacement)
+            stage = "close_previous_client"
+            if previous and hasattr(previous, "close"):
+                previous_close_ns = time.perf_counter_ns()
+                try:
+                    await previous.close()
+                    audit_event(
+                        "account.previous_client_closed",
+                        account_id=self.account_id,
+                        elapsed_ms=self._elapsed_ms(previous_close_ns),
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to close previous client for %s: %s", self.account_id, exc)
+                    audit_event(
+                        "account.previous_client_close_failed",
+                        level=logging.WARNING,
+                        account_id=self.account_id,
+                        elapsed_ms=self._elapsed_ms(previous_close_ns),
+                        error=exc,
+                    )
+        except asyncio.CancelledError:
+            audit_event(
+                "account.reload_cancelled",
+                level=logging.WARNING,
+                account_id=self.account_id,
+                stage=stage,
+                elapsed_ms=self._elapsed_ms(started_ns),
+            )
+            raise
+        except Exception as exc:
+            audit_event(
+                "account.reload_failed",
+                level=logging.ERROR,
+                account_id=self.account_id,
+                stage=stage,
+                elapsed_ms=self._elapsed_ms(started_ns),
+                error=exc,
+            )
+            raise
+        audit_event(
+            "account.reload_completed",
+            account_id=self.account_id,
+            base_url=getattr(self.client, "base_url", ""),
+            proxy_node=getattr(self.client, "_proxy_node", ""),
+            elapsed_ms=self._elapsed_ms(started_ns),
         )
-        if not replacement.signer.address:
-            raise ValueError("Invalid agent private key")
-        previous = self.install_client(replacement)
-        if previous and hasattr(previous, "close"):
-            try:
-                await previous.close()
-            except Exception as exc:
-                logger.warning("Failed to close previous client for %s: %s", self.account_id, exc)
 
 class AccountManager:
     """Manages all account instances."""
@@ -329,6 +518,8 @@ class AccountManager:
 
     async def init(self):
         """Load all accounts from DB and create client instances."""
+        started_ns = time.perf_counter_ns()
+        audit_event("accounts.init_started")
         # Init notifier from global config
         tg_token = get_global_config("tg_token", "")
         tg_chats_str = get_global_config("tg_chats", "")
@@ -337,70 +528,217 @@ class AccountManager:
 
         # Load accounts
         accounts = get_accounts()
+        audit_event("accounts.init_discovered", account_count=len(accounts))
         for acc in accounts:
             try:
                 await self._load_account(acc["id"])
             except Exception as e:
                 logger.error(f"Failed to load account {acc['name']}: {e}")
+                audit_event(
+                    "account.load_failed",
+                    level=logging.ERROR,
+                    account_id=acc.get("id", ""),
+                    stage="init_loop",
+                    error=e,
+                )
+        audit_event(
+            "accounts.init_completed",
+            discovered_count=len(accounts),
+            loaded_count=len(self.instances),
+            failed_count=max(0, len(accounts) - len(self.instances)),
+            elapsed_ms=_elapsed_ms(started_ns),
+        )
 
     async def _load_account(self, account_id: str) -> Optional[AccountInstance]:
         """Load a single account into memory."""
-        acc = get_account_decrypted(account_id)
-        if not acc:
-            return None
-
-        client = OKXOutcomesClient(
-            api_key=acc["api_key"],
-            secret_key=acc["secret_key"],
-            passphrase=acc["passphrase"],
-            agent_private_key=acc["agent_private_key"],
-            base_url=acc.get("base_url", "https://us.okx.com"),
-            proxy_node=acc["proxy_node"],
-        )
-
-        instance = AccountInstance(
-            account_id=acc["id"],
-            name=acc["name"],
-            client=client,
-            proxy_node=acc["proxy_node"],
-            notifier=self.notifier,
-        )
-        self.instances[acc["id"]] = instance
-        saved_sniper = get_sniper_state(acc["id"])
-        if saved_sniper:
-            if saved_sniper.get("corrupt"):
-                instance._sniper_snapshot_corrupt = True
-                instance._sniper_snapshot_write_blocked = True
-                instance.sniper.state.status = "error"
-                instance.sniper.state.locked = True
-                logger.error(
-                    "Sniper snapshot for %s is corrupt (%s); preserving the database row and blocking writes",
-                    acc["id"],
-                    ", ".join(saved_sniper.get("corrupt_fields") or ["unknown field"]),
+        started_ns = time.perf_counter_ns()
+        stage = "load_account_config"
+        audit_event("account.load_started", account_id=account_id)
+        try:
+            acc = get_account_decrypted(account_id)
+            if not acc:
+                audit_event(
+                    "account.load_not_found",
+                    level=logging.WARNING,
+                    account_id=account_id,
+                    elapsed_ms=_elapsed_ms(started_ns),
                 )
-                return instance
-            restore_state = dict(saved_sniper.get("runtime") or {})
-            restore_state.update(saved_sniper.get("config") or {})
-            result = await instance.sniper.restore(
-                restore_state,
-                resume=bool(saved_sniper.get("running")),
+                return None
+            audit_event(
+                "account.config_loaded",
+                account_id=account_id,
+                base_url=acc.get("base_url", "https://us.okx.com"),
+                proxy_node=acc.get("proxy_node", ""),
             )
-            if not result.get("ok"):
-                instance.sniper.state.status = "error"
-                instance.sniper.state.locked = True
-                semantic_failure = not result.get("needs_reconciliation", False)
-                if semantic_failure:
-                    # Parsing/config validation failed before a trustworthy
-                    # runtime could be restored. Preserve the original row.
-                    instance._sniper_snapshot_write_blocked = True
-                logger.error(
-                    "Sniper restore for %s requires attention: %s",
-                    acc["id"],
-                    result.get("error", "unknown error"),
+
+            stage = "build_client"
+            client = OKXOutcomesClient(
+                api_key=acc["api_key"],
+                secret_key=acc["secret_key"],
+                passphrase=acc["passphrase"],
+                agent_private_key=acc["agent_private_key"],
+                base_url=acc.get("base_url", "https://us.okx.com"),
+                proxy_node=acc["proxy_node"],
+            )
+
+            stage = "create_instance"
+            instance = AccountInstance(
+                account_id=acc["id"],
+                name=acc["name"],
+                client=client,
+                proxy_node=acc["proxy_node"],
+                notifier=self.notifier,
+            )
+            self.instances[acc["id"]] = instance
+            audit_event(
+                "account.instance_registered",
+                account_id=account_id,
+                loaded_account_count=len(self.instances),
+            )
+
+            stage = "load_sniper_snapshot"
+            saved_sniper = get_sniper_state(acc["id"])
+            if saved_sniper:
+                saved_config = (
+                    saved_sniper.get("config")
+                    if isinstance(saved_sniper.get("config"), dict)
+                    else {}
                 )
-                return instance
-            instance._persist_sniper_snapshot()
-        return instance
+                saved_runtime = (
+                    saved_sniper.get("runtime")
+                    if isinstance(saved_sniper.get("runtime"), dict)
+                    else {}
+                )
+                saved_targets = saved_config.get("targets", [])
+                audit_event(
+                    "sniper.snapshot_loaded",
+                    account_id=account_id,
+                    running=bool(saved_sniper.get("running")),
+                    corrupt=bool(saved_sniper.get("corrupt")),
+                    corrupt_fields=saved_sniper.get("corrupt_fields") or [],
+                    config_target_count=(
+                        len(saved_targets) if isinstance(saved_targets, list) else 0
+                    ),
+                    runtime_status=saved_runtime.get("status", ""),
+                )
+                if saved_sniper.get("corrupt"):
+                    instance._sniper_snapshot_corrupt = True
+                    instance._sniper_snapshot_write_blocked = True
+                    instance.sniper.state.status = "error"
+                    instance.sniper.state.locked = True
+                    logger.error(
+                        "Sniper snapshot for %s is corrupt (%s); preserving the database row and blocking writes",
+                        acc["id"],
+                        ", ".join(saved_sniper.get("corrupt_fields") or ["unknown field"]),
+                    )
+                    audit_event(
+                        "sniper.restore_blocked_corrupt_snapshot",
+                        level=logging.ERROR,
+                        account_id=account_id,
+                        corrupt_fields=saved_sniper.get("corrupt_fields") or [],
+                    )
+                    audit_event(
+                        "account.load_completed",
+                        level=logging.WARNING,
+                        account_id=account_id,
+                        restore_status="blocked_corrupt_snapshot",
+                        elapsed_ms=_elapsed_ms(started_ns),
+                    )
+                    return instance
+                restore_state = dict(saved_runtime)
+                restore_state.update(saved_config)
+                stage = "restore_sniper"
+                restore_started_ns = time.perf_counter_ns()
+                audit_event(
+                    "sniper.restore_started",
+                    account_id=account_id,
+                    resume=bool(saved_sniper.get("running")),
+                )
+                try:
+                    result = await instance.sniper.restore(
+                        restore_state,
+                        resume=bool(saved_sniper.get("running")),
+                    )
+                except asyncio.CancelledError:
+                    audit_event(
+                        "sniper.restore_cancelled",
+                        level=logging.WARNING,
+                        account_id=account_id,
+                        elapsed_ms=_elapsed_ms(restore_started_ns),
+                    )
+                    raise
+                except Exception as restore_exc:
+                    audit_event(
+                        "sniper.restore_failed",
+                        level=logging.ERROR,
+                        account_id=account_id,
+                        elapsed_ms=_elapsed_ms(restore_started_ns),
+                        error=restore_exc,
+                    )
+                    raise
+                audit_event(
+                    "sniper.restore_completed",
+                    level=(logging.INFO if result.get("ok") else logging.ERROR),
+                    account_id=account_id,
+                    ok=bool(result.get("ok")),
+                    needs_reconciliation=bool(
+                        result.get("needs_reconciliation", False)
+                    ),
+                    error=result.get("error", ""),
+                    elapsed_ms=_elapsed_ms(restore_started_ns),
+                )
+                if not result.get("ok"):
+                    instance.sniper.state.status = "error"
+                    instance.sniper.state.locked = True
+                    semantic_failure = not result.get("needs_reconciliation", False)
+                    if semantic_failure:
+                        # Parsing/config validation failed before a trustworthy
+                        # runtime could be restored. Preserve the original row.
+                        instance._sniper_snapshot_write_blocked = True
+                    logger.error(
+                        "Sniper restore for %s requires attention: %s",
+                        acc["id"],
+                        result.get("error", "unknown error"),
+                    )
+                    audit_event(
+                        "account.load_completed",
+                        level=logging.WARNING,
+                        account_id=account_id,
+                        restore_status="needs_attention",
+                        write_blocked=bool(
+                            instance._sniper_snapshot_write_blocked
+                        ),
+                        elapsed_ms=_elapsed_ms(started_ns),
+                    )
+                    return instance
+                stage = "persist_restored_sniper"
+                instance._persist_sniper_snapshot()
+            audit_event(
+                "account.load_completed",
+                account_id=account_id,
+                restore_status=("restored" if saved_sniper else "no_snapshot"),
+                elapsed_ms=_elapsed_ms(started_ns),
+            )
+            return instance
+        except asyncio.CancelledError:
+            audit_event(
+                "account.load_cancelled",
+                level=logging.WARNING,
+                account_id=account_id,
+                stage=stage,
+                elapsed_ms=_elapsed_ms(started_ns),
+            )
+            raise
+        except Exception as exc:
+            audit_event(
+                "account.load_failed",
+                level=logging.ERROR,
+                account_id=account_id,
+                stage=stage,
+                elapsed_ms=_elapsed_ms(started_ns),
+                error=exc,
+            )
+            raise
 
     async def add_account(self, name: str, api_key: str, secret_key: str,
                           passphrase: str, agent_private_key: str,
@@ -417,20 +755,42 @@ class AccountManager:
 
     async def remove_account(self, account_id: str) -> bool:
         """Stop strategies, close client, remove from DB."""
+        started_ns = time.perf_counter_ns()
+        audit_event(
+            "account.remove_started",
+            account_id=account_id,
+            loaded=account_id in self.instances,
+        )
         if account_id in self.instances:
             await self.instances[account_id].close()
             del self.instances[account_id]
         delete_account(account_id)
+        audit_event(
+            "account.remove_completed",
+            account_id=account_id,
+            elapsed_ms=_elapsed_ms(started_ns),
+        )
         return True
 
     async def update_account_credentials(self, account_id: str, **kwargs):
         """Update credentials and reload client."""
+        started_ns = time.perf_counter_ns()
+        audit_event(
+            "account.credentials_update_started",
+            account_id=account_id,
+            changed_field_count=len(kwargs),
+        )
         update_account(account_id, **kwargs)
         # Reload the instance
         if account_id in self.instances:
             await self.instances[account_id].close()
             del self.instances[account_id]
         await self._load_account(account_id)
+        audit_event(
+            "account.credentials_update_completed",
+            account_id=account_id,
+            elapsed_ms=_elapsed_ms(started_ns),
+        )
 
     def get_instance(self, account_id: str) -> Optional[AccountInstance]:
         return self.instances.get(account_id)
@@ -501,7 +861,19 @@ class AccountManager:
         }
 
     async def close_all(self, cancel_orders: bool = False):
+        started_ns = time.perf_counter_ns()
+        audit_event(
+            "accounts.close_all_started",
+            account_count=len(self.instances),
+            cancel_orders=cancel_orders,
+        )
         for inst in self.instances.values():
             await inst.close(cancel_orders=cancel_orders)
         if self.notifier:
             await self.notifier.close()
+        audit_event(
+            "accounts.close_all_completed",
+            account_count=len(self.instances),
+            cancel_orders=cancel_orders,
+            elapsed_ms=_elapsed_ms(started_ns),
+        )

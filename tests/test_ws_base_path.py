@@ -117,12 +117,26 @@ class _FakeDashboardSocket:
         self.messages.append(payload)
 
 
-def _book_message(action, bids, asks, seq, prev):
+def _book_message(action, bids, asks, seq, prev, ts=None, checksum=-702280706):
     payload = {
         "arg": {"channel": "pm-books", "instId": "asset-1"},
         "action": action,
-        "data": [{"bids": bids, "asks": asks, "seqId": seq, "prevSeqId": prev}],
+        "data": [{
+            "bids": bids,
+            "asks": asks,
+            "seqId": seq,
+            "prevSeqId": prev,
+            "checksum": checksum,
+            "ts": ts if ts is not None else str(1_700_000_000_000 + seq),
+        }],
     }
+    return types.SimpleNamespace(
+        type=WS_BOOK.aiohttp.WSMsgType.TEXT,
+        data=json.dumps(payload),
+    )
+
+
+def _poly_message(payload):
     return types.SimpleNamespace(
         type=WS_BOOK.aiohttp.WSMsgType.TEXT,
         data=json.dumps(payload),
@@ -192,13 +206,22 @@ class OkxBookTests(unittest.IsolatedAsyncioTestCase):
                 return upstream
 
         dashboard = _FakeDashboardSocket()
-        with mock.patch.object(WS_BOOK.aiohttp, "ClientSession", FakeSession):
+        with (
+            mock.patch.object(WS_BOOK.aiohttp, "ClientSession", FakeSession),
+            mock.patch.object(
+                WS_BOOK,
+                "_received_times",
+                return_value=(1_700_000_000_123_456_789, 987_654_321),
+            ),
+            mock.patch.object(WS_BOOK, "market_event") as market_log,
+        ):
             await WS_BOOK.okx_ws_relay(
                 dashboard,
                 "asset-1",
                 "",
                 "https://us.okx.com",
                 stop_event,
+                account_id="account-1",
             )
 
         self.assertEqual(len(connections), 1)
@@ -206,6 +229,139 @@ class OkxBookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(dashboard.messages), 2)
         self.assertEqual(dashboard.messages[-1]["bids"], [["0.39", "5", "1"]])
         self.assertEqual(dashboard.messages[-1]["asks"], [["0.60", "9", "2"]])
+        self.assertEqual(len(market_log.call_args_list), 2)
+
+        snapshot = market_log.call_args_list[0]
+        self.assertEqual(snapshot.args, ("okx_ws", "orderbook.snapshot"))
+        self.assertEqual(snapshot.kwargs["consumer"], "dashboard_relay")
+        self.assertEqual(snapshot.kwargs["account_id"], "account-1")
+        self.assertEqual(snapshot.kwargs["asset_id"], "asset-1")
+        self.assertEqual(snapshot.kwargs["received_wall_ns"], 1_700_000_000_123_456_789)
+        self.assertEqual(snapshot.kwargs["received_monotonic_ns"], 987_654_321)
+        self.assertEqual(snapshot.kwargs["source_timestamp"], "1700000000010")
+        self.assertEqual(snapshot.kwargs["sequence"], 10)
+        self.assertEqual(snapshot.kwargs["previous_sequence"], -1)
+        self.assertEqual(snapshot.kwargs["checksum_reported"], -702280706)
+        self.assertFalse(snapshot.kwargs["checksum_verified"])
+        self.assertIn(
+            "unspecified", snapshot.kwargs["checksum_verification_reason"]
+        )
+        self.assertEqual(snapshot.kwargs["top"]["bid"]["price"], "0.40")
+        self.assertIsNone(snapshot.kwargs["delta"])
+
+        update = market_log.call_args_list[1]
+        self.assertEqual(update.args, ("okx_ws", "orderbook.update"))
+        self.assertEqual(update.kwargs["sequence"], 11)
+        self.assertEqual(update.kwargs["previous_sequence"], 10)
+        self.assertEqual(update.kwargs["top"]["bid"]["price"], "0.39")
+        self.assertEqual(
+            update.kwargs["delta"],
+            {
+                "bids": [["0.40", "0", "0"], ["0.39", "5", "1"]],
+                "asks": [["0.60", "9", "2"]],
+            },
+        )
+
+    async def test_poly_snapshot_and_delta_are_logged_with_receipt_context(self):
+        stop_event = asyncio.Event()
+        changes = [
+            {
+                "asset_id": "poly-1",
+                "price": "0.40",
+                "size": "0",
+                "side": "BUY",
+            },
+            {
+                "asset_id": "poly-1",
+                "price": "0.42",
+                "size": "12",
+                "side": "BUY",
+            },
+        ]
+        upstream = _FakeUpstreamWebSocket(
+            [
+                _poly_message({
+                    "event_type": "book",
+                    "asset_id": "poly-1",
+                    "timestamp": "1700000000100",
+                    "sequence": 7,
+                    "hash": "book-hash-7",
+                    "bids": [{"price": "0.40", "size": "10"}],
+                    "asks": [{"price": "0.60", "size": "8"}],
+                }),
+                _poly_message({
+                    "event_type": "price_change",
+                    "timestamp": "1700000000110",
+                    "sequence": 8,
+                    "price_changes": changes,
+                }),
+            ],
+            stop_event,
+        )
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def get(self, *args, **kwargs):
+                return _FakeResponse()
+
+            def ws_connect(self, *args, **kwargs):
+                return upstream
+
+        dashboard = _FakeDashboardSocket()
+        with (
+            mock.patch.object(WS_BOOK.aiohttp, "ClientSession", FakeSession),
+            mock.patch.object(
+                WS_BOOK,
+                "_received_times",
+                return_value=(1_700_000_000_999_000_000, 444_555_666),
+            ),
+            mock.patch.object(WS_BOOK, "market_event") as market_log,
+        ):
+            await WS_BOOK.poly_ws_relay(
+                dashboard,
+                "poly-1",
+                stop_event,
+                account_id="account-poly",
+            )
+
+        self.assertEqual(len(dashboard.messages), 2)
+        self.assertEqual(len(market_log.call_args_list), 2)
+        snapshot = market_log.call_args_list[0]
+        self.assertEqual(snapshot.args, ("poly_ws", "orderbook.snapshot"))
+        self.assertEqual(snapshot.kwargs["account_id"], "account-poly")
+        self.assertEqual(snapshot.kwargs["source_timestamp"], "1700000000100")
+        self.assertEqual(snapshot.kwargs["sequence"], 7)
+        self.assertEqual(snapshot.kwargs["book_hash"], "book-hash-7")
+        self.assertEqual(snapshot.kwargs["top"]["bid"]["price"], "0.40")
+        self.assertEqual(snapshot.kwargs["received_monotonic_ns"], 444_555_666)
+
+        update = market_log.call_args_list[1]
+        self.assertEqual(update.args, ("poly_ws", "orderbook.update"))
+        self.assertEqual(update.kwargs["source_timestamp"], "1700000000110")
+        self.assertEqual(update.kwargs["sequence"], 8)
+        self.assertEqual(update.kwargs["top"]["bid"]["price"], "0.42")
+        self.assertEqual(update.kwargs["delta"], {"price_changes": changes})
+
+    def test_market_log_failure_isolated_from_relay(self):
+        with (
+            mock.patch.object(
+                WS_BOOK,
+                "market_event",
+                side_effect=RuntimeError("disk unavailable"),
+            ),
+            mock.patch.object(WS_BOOK.logger, "debug") as debug_log,
+        ):
+            WS_BOOK._emit_market_trace(
+                "poly_ws",
+                "orderbook.update",
+                account_id="account-1",
+            )
+        debug_log.assert_called_once()
 
     async def test_sequence_gap_discards_delta_and_reconnects(self):
         stop_event = asyncio.Event()

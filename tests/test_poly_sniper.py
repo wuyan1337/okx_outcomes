@@ -1,7 +1,10 @@
 import asyncio
 import json
+import time
+import types
 import unittest
 from decimal import Decimal
+from unittest.mock import AsyncMock, patch
 
 from backend.services.poly_sniper import (
     PolySniper,
@@ -66,8 +69,11 @@ class StartableSniper(PolySniper):
 
 
 class EntryClient:
-    def __init__(self):
+    def __init__(self, filled_size="2.5", filled_amount="0.5"):
         self.cancelled = []
+        self.place_calls = []
+        self.filled_size = filled_size
+        self.filled_amount = filled_amount
 
     def generate_client_order_id(self):
         return "entry-1"
@@ -79,6 +85,7 @@ class EntryClient:
         return {"code": "0", "data": [{"oddsType": "points", "available": "10"}]}
 
     async def place_order(self, **kwargs):
+        self.place_calls.append(kwargs)
         return {"code": "0", "_clientOrderId": "entry-1"}
 
     async def get_orders(self, status="open", market_id=None):
@@ -90,14 +97,22 @@ class EntryClient:
                 "clientOrderId": "entry-1",
                 "assetId": "yes-a",
                 "side": "BUY",
-                "filledSize": "2.5",
-                "filledAmount": "0.5",
+                "filledSize": self.filled_size,
+                "filledAmount": self.filled_amount,
             }]},
         }
 
     async def cancel_order(self, **kwargs):
         self.cancelled.append(kwargs)
         return {"code": "0"}
+
+
+class IocLifecycleSniper(PolySniper):
+    async def _snapshot_okx_asks(self, selected):
+        return [(Decimal("0.20"), Decimal("10"))]
+
+    async def _holding_loop(self):
+        return
 
 
 class RestoreClient:
@@ -258,7 +273,335 @@ class ExitTimeoutSniper(FastFinalSniper):
         return [(Decimal("0.20"), Decimal("10"))]
 
 
+class _TraceWebSocket:
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.sent = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.messages:
+            raise StopAsyncIteration
+        return self.messages.pop(0)
+
+    async def send_str(self, payload):
+        self.sent.append(json.loads(payload))
+
+
+def _trace_book_message(
+    action,
+    bids,
+    asks,
+    sequence,
+    previous_sequence,
+    checksum=-702280706,
+):
+    return types.SimpleNamespace(
+        type=1,  # aiohttp.WSMsgType.TEXT
+        data=json.dumps({
+            "arg": {"channel": "pm-books", "instId": "yes-a"},
+            "action": action,
+            "data": [{
+                "bids": bids,
+                "asks": asks,
+                "seqId": sequence,
+                "prevSeqId": previous_sequence,
+                "checksum": checksum,
+                "ts": str(1_700_000_000_000 + sequence),
+            }],
+        }),
+    )
+
+
 class PolySniperTests(unittest.IsolatedAsyncioTestCase):
+    async def test_trigger_candidate_links_poly_frame_trace_and_receipt_clock(self):
+        sniper = PolySniper(NoopClient())
+        selected = target()
+        sniper.targets = [selected]
+        sniper._runtime = {selected.id: TargetRuntime()}
+        sniper._token_targets = {selected.poly_token_id: [selected.id]}
+        sniper.state = SniperState(status="monitoring")
+        sniper._running = True
+        sniper.config.threshold_cents = Decimal("1")
+        sniper.config.window_ms = 1000
+        sniper._try_trigger = AsyncMock()
+
+        with patch("backend.services.poly_sniper.market_event") as market_log:
+            await sniper._process_bid(
+                selected.poly_token_id,
+                Decimal("0.10"),
+                signal_received_ns=111,
+                frame_id="run:poly:1",
+            )
+            await sniper._process_bid(
+                selected.poly_token_id,
+                Decimal("0.20"),
+                signal_received_ns=222,
+                frame_id="run:poly:2",
+                source_event_index=3,
+                source_change_index=4,
+            )
+            if sniper._trigger_tasks:
+                await asyncio.gather(*tuple(sniper._trigger_tasks))
+
+        trigger_event = next(
+            call
+            for call in market_log.call_args_list
+            if call.kwargs.get("decision") == "trigger_scheduled"
+        )
+        trace_id = trigger_event.kwargs["trace_id"]
+        self.assertTrue(trace_id)
+        self.assertEqual(trigger_event.kwargs["frame_id"], "run:poly:2")
+        self.assertEqual(trigger_event.kwargs["signal_received_perf_ns"], 222)
+        self.assertEqual(trigger_event.kwargs["source_event_index"], 3)
+        self.assertEqual(trigger_event.kwargs["source_change_index"], 4)
+        sniper._try_trigger.assert_awaited_once_with(
+            selected.id,
+            Decimal("0.10"),
+            Decimal("0.20"),
+            signal_received_ns=222,
+            trace_id=trace_id,
+            frame_id="run:poly:2",
+        )
+
+    async def test_trigger_latency_uses_frame_receipt_and_preserves_trace_id(self):
+        sniper = PolySniper(NoopClient())
+        selected = target()
+        sniper.targets = [selected]
+        sniper._runtime = {selected.id: TargetRuntime()}
+        sniper._token_targets = {selected.poly_token_id: [selected.id]}
+        sniper.state = SniperState(status="monitoring")
+        sniper._running = True
+        receipt_ns = time.perf_counter_ns()
+        captured = {}
+
+        async def capture_trigger(*args):
+            captured.update(sniper._latency_active or {})
+            sniper._finish_latency_trace("test")
+
+        sniper._run_trigger = capture_trigger
+        await sniper._try_trigger(
+            selected.id,
+            Decimal("0.10"),
+            Decimal("0.20"),
+            signal_received_ns=receipt_ns,
+            trace_id="trace-from-frame",
+            frame_id="run:poly:9",
+        )
+
+        self.assertEqual(captured["_started_ns"], receipt_ns)
+        self.assertEqual(captured["trace_id"], "trace-from-frame")
+        self.assertEqual(captured["poly_frame_id"], "run:poly:9")
+        self.assertEqual(sniper._latency_history[-1]["trace_id"], "trace-from-frame")
+
+    async def test_poly_price_change_trace_does_not_truncate_large_frame(self):
+        sniper = PolySniper(NoopClient())
+        changes = [
+            {
+                "asset_id": f"poly-{index}",
+                "best_bid": "0.20",
+                "price": "0.20",
+                "size": str(index + 1),
+            }
+            for index in range(75)
+        ]
+        sniper._process_bid = AsyncMock()
+
+        with patch("backend.services.poly_sniper.market_event") as market_log:
+            await sniper._process_ws_event({
+                "event_type": "price_change",
+                "price_changes": changes,
+            })
+
+        trace = market_log.call_args
+        self.assertEqual(trace.args, ("polymarket", "sniper.price_change"))
+        self.assertEqual(len(trace.kwargs["changes"]), 75)
+        self.assertEqual(sniper._process_bid.await_count, 75)
+
+    async def test_okx_trace_observer_logs_snapshot_update_and_no_view(self):
+        upstream = _TraceWebSocket([
+            _trace_book_message(
+                "snapshot",
+                [["0.40", "10"]],
+                [["0.60", "8"]],
+                10,
+                -1,
+            ),
+            _trace_book_message(
+                "update",
+                [],
+                [["0.55", "3"]],
+                11,
+                10,
+            ),
+        ])
+
+        class FakeSession:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def ws_connect(self, *args, **kwargs):
+                return upstream
+
+        client = NoopClient()
+        client.base_url = "https://www.okx.com"
+        client._proxy_node = ""
+        sniper = PolySniper(client, account_id="account-1")
+        sniper.targets = [target(side="no")]
+        sniper._running = True
+        sniper._run_id = "run-1"
+
+        with (
+            patch(
+                "backend.services.poly_sniper.aiohttp.ClientSession",
+                FakeSession,
+            ),
+            patch("backend.services.poly_sniper.market_event") as market_log,
+        ):
+            await sniper._okx_market_trace_session()
+
+        self.assertEqual(
+            upstream.sent,
+            [{
+                "op": "subscribe",
+                "args": [{"channel": "pm-books", "instId": "yes-a"}],
+            }],
+        )
+        self.assertEqual(len(market_log.call_args_list), 2)
+        snapshot = market_log.call_args_list[0]
+        self.assertEqual(snapshot.args, ("okx", "sniper.book_update"))
+        self.assertEqual(snapshot.kwargs["action"], "snapshot")
+        self.assertEqual(snapshot.kwargs["sequence"], 10)
+        self.assertEqual(snapshot.kwargs["checksum_reported"], -702280706)
+        self.assertFalse(snapshot.kwargs["checksum_verified"])
+        self.assertIn(
+            "unspecified", snapshot.kwargs["checksum_verification_reason"]
+        )
+        self.assertEqual(snapshot.kwargs["target_views"][0]["side"], "no")
+        self.assertTrue(
+            snapshot.kwargs["target_views"][0]["derived_from_yes_book"]
+        )
+        update = market_log.call_args_list[1]
+        self.assertEqual(update.kwargs["action"], "update")
+        self.assertEqual(update.kwargs["previous_sequence"], 10)
+        self.assertEqual(update.kwargs["target_views"][0]["best_bid"], "0.45")
+        self.assertIn("received_wall_ns", update.kwargs)
+        self.assertIn("received_monotonic_ns", update.kwargs)
+
+    async def test_okx_trace_delta_is_not_truncated(self):
+        large_delta = [
+            [f"0.{index + 100:03d}", str(index + 1)]
+            for index in range(75)
+        ]
+        upstream = _TraceWebSocket([
+            _trace_book_message("snapshot", [["0.40", "10"]], [], 10, -1),
+            _trace_book_message("update", large_delta, [], 11, 10),
+        ])
+
+        class FakeSession:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def ws_connect(self, *args, **kwargs):
+                return upstream
+
+        client = NoopClient()
+        client.base_url = "https://www.okx.com"
+        client._proxy_node = ""
+        sniper = PolySniper(client)
+        sniper.targets = [target()]
+        sniper._running = True
+
+        with (
+            patch(
+                "backend.services.poly_sniper.aiohttp.ClientSession",
+                FakeSession,
+            ),
+            patch("backend.services.poly_sniper.market_event") as market_log,
+        ):
+            await sniper._okx_market_trace_session()
+
+        update = market_log.call_args_list[-1]
+        self.assertEqual(update.kwargs["action"], "update")
+        self.assertEqual(len(update.kwargs["delta_bids"]), 75)
+
+    async def test_okx_trace_sequence_gap_is_logged_and_rejected(self):
+        upstream = _TraceWebSocket([
+            _trace_book_message("snapshot", [["0.40", "10"]], [], 10, -1),
+            _trace_book_message("update", [["0.41", "2"]], [], 12, 8),
+        ])
+
+        class FakeSession:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def ws_connect(self, *args, **kwargs):
+                return upstream
+
+        client = NoopClient()
+        client.base_url = "https://www.okx.com"
+        client._proxy_node = ""
+        sniper = PolySniper(client)
+        sniper.targets = [target()]
+        sniper._running = True
+
+        with (
+            patch(
+                "backend.services.poly_sniper.aiohttp.ClientSession",
+                FakeSession,
+            ),
+            patch("backend.services.poly_sniper.market_event") as market_log,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "sequence gap"):
+                await sniper._okx_market_trace_session()
+
+        self.assertEqual(market_log.call_args_list[-1].args[1], "sniper.sequence_gap")
+        self.assertEqual(
+            market_log.call_args_list[-1].kwargs["expected_previous"], 10
+        )
+        self.assertEqual(
+            market_log.call_args_list[-1].kwargs["received_previous"], 8
+        )
+
+    async def test_stop_cancels_okx_trace_observer(self):
+        sniper = PolySniper(NoopClient())
+        sniper._running = True
+        sniper.state = SniperState(status="monitoring")
+        observer = asyncio.create_task(asyncio.Event().wait())
+        sniper._okx_trace_task = observer
+
+        await sniper.stop()
+
+        self.assertTrue(observer.done())
+        self.assertTrue(observer.cancelled())
+        self.assertIsNone(sniper._okx_trace_task)
+
     def test_legacy_mapping_arms_only_yes(self):
         sniper = PolySniper(NoopClient())
         targets = sniper._parse_targets(
@@ -414,28 +757,84 @@ class PolySniperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sniper.state.status, "monitoring")
         self.assertEqual(sniper.state.active_target_id, "")
 
-    async def test_partial_entry_is_kept_and_only_own_order_is_cancelled(self):
+    async def test_partial_ioc_entry_is_kept_without_resting_order_cancel(self):
         client = EntryClient()
         sniper = PolySniper(client)
         selected = target()
         sniper.targets = [selected]
         sniper.state = SniperState(status="triggered", locked=True, active_target_id="a")
 
-        result = await sniper._execute_entry(
-            selected,
-            [(Decimal("0.20"), Decimal("10"))],
-            Decimal("0.10"),
-            Decimal("0.30"),
-        )
+        with patch(
+            "backend.services.poly_sniper.asyncio.sleep",
+            new_callable=AsyncMock,
+        ) as sleep_mock:
+            result = await sniper._execute_entry(
+                selected,
+                [(Decimal("0.20"), Decimal("10"))],
+                Decimal("0.10"),
+                Decimal("0.30"),
+            )
 
         self.assertTrue(result)
         self.assertEqual(sniper.state.buy_size, Decimal("2.5"))
         self.assertEqual(sniper.state.buy_price, Decimal("0.2"))
-        self.assertEqual(client.cancelled, [{
-            "asset_id": "yes-a",
-            "client_order_id": "entry-1",
-        }])
+        self.assertEqual(client.place_calls[0]["tif"], "ioc")
+        self.assertEqual(client.place_calls[0]["price"], "0.20")
+        self.assertEqual(client.cancelled, [])
+        sleep_mock.assert_not_awaited()
         json.dumps(sniper.get_state())
+
+    async def test_partial_ioc_fill_enters_holding(self):
+        client = EntryClient()
+        sniper = IocLifecycleSniper(client)
+        selected = target()
+        sniper.targets = [selected]
+        sniper.state = SniperState(
+            status="triggered",
+            locked=True,
+            active_target_id=selected.id,
+        )
+        sniper._running = True
+
+        await sniper._run_trigger(
+            selected.id,
+            Decimal("0.10"),
+            Decimal("0.30"),
+        )
+
+        self.assertEqual(sniper.state.status, "holding")
+        self.assertTrue(sniper.state.locked)
+        self.assertEqual(sniper.state.buy_size, Decimal("2.5"))
+        self.assertEqual(client.place_calls[0]["tif"], "ioc")
+        self.assertEqual(client.cancelled, [])
+        self.assertIsNotNone(sniper._hold_task)
+        await sniper._hold_task
+
+    async def test_zero_ioc_fill_releases_global_lock(self):
+        client = EntryClient(filled_size="0", filled_amount="0")
+        sniper = IocLifecycleSniper(client)
+        selected = target()
+        sniper.targets = [selected]
+        sniper.state = SniperState(
+            status="triggered",
+            locked=True,
+            active_target_id=selected.id,
+        )
+        sniper._running = True
+
+        await sniper._run_trigger(
+            selected.id,
+            Decimal("0.10"),
+            Decimal("0.30"),
+        )
+
+        self.assertEqual(sniper.state.status, "monitoring")
+        self.assertFalse(sniper.state.locked)
+        self.assertEqual(sniper.state.active_target_id, "")
+        self.assertFalse(sniper.state.entry_placement_attempted)
+        self.assertEqual(sniper.state.entry_client_order_id, "")
+        self.assertEqual(client.place_calls[0]["tif"], "ioc")
+        self.assertEqual(client.cancelled, [])
 
     async def test_restore_attributes_only_position_above_pre_entry_baseline(self):
         sniper = PolySniper(RestoreClient())

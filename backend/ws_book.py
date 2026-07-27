@@ -10,9 +10,64 @@ import aiohttp
 from aiohttp_socks import ProxyConnector
 
 from .core.database import PROXY_NODES
+from .core.logging_config import market_event
 from .core.price_utils import as_decimal, format_okx_price, invert_binary_price
 
 logger = logging.getLogger(__name__)
+
+
+def _received_times():
+    """Capture wall and monotonic clocks as close to payload receipt as possible."""
+    return time.time_ns(), time.monotonic_ns()
+
+
+def _source_value(payload, *keys):
+    if not isinstance(payload, dict):
+        return None
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _poly_top(bids, asks):
+    def _level(rows):
+        if not rows:
+            return None
+        row = rows[0]
+        if not isinstance(row, dict):
+            return None
+        return {
+            "price": row.get("price"),
+            "size": row.get("size"),
+        }
+
+    return {"bid": _level(bids), "ask": _level(asks)}
+
+
+def _okx_top(bids, asks):
+    def _level(rows):
+        if not rows:
+            return None
+        row = rows[0]
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            return None
+        return {
+            "price": row[0],
+            "size": row[1],
+            "row": list(row),
+        }
+
+    return {"bid": _level(bids), "ask": _level(asks)}
+
+
+def _emit_market_trace(source, event, **fields):
+    """Keep telemetry failures outside the dashboard relay data path."""
+    try:
+        market_event(source, event, consumer="dashboard_relay", **fields)
+    except Exception:
+        logger.debug("Dashboard market trace failed", exc_info=True)
 
 
 def _sort_poly_book(bids, asks, limit=10):
@@ -107,7 +162,12 @@ def _invert_okx_book_arrays(bids, asks):
     return inv_bids, inv_asks
 
 
-async def poly_ws_relay(ws_out: WebSocket, token_id: str, stop_event: asyncio.Event):
+async def poly_ws_relay(
+    ws_out: WebSocket,
+    token_id: str,
+    stop_event: asyncio.Event,
+    account_id: str = "",
+):
     """Connect to Polymarket WS and relay book updates to frontend."""
     url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     retry_delay = 1
@@ -125,19 +185,45 @@ async def poly_ws_relay(ws_out: WebSocket, token_id: str, stop_event: asyncio.Ev
                         ) as snap_resp:
                             if snap_resp.status == 200:
                                 snap = await snap_resp.json()
+                                received_wall_ns, received_monotonic_ns = _received_times()
                                 bids = snap.get("bids", [])
                                 asks = snap.get("asks", [])
                                 if bids or asks:
                                     sb, sa = _sort_poly_book(bids, asks)
                                     bid_map, ask_map = _poly_book_maps(bids, asks)
+                                    _emit_market_trace(
+                                        "poly_rest",
+                                        "orderbook.snapshot",
+                                        account_id=account_id,
+                                        token_id=token_id,
+                                        transport="rest",
+                                        received_wall_ns=received_wall_ns,
+                                        received_monotonic_ns=received_monotonic_ns,
+                                        source_timestamp=_source_value(
+                                            snap, "timestamp", "ts"
+                                        ),
+                                        sequence=_source_value(
+                                            snap, "sequence", "seq", "seqId"
+                                        ),
+                                        previous_sequence=_source_value(
+                                            snap, "previous_sequence", "prevSeqId"
+                                        ),
+                                        book_hash=_source_value(snap, "hash"),
+                                        top=_poly_top(sb, sa),
+                                        delta=None,
+                                        levels={"bids": sb, "asks": sa},
+                                    )
                                     await ws_out.send_json({
                                         "source": "poly",
-                                        "ts": int(time.time() * 1000),
+                                        "ts": received_wall_ns // 1_000_000,
                                         "bids": sb,
                                         "asks": sa,
                                     })
                     except Exception:
-                        pass
+                        logger.debug(
+                            "Poly dashboard REST snapshot failed",
+                            exc_info=True,
+                        )
 
                     # Subscribe to WS for real-time updates
                     sub_msg = json.dumps({"type": "market", "assets_ids": [token_id]})
@@ -149,6 +235,7 @@ async def poly_ws_relay(ws_out: WebSocket, token_id: str, stop_event: asyncio.Ev
                         if stop_event.is_set():
                             break
                         if msg.type == aiohttp.WSMsgType.TEXT:
+                            received_wall_ns, received_monotonic_ns = _received_times()
                             try:
                                 raw = json.loads(msg.data)
                                 items = raw if isinstance(raw, list) else [raw]
@@ -159,22 +246,55 @@ async def poly_ws_relay(ws_out: WebSocket, token_id: str, stop_event: asyncio.Ev
                                         asks = data.get("asks", [])
                                         bid_map, ask_map = _poly_book_maps(bids, asks)
                                         sb, sa = _sort_poly_book(bids, asks)
+                                        event_name = "orderbook.snapshot"
+                                        delta = None
+                                        levels = {"bids": sb, "asks": sa}
                                     elif event_type == "price_change":
+                                        changes = data.get("price_changes", [])
                                         if not _apply_poly_price_changes(
-                                            bid_map, ask_map, data.get("price_changes", []), token_id
+                                            bid_map, ask_map, changes, token_id
                                         ):
                                             continue
                                         sb, sa = _poly_book_from_maps(bid_map, ask_map)
+                                        event_name = "orderbook.update"
+                                        delta = {"price_changes": changes}
+                                        levels = None
                                     else:
                                         continue
+                                    _emit_market_trace(
+                                        "poly_ws",
+                                        event_name,
+                                        account_id=account_id,
+                                        token_id=token_id,
+                                        transport="websocket",
+                                        upstream_event_type=event_type,
+                                        received_wall_ns=received_wall_ns,
+                                        received_monotonic_ns=received_monotonic_ns,
+                                        source_timestamp=_source_value(
+                                            data, "timestamp", "ts"
+                                        ),
+                                        sequence=_source_value(
+                                            data, "sequence", "seq", "seqId"
+                                        ),
+                                        previous_sequence=_source_value(
+                                            data, "previous_sequence", "prevSeqId"
+                                        ),
+                                        book_hash=_source_value(data, "hash"),
+                                        top=_poly_top(sb, sa),
+                                        delta=delta,
+                                        levels=levels,
+                                    )
                                     await ws_out.send_json({
                                         "source": "poly",
-                                        "ts": int(time.time() * 1000),
+                                        "ts": received_wall_ns // 1_000_000,
                                         "bids": sb,
                                         "asks": sa,
                                     })
                             except Exception:
-                                pass
+                                logger.debug(
+                                    "Poly dashboard WS payload failed",
+                                    exc_info=True,
+                                )
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break
         except asyncio.CancelledError:
@@ -188,7 +308,7 @@ async def poly_ws_relay(ws_out: WebSocket, token_id: str, stop_event: asyncio.Ev
 
 async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str,
                        base_url: str, stop_event: asyncio.Event,
-                       invert: bool = False):
+                       invert: bool = False, account_id: str = ""):
     """Connect to OKX business WS and maintain the incremental pm-books book."""
     retry_delay = 1
     while not stop_event.is_set():
@@ -213,21 +333,54 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str,
                         ) as snap_resp:
                             if snap_resp.status == 200:
                                 snap = await snap_resp.json()
+                                received_wall_ns, received_monotonic_ns = _received_times()
                                 if snap.get("code") == "0" and snap.get("data"):
                                     book = snap["data"][0]
                                     bids = book.get("bids", [])[:10]
                                     asks = book.get("asks", [])[:10]
                                     bid_map, ask_map = _okx_book_maps(bids, asks)
+                                    raw_bids = [list(row) for row in bids]
+                                    raw_asks = [list(row) for row in asks]
                                     if invert:
                                         bids, asks = _invert_okx_book_arrays(bids, asks)
+                                    _emit_market_trace(
+                                        "okx_rest",
+                                        "orderbook.snapshot",
+                                        account_id=account_id,
+                                        asset_id=asset_id,
+                                        transport="rest",
+                                        region=(
+                                            "AU" if "us.okx.com" in base_url else "CN"
+                                        ),
+                                        proxy_node=proxy_node,
+                                        inverted=bool(invert),
+                                        received_wall_ns=received_wall_ns,
+                                        received_monotonic_ns=received_monotonic_ns,
+                                        source_timestamp=_source_value(
+                                            book, "ts", "timestamp"
+                                        ),
+                                        sequence=_source_value(
+                                            book, "seqId", "seq_id", "sequence"
+                                        ),
+                                        previous_sequence=_source_value(
+                                            book, "prevSeqId", "prev_seq_id"
+                                        ),
+                                        top=_okx_top(bids, asks),
+                                        raw_yes_top=_okx_top(raw_bids, raw_asks),
+                                        delta=None,
+                                        levels={"bids": bids[:10], "asks": asks[:10]},
+                                    )
                                     await ws_out.send_json({
                                         "source": "okx",
-                                        "ts": int(time.time() * 1000),
+                                        "ts": received_wall_ns // 1_000_000,
                                         "bids": bids[:10],
                                         "asks": asks[:10],
                                     })
                     except Exception:
-                        pass
+                        logger.debug(
+                            "OKX dashboard REST snapshot failed",
+                            exc_info=True,
+                        )
 
                     sub_msg = json.dumps({
                         "op": "subscribe",
@@ -241,6 +394,7 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str,
                         if stop_event.is_set():
                             break
                         if msg.type == aiohttp.WSMsgType.TEXT:
+                            received_wall_ns, received_monotonic_ns = _received_times()
                             try:
                                 data = json.loads(msg.data)
                                 if "data" in data and data.get("arg", {}).get("channel") == "pm-books":
@@ -248,6 +402,7 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str,
                                     action = str(data.get("action", "")).lower()
                                     seq = book.get("seqId", book.get("seq_id"))
                                     prev_seq = book.get("prevSeqId", book.get("prev_seq_id"))
+                                    checksum = book.get("checksum")
                                     if action == "snapshot":
                                         bid_map, ask_map = _okx_book_maps(
                                             book.get("bids", []), book.get("asks", [])
@@ -268,12 +423,72 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str,
                                     else:
                                         continue
                                     last_seq = seq
-                                    bids, asks = _okx_book_from_maps(bid_map, ask_map)
+                                    raw_bids, raw_asks = _okx_book_from_maps(
+                                        bid_map, ask_map
+                                    )
+                                    bids = [list(row) for row in raw_bids]
+                                    asks = [list(row) for row in raw_asks]
                                     if invert:
                                         bids, asks = _invert_okx_book_arrays(bids, asks)
+                                    _emit_market_trace(
+                                        "okx_ws",
+                                        (
+                                            "orderbook.snapshot"
+                                            if action == "snapshot"
+                                            else "orderbook.update"
+                                        ),
+                                        account_id=account_id,
+                                        asset_id=asset_id,
+                                        transport="websocket",
+                                        region=(
+                                            "AU" if "us.okx.com" in base_url else "CN"
+                                        ),
+                                        proxy_node=proxy_node,
+                                        inverted=bool(invert),
+                                        upstream_action=action,
+                                        received_wall_ns=received_wall_ns,
+                                        received_monotonic_ns=received_monotonic_ns,
+                                        source_timestamp=_source_value(
+                                            book, "ts", "timestamp"
+                                        ),
+                                        sequence=seq,
+                                        previous_sequence=prev_seq,
+                                        checksum_reported=checksum,
+                                        checksum_verified=(
+                                            False if checksum is not None else None
+                                        ),
+                                        checksum_verification_reason=(
+                                            "official pm-books canonicalization is unspecified"
+                                            if checksum is not None
+                                            else "checksum not supplied"
+                                        ),
+                                        top=_okx_top(bids, asks),
+                                        raw_yes_top=_okx_top(raw_bids, raw_asks),
+                                        delta=(
+                                            {
+                                                "bids": book.get("bids", []),
+                                                "asks": book.get("asks", []),
+                                            }
+                                            if action == "update"
+                                            else None
+                                        ),
+                                        levels=(
+                                            {"bids": bids[:10], "asks": asks[:10]}
+                                            if action == "snapshot"
+                                            else None
+                                        ),
+                                        raw_yes_snapshot=(
+                                            {
+                                                "bids": book.get("bids", []),
+                                                "asks": book.get("asks", []),
+                                            }
+                                            if action == "snapshot"
+                                            else None
+                                        ),
+                                    )
                                     out = {
                                         "source": "okx",
-                                        "ts": int(time.time() * 1000),
+                                        "ts": received_wall_ns // 1_000_000,
                                         "bids": bids[:10],
                                         "asks": asks[:10],
                                     }
@@ -281,7 +496,10 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str,
                             except RuntimeError:
                                 raise
                             except Exception:
-                                pass
+                                logger.debug(
+                                    "OKX dashboard WS payload failed",
+                                    exc_info=True,
+                                )
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break
         except asyncio.CancelledError:
@@ -295,7 +513,8 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str,
 
 async def periodic_refresh(ws_out: WebSocket, poly_token: str, okx_asset: str,
                            proxy_node: str, base_url: str,
-                           stop_event: asyncio.Event, invert: bool = False):
+                           stop_event: asyncio.Event, invert: bool = False,
+                           account_id: str = ""):
     """Refresh both books via REST every three seconds."""
     while not stop_event.is_set():
         await asyncio.sleep(3)
@@ -309,18 +528,44 @@ async def periodic_refresh(ws_out: WebSocket, poly_token: str, okx_asset: str,
                         async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
                             if resp.status == 200:
                                 snap = await resp.json()
+                                received_wall_ns, received_monotonic_ns = _received_times()
                                 bids = snap.get("bids", [])
                                 asks = snap.get("asks", [])
                                 if bids or asks:
                                     sb, sa = _sort_poly_book(bids, asks)
+                                    _emit_market_trace(
+                                        "poly_rest",
+                                        "orderbook.snapshot",
+                                        account_id=account_id,
+                                        token_id=poly_token,
+                                        transport="periodic_rest",
+                                        received_wall_ns=received_wall_ns,
+                                        received_monotonic_ns=received_monotonic_ns,
+                                        source_timestamp=_source_value(
+                                            snap, "timestamp", "ts"
+                                        ),
+                                        sequence=_source_value(
+                                            snap, "sequence", "seq", "seqId"
+                                        ),
+                                        previous_sequence=_source_value(
+                                            snap, "previous_sequence", "prevSeqId"
+                                        ),
+                                        book_hash=_source_value(snap, "hash"),
+                                        top=_poly_top(sb, sa),
+                                        delta=None,
+                                        levels={"bids": sb, "asks": sa},
+                                    )
                                     await ws_out.send_json({
                                         "source": "poly",
-                                        "ts": int(time.time() * 1000),
+                                        "ts": received_wall_ns // 1_000_000,
                                         "bids": sb,
                                         "asks": sa,
                                     })
                     except Exception:
-                        pass
+                        logger.debug(
+                            "Poly dashboard periodic refresh failed",
+                            exc_info=True,
+                        )
                 if okx_asset:
                     try:
                         connector = None
@@ -335,22 +580,61 @@ async def periodic_refresh(ws_out: WebSocket, poly_token: str, okx_asset: str,
                                     data = await resp.json()
                                     if data.get("code") == "0" and data.get("data"):
                                         book = data["data"][0]
+                                        received_wall_ns, received_monotonic_ns = _received_times()
                                         bids = book.get("bids", [])[:10]
                                         asks = book.get("asks", [])[:10]
+                                        raw_bids = [list(row) for row in bids]
+                                        raw_asks = [list(row) for row in asks]
                                         if invert:
                                             bids, asks = _invert_okx_book_arrays(bids, asks)
+                                        _emit_market_trace(
+                                            "okx_rest",
+                                            "orderbook.snapshot",
+                                            account_id=account_id,
+                                            asset_id=okx_asset,
+                                            transport="periodic_rest",
+                                            region=(
+                                                "AU" if "us.okx.com" in base_url else "CN"
+                                            ),
+                                            proxy_node=proxy_node,
+                                            inverted=bool(invert),
+                                            received_wall_ns=received_wall_ns,
+                                            received_monotonic_ns=received_monotonic_ns,
+                                            source_timestamp=_source_value(
+                                                book, "ts", "timestamp"
+                                            ),
+                                            sequence=_source_value(
+                                                book, "seqId", "seq_id", "sequence"
+                                            ),
+                                            previous_sequence=_source_value(
+                                                book, "prevSeqId", "prev_seq_id"
+                                            ),
+                                            top=_okx_top(bids, asks),
+                                            raw_yes_top=_okx_top(raw_bids, raw_asks),
+                                            delta=None,
+                                            levels={
+                                                "bids": bids[:10],
+                                                "asks": asks[:10],
+                                            },
+                                        )
                                         await ws_out.send_json({
                                             "source": "okx",
-                                            "ts": int(time.time() * 1000),
+                                            "ts": received_wall_ns // 1_000_000,
                                             "bids": bids[:10],
                                             "asks": asks[:10],
                                         })
                     except Exception:
-                        pass
+                        logger.debug(
+                            "OKX dashboard periodic refresh failed",
+                            exc_info=True,
+                        )
         except asyncio.CancelledError:
             return
         except Exception:
-            pass
+            logger.debug(
+                "Dashboard periodic refresh iteration failed",
+                exc_info=True,
+            )
 
 
 def register_ws_routes(app, manager):
@@ -379,19 +663,21 @@ def register_ws_routes(app, manager):
 
             if poly_token:
                 tasks.append(asyncio.create_task(
-                    poly_ws_relay(websocket, poly_token, stop_event)
+                    poly_ws_relay(
+                        websocket, poly_token, stop_event, account_id=account_id
+                    )
                 ))
             if okx_asset:
                 tasks.append(asyncio.create_task(
                     okx_ws_relay(
                         websocket, okx_query_asset, proxy_node, base_url,
-                        stop_event, invert_okx,
+                        stop_event, invert_okx, account_id=account_id,
                     )
                 ))
             tasks.append(asyncio.create_task(
                 periodic_refresh(
                     websocket, poly_token, okx_query_asset, proxy_node,
-                    base_url, stop_event, invert_okx,
+                    base_url, stop_event, invert_okx, account_id=account_id,
                 )
             ))
 
@@ -428,4 +714,7 @@ def register_ws_routes(app, manager):
             try:
                 await websocket.close()
             except Exception:
-                pass
+                logger.debug(
+                    "Dashboard websocket close failed",
+                    exc_info=True,
+                )
