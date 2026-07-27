@@ -76,6 +76,16 @@ class ClientAuditLoggingTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.audit_patch.stop()
 
+    def test_retired_proxy_node_is_rejected_before_network_use(self):
+        with self.assertRaisesRegex(ValueError, "refusing automatic Direct fallback"):
+            client_module.OKXOutcomesClient(
+                "api-key-secret",
+                "hmac-secret",
+                "passphrase-secret",
+                "",
+                proxy_node="JP5",
+            )
+
     def _events(self, name):
         return [fields for event, fields in self.events if event == name]
 

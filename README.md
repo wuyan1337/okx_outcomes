@@ -129,7 +129,7 @@ SQLite + Fernet key + JSON runtime files
 
 - `backend/app.py` 负责 HTTP、认证、参数接收和页面服务，不承载具体策略循环；
 - `AccountManager` 为每个账户创建独立 client 和策略对象，管理启动、关闭与恢复；
-- `OKXOutcomesClient` 统一处理 REST 鉴权、写操作签名、SOCKS5、分页和心跳；
+- `OKXOutcomesClient` 统一处理 REST 鉴权、写操作签名、SOCKS5、分页和 session 生命周期；
 - `backend/ws_book.py` 只负责向浏览器汇总 Poly/OKX 订单簿；
 - 策略服务自己负责状态机、partial fill、风控和持久化。
 
@@ -140,18 +140,16 @@ SQLite + Fernet key + JSON runtime files
 | 路径 | 职责 |
 | --- | --- |
 | `README.md` | 当前项目手册。 |
+| [`STRATEGY_LOGIC_README.md`](STRATEGY_LOGIC_README.md) | 按 1/2/3/4/5 顺序说明每个策略从启动、检测、下单、退出到失败恢复的真实执行逻辑。 |
 | `requirements.txt` | Python 运行依赖。 |
 | `config.yaml` | Web 登录、base path 和首次 Telegram 配置来源。不要提交真实凭据。 |
-| `.gitignore` | 忽略 Python 缓存、`data/`、扩展名恰好为 `.bak` 的文件和 `.env`。仓库里已跟踪的 `.bak-*` 历史快照不会因此消失。 |
+| `.gitignore` | 忽略 Python/测试缓存、`data/`、`logs/`、备份与临时补丁文件，以及 `.env`。 |
 | `auto-push.sh` | Linux `inotify` 自动 add/commit/push 脚本；不是启动脚本，运行前必须审查。 |
 | `ss.txt` | 本地 OKX Outcome API 文档副本，不是程序运行依赖，当前也不应作为凭据示例。 |
-| `patch_fix.py` | 旧的一次性文本替换补丁，不在启动或测试流程中；重复执行可能误改现有代码。 |
-| `layers` | 空占位文件，当前没有代码读取。 |
 | `scripts/bootstrap-egress-node.sh` | 在新 Ubuntu 出口 VPS 创建受限 SSH forwarding 用户；只允许 Bot 单 IP、key auth 和 OKX 目标，不启动公网 SOCKS。失败会恢复原 SSH 配置/authorized key。 |
 | `scripts/install-egress-tunnel.sh` | 在 Bot Ubuntu 主机核验 host key，安装 `127.0.0.1` dynamic SOCKS systemd 服务并做 Region 连通检查。 |
 | `scripts/proxy_nodes.py` | 原子管理本机 node registry、列出 backend 实际节点并执行统一延迟 benchmark。 |
 | `data/` | 本地运行数据，Git 已忽略；包含数据库、密钥和策略状态，不能随意清空。 |
-| `*.bak-*`、`*.bak` | 人工历史快照，不会被 Python import；仅用于人工比对或回滚参考。 |
 
 ### 4.2 Backend
 
@@ -162,18 +160,18 @@ SQLite + Fernet key + JSON runtime files
 | `backend/ws_book.py` | Poly 与 OKX 订单簿 relay；连接 OKX 官方 `/ws/v5/business` 的 `pm-books`，处理 snapshot/update、序列 gap 和断线重连。 |
 | `backend/core/__init__.py` | `backend.core` package 标记。 |
 | `backend/core/auth.py` | OKX HMAC REST 鉴权；写操作使用 msgpack、keccak、EIP-712/ECDSA 生成签名。 |
-| `backend/core/client.py` | OKX Outcomes 异步 REST client；负责代理连接、读写 API、分页、`clientOrderId`、heartbeat 和 session 生命周期。 |
-| `backend/core/database.py` | SQLite 表、账户增删改查、Fernet 加解密、全局配置和 Sniper 状态。 |
+| `backend/core/client.py` | OKX Outcomes 异步 REST client；负责代理连接、读写 API、分页、`clientOrderId` 和 session 生命周期。文件保留 dead-man helper，但当前服务运行链路不调用它。 |
+| `backend/core/database.py` | SQLite 表、账户增删改查、Fernet 加解密、全局配置、新版 Sniper 与 Sniper Old 的持久状态。 |
 | `backend/core/proxy_nodes.py` | 内置节点、统一名称、`data/proxy_nodes.json` 本地扩展和节点校验。数据库仍保存稳定的旧 ID。 |
 | `backend/core/price_utils.py` | 所有 cent/`0..1` 转换、OKX tick、方向性对齐、显示格式和二元价格镜像。 |
 | `backend/services/__init__.py` | `backend.services` package 标记。 |
-| `backend/services/account_manager.py` | 为每个账户组装 client、notifier 和全部策略；处理依赖连接、启动/关闭与新版 Sniper 恢复。 |
+| `backend/services/account_manager.py` | 为每个账户组装 client、notifier 和全部策略；处理启动/关闭、两套 Sniper 的两阶段恢复、账户级 open orders/positions 安全对账和周期性只读探测。 |
 | `backend/services/manual_strategy_d.py` | Manual-D 双边挂单、增量 fill 检测、对应卖单和 pending sell 持久化。 |
 | `backend/services/manual_strategy_s.py` | Manual-S 单边引擎；Bid-Sell 也复用此引擎。 |
 | `backend/services/poly_monitor.py` | Poly best bid 监控、深度门槛、触发账户级撤单和 Auto-Rebalance。 |
 | `backend/services/auto_rebalance.py` | Monitor 触发后的对账、稳定等待、成本层同步、卖单恢复和策略重启。 |
 | `backend/services/poly_sniper.py` | 新版显式多候选 Sniper、全局锁、入场/退出、partial fill、状态保存和恢复。 |
-| `backend/services/poly_sniper_old.py` | 遗留版 Sniper，仅用于兼容和对照。新功能不要继续加在这里。 |
+| `backend/services/poly_sniper_old.py` | 遗留兼容 Sniper；固定监听一对 YES/NO、精确订单生命周期、partial fill 退出、fail-closed Stop，并使用 SQLite ledger 做两阶段重启恢复。 |
 | `backend/services/notifier.py` | Telegram 异步发送队列和配置刷新。 |
 | `backend/services/size_utils.py` | 数量规范化；买单 share 取整数，卖单保留真实可用的小数数量。 |
 | `backend/services/latency_probe.py` | OKX 各路由与 Poly Direct 的冷/热多次探测、统计和错误分类；不伪装成真实下单延迟。 |
@@ -185,7 +183,6 @@ SQLite + Fernet key + JSON runtime files
 | `frontend/dashboard.html` | 单文件主控制台，包含 HTML、CSS 和 JavaScript；账户、策略、订单簿、订单、持仓、配置和日志 UI 都在此文件。 |
 | `frontend/login.html` | 登录页。 |
 | `frontend/sniper-help.html` | 新 Sniper 参数和操作帮助。 |
-| `frontend/polytest.html` | 未被 `app.py` 注册的旧诊断页，含历史硬编码信息，不应部署或作为生产入口。 |
 
 ### 4.4 Tests
 
@@ -193,6 +190,7 @@ SQLite + Fernet key + JSON runtime files
 | --- | --- |
 | `tests/test_price_precision.py` | Poly/OKX 显示、边界 tick、0.1¢ 和方向性对齐。 |
 | `tests/test_poly_sniper.py` | 多候选、全局锁、NO 镜像、信号、partial fill 和退出行为。 |
+| `tests/test_poly_sniper_old.py` | Sniper Old 精确 cloid、partial fill、Stop、SQLite ledger 与恢复行为。 |
 | `tests/test_sniper_persistence.py` | Sniper SQLite 状态保存、刷新/重启恢复与锁定恢复。 |
 | `tests/test_account_manager_sniper_shutdown.py` | AccountManager 关闭时保留 Sniper 恢复语义，不做意外账户级撤单。 |
 | `tests/test_persistence_and_rebalance.py` | 辅助状态持久化和 Auto-Rebalance 成本层行为。 |
@@ -293,7 +291,7 @@ http://127.0.0.1:8899/
 
 Telegram token/chat 配置是全局共享的；各账户策略引用同一个 notifier，但通知正文会带账户上下文。
 
-同一个 proxy node 当前只允许分配给一个账户。账户删除会移除数据库记录并关闭相应实例；删除前应先在 OKX 核对开放订单和持仓。
+同一个 proxy node 当前只允许分配给一个账户。删除账户不是直接删数据库：服务端会先执行完整 Flash Close，确认交易所开放订单、开放仓位以及 Manual/两套 Sniper 的本地收尾都安全。Flash 任一步失败会返回 409 并保留账户、实例和凭据；全部通过后才关闭实例并删除 SQLite 账户行及其 Sniper 状态。后续数据库删除本身异常时返回 500，不能显示成删除成功。
 
 ### 6.2 Order Book
 
@@ -309,29 +307,35 @@ OKX WS 必须先收到 `snapshot` 才接受 `update`。如果 update 早于 snap
 
 ### 6.3 Active Orders、Cancel All 和 Flash
 
-- 单条取消只针对选中的订单；
-- `Cancel All` 会处理该账户的全部开放订单，不限于当前页面策略；
-- `Flash` 会停止策略、撤账户开放订单，再按各持仓 best bid 提交 reduce-only IOC 卖单；
-- `Flash` 只有在最终重新查询确认开放订单和开放持仓都为 0 时才返回完成；
-- IOC 被 OKX 接受只表示请求已提交，不能保证全部成交；仍有 partial position 时页面会明确显示未完成。
-- OKX 已确认清空后，Flash 会再调用 Sniper 的持久 ledger 对账；若订单终态仍无法证明，OKX 敞口虽已清空，接口仍会提示 Sniper 需要对账，而不会直接删除锁。
+1. 单条取消只针对选中的订单；`Cancel All` 处理该账户全部开放订单，不限于当前页面策略。
+2. Flash 先停止所有本地交易写入，再查询订单与仓位；在撤保护单前，必须为每个仓位预先验证真实可执行退出盘口。
+3. 任一仓位没有可验证的 best bid、position 响应异常或 outcome 无法识别时，Flash 在 `cancelled=0` 的状态停止，保留现有保护单。
+4. 预检通过后逐 asset 撤相关订单、刷新 `availableSize` 和盘口，再最多提交 5 次 reduce-only IOC SELL；每次按唯一 `clientOrderId` 确认终态并重新查询 position。
+5. 仓位仍未退出时，程序尝试恢复被撤的 confirmed protective SELL，并只撤非保护订单；结果会明确报告剩余仓位和保护覆盖状态。
+6. 只有最终反复查询确认 open orders 与 open positions 都为 0，并且 Manual、新版 Sniper、Sniper Old 的本地 stop/reconcile 也安全完成，Flash 才返回完整成功。
+7. 删除账户走同一完整流程，不跳过本地 ledger 收尾；失败时不删除账户或凭据。
 
 执行高影响操作后必须重新查询 Open Orders 和 Positions，不能只看按钮返回成功。
 
 ### 6.4 Manual 手工交易
 
-Manual 页允许：
+1. 用户选择 OKX 市场、真实 YES/NO、BUY/SELL、cent 价格、share 数和 GTC/IOC；Market UI 取当前 best ask/bid，Limit UI 使用输入价格。
+2. 任何自动策略或风险控制任务正在运行时拒绝 Manual。账户、新版 Sniper 或 Sniper Old 仍 locked 时禁止 BUY；经过仓位校验的 reduce-only SELL 仍可减仓。
+3. 服务端把 cent 转为 `0..1` 并再次按 BUY 向下、SELL 向上对齐；`0.1¢` 会提交为 `0.001`。BUY 名义额必须至少 `1 xp`。
+4. SELL 先查询真实 position，不能超过最新 `availableSize`，并固定 `reduceOnly=true`；低于 `1 xp` 只有卖完整个可用仓位且没有 frozen size 才允许。
+5. 每单生成唯一 `clientOrderId` 并查询订单状态。提交未知时先撤自己的订单并核对终态；仍无法确认则返回 409 并激活 recovery lock。
+6. IOC 必须进入明确终态；GTC 只有 `ACTIVE` 或有成交才成功。Manual Trade 不自动补保护 SELL，也不运行后续循环。
 
-- 选择 OKX 市场和真实 YES/NO；
-- Market 模式按当前 best ask/bid 提交 IOC；
-- Limit 模式按输入 cent 价格提交 GTC；
-- 买入数量使用整数 share；
-- 卖出使用实际持仓可用数量，可保留小数；低于 `1 xp` 时只有“卖完全部仓位且没有冻结数量”才适用 sell-all 例外；
-- 查看 position 和 closed-order 交易历史。
+不要在任一 Sniper holding 期间从其他页面、脚本或另一套服务修改同一 asset 的仓位；这会破坏本地成交 ledger 与真实 position 的对应关系。
 
-服务端会再次校验和方向性对齐价格。买单名义额低于 `1 xp` 时直接拒绝。API 超时不代表订单一定失败；遇到结果未知时应先按 `clientOrderId/orderId` 和持仓查询，不能盲目重下。
+### 6.5 Ask Sell
 
-新版 Sniper 正在运行时，普通 Manual 下单会被服务端拒绝，防止手工仓位变化破坏 `position_before` baseline。Sniper 已停止但仍 locked 时禁止 Manual BUY；如确需人工对账，可在核对订单后使用 reduce-only Manual SELL 或账户级 Flash，随后再次执行 Sniper Stop/状态查询让本地 ledger 完成对账。不要在 Sniper holding 期间从其他页面、脚本或另一套服务修改同一 asset 的仓位。
+1. Ask Sell 只在没有自动策略继续写订单时运行；它是减风险动作，但不会绕过真实订单和仓位核验。
+2. 对每个 open position，根据 `marketId/tokenIndex` 得到真实 OKX YES/NO asset，再从 `poly_asset_map.json` 找到对应 Poly token；缺映射、Poly book 失败、asks 为空时该 asset 直接失败，不猜价。
+3. Poly ask1 按 OKX SELL tick 向上对齐。程序只撤该 asset 的旧 SELL，并按 order/cloid 确认它们已终结。
+4. 撤单确认后重新查询 position 和最新 `availableSize`；仓位已关闭则记录 `position_closed`，仓位仍在但没有可卖数量则激活 recovery lock。
+5. 新保护单使用唯一 `clientOrderId`、reduce-only GTC；只有确认 `ACTIVE/FILLED` 才算成功。新单失败且状态可证明安全时，会尝试按旧保护单恢复 SELL；状态未知时不会报告恢复完成。
+6. 返回逐 asset 的 placed/skipped/failed。任一仓位未保护时整体 `ok=false`，并保留 recovery 状态供继续对账。
 
 API 凭据或 KYC region 会替换账户 client。只要任一策略、Monitor、Auto-Rebalance 或 Sniper 锁仍活动，服务端会拒绝保存这类变更。`Stop` 可能保留交易所挂单，所以本地任务停止还不够：服务端还必须成功查询并确认旧账户 Open Orders 和 Positions 都为 0，否则返回 409/503，不写数据库也不替换 client。新 agent private key 会在写库前解析验证；准备好新 client 后才执行数据库更新和内存切换。
 
@@ -340,11 +344,13 @@ API 凭据或 KYC region 会替换账户 client。只要任一策略、Monitor�
 Manual-D 是同一二元市场的双边策略。页面输入 `a`，单位为 cent，当前四个目标价为：
 
 ```text
-YES buy  = a
-NO  buy  = 99 - a
-YES sell = a + 1
-NO  sell = 100 - a
+YES buy  = buy-align(a)
+NO  buy  = buy-align(99 - YES buy)
+YES sell = sell-align(YES buy + 1)
+NO  sell = sell-align(NO buy + 1)
 ```
+
+这里的 `buy-align` 是按 BUY 方向向下对齐 OKX 当前 tick，`sell-align` 是按 SELL 方向向上对齐。SELL 必须从该边已经实际对齐的 BUY 再加 `1¢` 计算，不能在 4¢/96¢ 边界继续使用未经对齐的理论补数。
 
 例如 `a = 30¢`：
 
@@ -356,7 +362,7 @@ NO:  buy 69¢ → sell 70¢
 运行过程：
 
 1. 按账户可用余额和 Position % 计算相同 pairs 数量；
-2. 同时提交 YES/NO GTC buy；
+2. 为两边分别生成并持久化 `clientOrderId`，再顺序提交 YES/NO GTC buy；第二边失败时只回滚本轮第一边；
 3. 轮询 closed orders 和仍开放订单中的 partial fill；
 4. 只处理新增 fill 数量；
 5. 为对应 asset 提交 GTC sell；
@@ -366,7 +372,7 @@ NO:  buy 69¢ → sell 70¢
 
 双边部署采用失败保护：如果 NO buy 提交失败，会撤销本轮 YES buy，并轮询确认撤单终态。撤单结果未知或任一边已经成交时，策略会停止继续部署新一轮，但主循环仍管理已经观察到的 fill，避免用“启动失败”掩盖裸仓。对应 sell 只有在 OKX 明确接受后才推进 pending 进度；失败数量按每个 buy order 以 `2/4/8/.../60` 秒退避重试。低于 `1 xp` 的 sell 必须重新查询 position，只有请求数量等于 `availableSize` 且也等于总 `size` 时才使用 sell-all 例外。
 
-**Manual-D 的 Stop 语义：**停止策略循环和继续部署，但保留已经提交到 OKX 的挂单；不会自动 Cancel All，也不会平仓。
+**Manual-D 的 Stop 语义：**停止扫描和新部署，只撤销并核对本策略尚未完成的入场 BUY；撤单期间新增的 fill 会先补齐保护 SELL。已经确认的保护 SELL 保留，Stop 不执行账户级 Cancel All，也不主动平仓。
 
 Manual-D 的 Poly Monitor 固定要求 **真实 Poly YES token**。它不会让用户选择一个 Poly NO 后用 `100 - YES` 冒充监控价。
 
@@ -388,7 +394,7 @@ sell = a + 1¢
 - pending sell 进度写入 `pending_sells_s_{account_id}.json`；
 - sell 被拒绝或查询失败时不推进 pending 进度，按 buy order 退避重试；
 - 低于 `1 xp` 时，仅在 position 明确证明没有冻结数量且会卖完整仓位时提交 sell-all；
-- Stop 只停止循环，保留 OKX 现有挂单。
+- Stop 停止扫描和新 BUY，只撤销并核对本策略尚未完成的入场 BUY；撤单期间新增的 fill 会先补保护 SELL，已经确认的保护 SELL 保留。
 
 如果交易 OKX NO：
 
@@ -415,7 +421,7 @@ buy  = sell - 1¢
 
 ## 10. Poly Monitor 风控
 
-Poly Monitor 同时使用 Poly REST 轮询和 WebSocket；REST 基准轮询约每 1.5 秒一次。比较前先把 Poly best bid 向下对齐到当前可执行 OKX tick，避免用无法实际挂出的价格触发错误比较。
+Poly Monitor 同时使用 Poly REST 轮询和 WebSocket；REST 基准轮询约每 1.5 秒一次。风险比较使用当前 OKX tick 的 `ROUND_HALF_UP`：恰好位于中点时向上，既不是固定向下，也不是直接用未经对齐的浮点值。原始 Poly 价格仍完整写入行情日志。
 
 ### 10.1 触发条件
 
@@ -437,10 +443,10 @@ Poly Monitor 同时使用 Poly REST 轮询和 WebSocket；REST 基准轮询约�
 
 ### 10.2 触发顺序
 
-1. 对当前 OKX **账户级 Cancel All**；
-2. 停止当前策略；
-3. 写日志并发送通知；
-4. 如果启用 Auto-Rebalance，启动重部署流程。
+1. 先写 `monitor_strategy_stop/before` recovery journal；写盘失败时冻结 Manual，但不执行账户级撤单。
+2. 停止 Manual-D 和 Manual-S；两个 `stop()` 都必须在 5 秒内明确返回 `True`，否则写 failed 并停止。
+3. stop 确认后写 `monitor_cancel_all/before`，再执行当前 OKX **账户级 Cancel All**，并查询到 open orders 为 0。
+4. stop 或 recovery 写盘失败时只记录错误并停止；stop 已确认且 cancel 结果成功写盘后才发送通知。只有 stop 与 cancel 都明确成功且 Auto-Rebalance 已启用，才启动重部署。
 
 > **重要：**Poly Monitor 的撤单范围可能覆盖该 OKX 账户所有开放订单，不只是当前 Manual 策略创建的订单。不要在同一个账户中混放不希望被风控撤掉的手工订单或其他机器人订单。
 
@@ -455,7 +461,8 @@ Auto-Rebalance 只在 Poly Monitor 已触发且账户启用该开关时运行：
 5. 用 `Decimal` 将新价对齐到 OKX 可执行 tick；
 6. 即使稳定价与原价相同，也会把每个 asset 的实际持仓数量与本地成本层完整同步；
 7. 按 `max(记录成本价, 新 sell 价)` 为每个 outcome 重挂 `reduceOnly` protective sell，避免低于记录成本卖出；低于 `1 xp` 只允许整仓 sell-all；
-8. 先恢复 Monitor，再重启原 Manual-D、Manual-S 或 Bid-Sell；任一步失败都会停止新 BUY 并报告失败，不能把部分成功写成“完成”。
+8. 先恢复 Monitor，再重启原 Manual-D、Manual-S 或 Bid-Sell；Manual 重启前后检查 `deployment_blocked/block_reason`，必须进入 running 且成功释放 entry barrier，任一步失败都会停止已重启组件；回滚时 `stop_strategy()` 明确返回 `False` 会记录 cleanup failure 并保留 recovery；
+9. 中断 recovery 会先严格停止 Manual：回调必须明确返回 `True` 才进入撤单、position 对账和 protective SELL 重建。Recovery 只恢复保护，不自动恢复新 BUY。
 
 成本层保存在：
 
@@ -562,9 +569,9 @@ Unlock and monitor all candidates again
 
 ### 12.4 入场、持仓和退出
 
-- 入场提交短暂的 GTC marketable limit；
+- 入场以最高合格 ask 为限价提交 IOC BUY；IOC 未成交余量由 OKX 终止，不会作为 GTC 留在订单簿；
 - 生成 `clientOrderId` 并成功保存下单前 SQLite snapshot 后才允许发单；任一步失败都会禁止本次下单；
-- 约 0.3 秒后只按 Sniper 自己的 `clientOrderId` 撤未成交 entry，不做账户级撤单；
+- API `code=0` 只表示请求已受理；随后仍按该 entry `clientOrderId` 查询精确订单终态和真实 `filledSize`，终态未知时保持 locked 并停止自动推进；
 - 买入 share 规范为整数；
 - 名义额不足 `1 xp` 不下单；
 - partial fill 会保留并进入持仓管理，不能当成整单失败；
@@ -609,14 +616,15 @@ NO exit bid  = 1 - YES best ask
 - 所有 exit `clientOrderId`；
 - 当前状态和更新时间。
 
-服务启动时，`AccountManager` 调用 `restore(resume=running)`：
+### 13.1 启动恢复顺序
 
-- 没有风险敞口时，恢复原 targets 并继续监控；
-- 存在锁时，查询 open/closed orders 和 positions；
-- 能确认 entry/exit 与仓位归属时，恢复 holding 或安全解锁；
-- 无法确认时保持 error/locked，禁止新入场；
-- 正常服务关闭不会为了方便而执行账户级 Cancel All；
-- 正常关闭会保留“关闭前原本 running”的恢复标记。
+1. `AccountManager` 先加载账户、解密 client，并读取该账户的 Sniper SQLite snapshot。
+2. 如果 snapshot 存在，先调用 `restore(..., resume=False)`：恢复 targets、订单归属、持仓 baseline 和锁，但不启动 Poly 信号监听。
+3. 随后查询完整 OKX open orders 与 open positions，执行账户级安全对账；无法归属、查询失败或状态损坏时保持 `error/locked`，禁止新入场。
+4. 只有账户安全对账通过，且 snapshot 表明关闭前原本处于 running，才再次调用 `restore(..., resume=True)` 恢复监听；没有风险敞口时也必须先经过这道安全门。
+5. 最后启动账户级只读安全探测，继续周期性核对 API、开放订单和开放仓位是否可被可靠读取。
+
+正常服务关闭不会为了方便而执行账户级 Cancel All；它会保留“关闭前原本 running”的恢复标记，供上述顺序判断是否应恢复监听。
 
 如果 `sniper_state` 的 config/runtime JSON 损坏，启动时会将该账户 Sniper 标为 `error/locked`，保留原数据库行并阻止自动 snapshot 覆盖。不要直接清掉这条记录；先备份数据库，再依据 OKX 的真实订单和 position 做人工恢复。
 
@@ -627,7 +635,29 @@ NO exit bid  = 1 - YES best ask
 - 页面刷新只重新读取后端当前状态，不中断后端策略；
 - 服务重启会走订单和 position 对账，不能只相信重启前的内存数量。
 
-Manual-D、Manual-S 和 Poly Monitor 的完整 running 状态当前不会像新版 Sniper 一样自动续跑。它们只持久化 pending fill、成本层或映射等辅助数据。
+Manual-D、Manual-S 和 Poly Monitor 的完整 running 状态不会像新版 Sniper 或 Sniper Old 一样自动续跑。它们只持久化 pending fill、成本层或映射等辅助数据。
+
+### 13.2 Sniper Old 的 SQLite 两阶段恢复
+
+Sniper Old 使用独立的 SQLite `sniper_old_state`，保存配置、running 标记、YES/NO token 与 asset、holding side、买卖数量、entry/exit `clientOrderId`、订单 ID、累计成交和 hold 起点。
+
+1. 启动先读取 `sniper_old_state`。JSON 损坏或对象结构非法时保留原行、标记 `error/locked` 并阻止自动覆盖。
+2. 第一阶段调用 `restore(..., resume=False)`：加载 ledger，逐个观察或撤销未决 entry/exit cloid，累计已确认成交，并查询真实 matching position；这一阶段绝不启动 Poly 监听或新 BUY。修正后的 ledger 会先写回 SQLite，并保留旧 snapshot 的 running 标记；写盘失败立即锁定，不能进入第二阶段。
+3. 随后执行账户级 open orders/positions 安全对账。订单、仓位或 market/token 映射无法证明归属时进入 recovery lock。
+4. 只有安全对账通过、旧 snapshot 的 running 标记为真、且同账户没有新版 Sniper 恢复请求时，才执行第二阶段 `restore(..., resume=True)`。
+5. 第二阶段若仍有仓位，恢复 holding/timeout 退出管理；若已空仓，恢复 monitoring。恢复后的状态再次写回 SQLite，写盘失败继续保持 locked。
+
+新版 Sniper 与 Sniper Old 都能跨服务重启恢复，但恢复模型不同：新版是多 target/global lock，Old 是固定 YES/NO 对和单仓 ledger。两者不会在同一账户同时自动恢复运行。
+
+### 13.3 只读账户安全探测与旧 dead-man 升级警告
+
+1. 每个已加载账户默认每 `120s` 执行一次只读探测，查询完整 open orders 和 open positions。
+2. 每轮最多尝试 3 次，失败重试间隔约 `2s`；成功时更新 `last_heartbeat_ok`，并把订单数、仓位数和耗时写入审计日志。
+3. 探测失败会激活 recovery lock，并停止所有可能新增敞口的本地策略活动；未知状态不会被当成空仓。position 没有显式 `assetId` 时，只有 `tokenIndex=1/tokenName=YES` 或 `2/NO` 的完整一致组合才能派生 asset；缺失、未知或冲突 outcome 会进入 `invalid_positions` 并保持锁定。
+4. 探测恢复后执行完整账户安全对账，只有能够证明安全时才解除 entry lock。普通 Manual Stop 不关闭这个后台任务。
+5. 当前运行链路不会调用 `backend/core/client.py::heartbeat()`，也不会安装 OKX 的 5 分钟 dead-man Cancel All，因为到期会撤掉包括保护 SELL 在内的全部订单。
+
+从曾经启用 dead-man 的旧版本升级时，旧进程最后提交的签名仍可能在约 5 分钟内到期并撤单。首次升级必须先确认账户空仓且无挂单，停止旧服务，并等待最后一份旧签名失效后再启动新版。
 
 ## 14. SQLite 和本地运行数据
 
@@ -652,6 +682,7 @@ data/
 | `accounts` | 账户名、加密后的 API 凭据、agent key、proxy node 等。 |
 | `global_config` | Telegram 等全局配置和少量运行辅助状态。 |
 | `sniper_state` | 新版 Sniper 配置、runtime snapshot、running 标记和更新时间。 |
+| `sniper_old_state` | Sniper Old 配置、单仓订单 ledger、running 标记和更新时间。 |
 
 备份要求：
 
@@ -698,13 +729,13 @@ Sniper 面板显示最后一次各分段、`Trigger→Ack`，以及最近窗口�
 
 | 稳定 ID | 统一显示名 |
 | --- | --- |
-| `JP1`…`JP5` | `JP-TYO-01`…`JP-TYO-05` |
+| `JP1`…`JP3` | `JP-TYO-01`…`JP-TYO-03` |
 | `OSAKA` | `JP-OSA-01` |
 | `SG1` | `SG-SIN-01` |
 | `K1` | `KR-SEL-01` |
 | `SYD1` / `SYD2` | `AU-SYD-01` / `AU-SYD-02` |
 
-新节点名必须使用 `CC-CITY-NN`，例如 `JP-TYO-06`。`direct`、旧式 `socks5` 和新式 `tunnel` 是路由类型，不再混进节点名。内置旧节点仍保留以兼容现有账户；新节点只允许 Direct 或绑定 `127.0.0.1` 的 SSH tunnel，不允许通过注册工具新增公网裸 SOCKS5。
+新节点名必须使用 `CC-CITY-NN`，例如 `JP-TYO-06`。`direct`、旧式 `socks5` 和新式 `tunnel` 是路由类型，不再混进节点名。仍在使用的稳定 ID 保留以兼容现有账户；已失效的 `JP4`/`JP5` 已退役，自定义 registry 不能重新注册它们，旧数据库若仍绑定这些 ID 会拒绝加载而不会静默改走 Direct。新节点只允许 Direct 或绑定 `127.0.0.1` 的 SSH tunnel，不允许通过注册工具新增公网裸 SOCKS5。
 
 本机扩展写入 `data/proxy_nodes.json`，升级代码时不要覆盖它。服务在启动时读取 registry，所以注册或替换节点后必须重启这一套单进程 FastAPI 服务。先检查有效配置：
 
@@ -1149,7 +1180,7 @@ Select-String -Path .\logs\audit.jsonl* -SimpleMatch $clientOrderId
 - 不要通过静态 Web 目录公开 `logs/`，`/api/logging/status` 只返回路径、容量和队列健康，不返回日志正文。
 - `.gitignore` 必须保留 `logs/`。注意 `zip -r`、资源管理器压缩和某些部署工具不会自动读取 `.gitignore`。
 - 升级包/部署包不得包含 `logs/`、`bot.log*`、`error.log*`、`audit.jsonl*`、`market_data.jsonl*`；目标机启动时会自行创建空日志文件。
-- 同样不要把 `data/`、真实 `config.yaml` 凭据、私钥、`.key` 或历史 `.bak-*` 混进通用代码升级包。运行数据应走单独、受控的备份流程。
+- 同样不要把 `data/`、真实 `config.yaml` 凭据、私钥、`.key` 或历史备份快照混进通用代码升级包。运行数据应走单独、受控的备份流程。
 - 部署后先调用 `/api/logging/status`，再制造一条无风险页面请求，确认 `bot.log` 和 `audit.jsonl` 的修改时间更新；不要等到第一次实盘异常才发现目录不可写。
 
 ## 19. 测试与静态检查
@@ -1160,7 +1191,7 @@ Select-String -Path .\logs\audit.jsonl* -SimpleMatch $clientOrderId
 python -m unittest discover -s tests -v
 ```
 
-本次本地审查结果为 `213 tests OK`；其中前端测试会提取各 HTML 的 inline JavaScript 并交给 Node.js 做语法检查。
+最终通过数量以当前完整 `unittest` 输出为准；其中前端测试会提取各 HTML 的 inline JavaScript 并交给 Node.js 做语法检查。
 
 Python 语法检查：
 
@@ -1236,23 +1267,11 @@ Cancel All 只撤单，不会撤销已经发生的 fill。Auto-Rebalance 会尝�
 
 ### `poly_sniper_old.py`
 
-旧版会从一对 YES/NO 配置自动同时监控两边，缺少新版显式多候选全局锁和完整持久恢复。保留它是为了兼容和行为对照，不代表推荐继续使用。多赛事、多 outcome 和恢复相关功能只应维护在 `poly_sniper.py`。
+旧版会从一对 YES/NO 配置自动同时监控两边，共用一套单仓状态。它已有唯一 `clientOrderId`、精确订单终态、partial fill 累计退出、最多 5 次平仓尝试、fail-closed Stop，以及独立 `sniper_old_state` SQLite ledger 和两阶段重启恢复；但仍没有新版显式多 target、任意 outcome 映射和全局候选管理。保留它是为了兼容和行为对照，不代表推荐继续使用；新功能应优先维护在 `poly_sniper.py`。
 
-### `.bak-*`
+### `scripts/`
 
-这些是历史人工快照，Python 不会 import 它们。它们可能包含已经修复的逻辑、旧 UI、旧配置或过期凭据，不能当成当前实现说明。
-
-### `frontend/polytest.html`
-
-这是旧独立诊断页面，`app.py` 没有提供对应路由，而且页面含历史硬编码信息。生产部署时不要额外暴露它。
-
-### `patch_fix.py`
-
-这是一次性旧补丁。当前启动和测试都不调用它；再次执行会对源码做文本替换，可能破坏已经更新的实现。
-
-### `layers` 和 `scripts/`
-
-`layers` 是空占位，不是运行入口。`scripts/` 现在包含出口 VPS bootstrap、Bot 主机 SSH tunnel 安装和节点 registry/benchmark 工具；应用不会自动执行它们，但新节点接入和生产排障需要保留，使用方法见第 15 章。
+`scripts/` 现在包含出口 VPS bootstrap、Bot 主机 SSH tunnel 安装和节点 registry/benchmark 工具；应用不会自动执行它们，但新节点接入和生产排障需要保留，使用方法见第 15 章。
 
 ### `auto-push.sh`
 
@@ -1268,7 +1287,7 @@ Cancel All 只撤单，不会撤销已经发生的 fill。Auto-Rebalance 会尝�
 - [ ] 修改默认 Web 登录密码并启用 HTTPS；
 - [ ] 确认只有一个 bot 进程，Uvicorn 没有启用多 worker，也没有第二实例共享 `data/`；
 - [ ] 确认服务器时间同步；
-- [ ] 验证每个账户的代理和 API heartbeat；
+- [ ] 验证每个账户的代理和只读 open orders/positions 安全探测；
 - [ ] 用 4¢、96¢、3.9¢、96.1¢、0.1¢ 验证显示和下单格式；
 - [ ] 分别验证真实 Poly YES 和真实 Poly NO token；
 - [ ] 验证 Manual-S NO 的 OKX 镜像 bid/ask；

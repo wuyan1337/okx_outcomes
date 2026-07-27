@@ -3,15 +3,15 @@ import asyncio
 import json
 import time
 import logging
-from typing import Optional
+from typing import Callable, Optional
 from fastapi import WebSocket, WebSocketDisconnect
 
 import aiohttp
 from aiohttp_socks import ProxyConnector
 
-from .core.database import PROXY_NODES
 from .core.logging_config import market_event
 from .core.price_utils import as_decimal, format_okx_price, invert_binary_price
+from .core.proxy_nodes import require_proxy_node
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +310,7 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str,
                        base_url: str, stop_event: asyncio.Event,
                        invert: bool = False, account_id: str = ""):
     """Connect to OKX business WS and maintain the incremental pm-books book."""
+    node = require_proxy_node(proxy_node)
     retry_delay = 1
     while not stop_event.is_set():
         bid_map = {}
@@ -318,10 +319,8 @@ async def okx_ws_relay(ws_out: WebSocket, asset_id: str, proxy_node: str,
         ws_snapshot_received = False
         try:
             connector = None
-            if proxy_node and proxy_node in PROXY_NODES:
-                node = PROXY_NODES[proxy_node]
-                if node["host"] is not None:
-                    connector = ProxyConnector.from_url(f"socks5://{node['host']}:{node['port']}")
+            if node is not None and node["host"] is not None:
+                connector = ProxyConnector.from_url(f"socks5://{node['host']}:{node['port']}")
 
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.ws_connect(_okx_ws_endpoint(base_url), heartbeat=20) as ws:
@@ -516,6 +515,7 @@ async def periodic_refresh(ws_out: WebSocket, poly_token: str, okx_asset: str,
                            stop_event: asyncio.Event, invert: bool = False,
                            account_id: str = ""):
     """Refresh both books via REST every three seconds."""
+    node = require_proxy_node(proxy_node)
     while not stop_event.is_set():
         await asyncio.sleep(3)
         if stop_event.is_set():
@@ -569,10 +569,8 @@ async def periodic_refresh(ws_out: WebSocket, poly_token: str, okx_asset: str,
                 if okx_asset:
                     try:
                         connector = None
-                        if proxy_node and proxy_node in PROXY_NODES:
-                            node = PROXY_NODES[proxy_node]
-                            if node["host"] is not None:
-                                connector = ProxyConnector.from_url(f"socks5://{node['host']}:{node['port']}")
+                        if node is not None and node["host"] is not None:
+                            connector = ProxyConnector.from_url(f"socks5://{node['host']}:{node['port']}")
                         async with aiohttp.ClientSession(connector=connector) as sess2:
                             url = f"{base_url.rstrip('/')}/api/v5/market/pm-books?instId={okx_asset}&sz=10"
                             async with sess2.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
@@ -637,11 +635,23 @@ async def periodic_refresh(ws_out: WebSocket, poly_token: str, okx_asset: str,
             )
 
 
-def register_ws_routes(app, manager):
+def register_ws_routes(
+    app,
+    manager,
+    token_validator: Optional[Callable[[str, str], bool]] = None,
+):
     """Register WebSocket routes on the FastAPI app."""
 
     @app.websocket("/ws/book/{account_id}")
     async def ws_book(websocket: WebSocket, account_id: str):
+        token = str(websocket.query_params.get("token", "") or "")
+        if token_validator is None or not token_validator(token, account_id):
+            logger.warning(
+                "Rejected unauthenticated dashboard websocket account=%s",
+                account_id,
+            )
+            await websocket.close(code=4401, reason="Authentication required")
+            return
         await websocket.accept()
         stop_event = asyncio.Event()
         tasks = []
@@ -658,8 +668,13 @@ def register_ws_routes(app, manager):
             okx_query_asset = yes_asset if invert_okx else okx_asset
 
             inst = manager.get_instance(account_id)
-            proxy_node = inst.proxy_node if inst else "JP2"
-            base_url = inst.client.base_url if inst else "https://us.okx.com"
+            if inst is None:
+                await websocket.send_json({"error": "Account is unavailable"})
+                await websocket.close()
+                return
+            proxy_node = inst.proxy_node
+            require_proxy_node(proxy_node)
+            base_url = inst.client.base_url
 
             if poly_token:
                 tasks.append(asyncio.create_task(

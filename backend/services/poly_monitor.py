@@ -1,6 +1,6 @@
 """Polymarket best-bid risk control for Manual-D and Manual-S."""
 import asyncio
-from decimal import Decimal, ROUND_FLOOR
+from decimal import Decimal, ROUND_HALF_UP
 import logging
 import secrets
 import time
@@ -59,6 +59,14 @@ class PolyMonitor:
 
     async def start(self, poly_token_id: str, reference_price: float = 0.0, depth_threshold: float = 10000.0):
         """Start monitoring. If reference_price=0, fetch current Poly best bid as reference."""
+        if self.auto_rebalance is not None and getattr(
+            self.auto_rebalance, "recovery_required", False
+        ):
+            return {
+                "ok": False,
+                "error": "Account recovery is required before Monitor can start",
+                "recovery": self.auto_rebalance.recovery_status(),
+            }
         if self._running or (
             self._trigger_task is not None and not self._trigger_task.done()
         ):
@@ -195,6 +203,31 @@ class PolyMonitor:
         return generation is None or (
             generation == self._lifecycle_generation and self.state.enabled
         )
+
+    async def _stop_strategy_after_journal_failure(self, reason: str) -> None:
+        """Freeze Manual activity even when journaling prevents account cancel-all."""
+        if not self.on_trigger_callback:
+            logger.critical(
+                "[PolyMonitor] No strategy-stop callback is available after journal failure"
+            )
+            return
+        try:
+            stopped = await asyncio.wait_for(self.on_trigger_callback(), timeout=5.0)
+            if stopped is not True:
+                raise RuntimeError("strategy stop was not safely confirmed")
+            audit_event(
+                "monitor.strategy_stopped_after_persistence_failure",
+                level=logging.WARNING,
+                account_id=self.account_id,
+                run_id=self._run_id,
+                trace_id=self._trigger_trace_id,
+                reason=reason,
+            )
+        except Exception as exc:
+            logger.critical(
+                "[PolyMonitor] Failed to stop strategy after journal failure: %s",
+                exc,
+            )
 
     async def _get_poly_best_bid(self, token_id: str) -> Optional[float]:
         """Fetch current Poly best bid price."""
@@ -408,10 +441,10 @@ class PolyMonitor:
 
     @staticmethod
     def _risk_bid_price(price) -> Decimal:
-        """Floor a Poly bid to the executable OKX tick for conservative risk checks."""
+        """Round a Poly bid to the nearest executable OKX tick, halves upward."""
         value = as_decimal(price)
         tick = okx_tick(value)
-        return (value / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+        return (value / tick).to_integral_value(rounding=ROUND_HALF_UP) * tick
 
     async def _check_price(self, current_bid: float, bids: list, source: str):
         """Check if price deviated from reference.
@@ -501,7 +534,7 @@ class PolyMonitor:
             self._schedule_trigger(reason)
 
     async def _trigger(self, reason: str, generation: Optional[int] = None):
-        """Price deviated - CANCEL FIRST, then stop strategy, then notify."""
+        """Price deviated: freeze entries, verify stop, then cancel and notify."""
         if self.state.triggered or not self._trigger_generation_active(generation):
             return
 
@@ -520,7 +553,129 @@ class PolyMonitor:
             lifecycle_generation=generation,
         )
 
-        # Step 1: CANCEL ALL ORDERS IMMEDIATELY (highest priority)
+        recovery_id = self._trigger_trace_id or secrets.token_hex(8)
+        self._trigger_trace_id = recovery_id
+        recovery_context = {
+            "source": "poly_monitor",
+            "run_id": self._run_id,
+            "trace_id": recovery_id,
+            "reason": reason,
+            "poly_token_id": self.state.poly_token_id,
+            "reference_price": self.state.reference_price,
+            "old_price_cents": self._old_price_cents,
+            "strategy_type": self._strategy_type,
+            "strategy_mode": self._strategy_mode,
+            "strategy_asset_id": getattr(self, "_strategy_asset_id", ""),
+            "lifecycle_generation": generation,
+        }
+        prepare_recovery = getattr(self.auto_rebalance, "prepare_recovery", None)
+        get_params = getattr(self.auto_rebalance, "get_strategy_params", None)
+        try:
+            strategy_params = get_params() if callable(get_params) else {}
+        except Exception as exc:
+            logger.critical(
+                "[PolyMonitor] Refusing cancel-all because strategy context is unavailable: %s",
+                exc,
+            )
+            await self._stop_strategy_after_journal_failure(reason)
+            return
+        if not isinstance(strategy_params, dict) or not strategy_params:
+            logger.critical(
+                "[PolyMonitor] Refusing cancel-all because strategy parameters are unavailable"
+            )
+            await self._stop_strategy_after_journal_failure(reason)
+            return
+        if not callable(prepare_recovery) or not prepare_recovery(
+            rebalance_id=recovery_id,
+            stage="monitor_strategy_stop",
+            phase="before",
+            context=recovery_context,
+            strategy_params=strategy_params,
+        ):
+            logger.critical(
+                "[PolyMonitor] Refusing cancel-all because the strategy-stop journal could not be persisted"
+            )
+            audit_event(
+                "monitor.strategy_stop_blocked_persistence",
+                level=logging.CRITICAL,
+                account_id=self.account_id,
+                run_id=self._run_id,
+                trace_id=recovery_id,
+                reason=reason,
+            )
+            await self._stop_strategy_after_journal_failure(reason)
+            return
+
+        # Step 1: stop both Manual strategies and require an explicit safe result.
+        strategies_stopped = False
+        if self.on_trigger_callback:
+            try:
+                stop_result = await asyncio.wait_for(
+                    self.on_trigger_callback(), timeout=5.0
+                )
+                strategies_stopped = stop_result is True
+                if strategies_stopped:
+                    logger.info("[PolyMonitor] Strategies stopped and verified")
+                else:
+                    logger.error(
+                        "[PolyMonitor] Strategy stop returned an unsafe result; cancel-all and auto-rebalance blocked"
+                    )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "[PolyMonitor] Strategy stop timed out (5s); cancel-all and auto-rebalance blocked"
+                )
+            except Exception as e:
+                logger.error(
+                    "[PolyMonitor] Strategy stop failed; cancel-all and auto-rebalance blocked: %s",
+                    e,
+                )
+        else:
+            logger.error(
+                "[PolyMonitor] Strategy-stop callback unavailable; cancel-all and auto-rebalance blocked"
+            )
+
+        if not prepare_recovery(
+            rebalance_id=recovery_id,
+            stage="monitor_strategy_stop",
+            phase="after" if strategies_stopped else "failed",
+            context={
+                **recovery_context,
+                "strategies_stopped": strategies_stopped,
+            },
+            strategy_params=strategy_params,
+        ):
+            logger.critical(
+                "[PolyMonitor] Strategy-stop result could not be persisted; cancel-all blocked"
+            )
+            return
+        if not strategies_stopped:
+            return
+
+        if not self._trigger_generation_active(generation):
+            logger.info("[PolyMonitor] Trigger stopped before cancel-all")
+            return
+
+        if not prepare_recovery(
+            rebalance_id=recovery_id,
+            stage="monitor_cancel_all",
+            phase="before",
+            context={**recovery_context, "strategies_stopped": True},
+            strategy_params=strategy_params,
+        ):
+            logger.critical(
+                "[PolyMonitor] Refusing cancel-all because its recovery journal could not be persisted"
+            )
+            audit_event(
+                "monitor.cancel_all_blocked_persistence",
+                level=logging.CRITICAL,
+                account_id=self.account_id,
+                run_id=self._run_id,
+                trace_id=recovery_id,
+                reason=reason,
+            )
+            return
+
+        # Step 2: with entry loops stopped, cancel and verify the account order set.
         cancelled = await self._fast_cancel_all()
         logger.info(f"[PolyMonitor] Final cancel result: {cancelled}")
         cancel_confirmed = bool(cancelled.get("ok"))
@@ -532,26 +687,21 @@ class PolyMonitor:
             trace_id=self._trigger_trace_id,
             result=cancelled,
         )
-
-        if not self._trigger_generation_active(generation):
-            logger.info("[PolyMonitor] Trigger stopped before strategy callback")
+        if not prepare_recovery(
+            rebalance_id=recovery_id,
+            stage="monitor_cancel_all",
+            phase="after" if cancel_confirmed else "failed",
+            context={
+                **recovery_context,
+                "strategies_stopped": True,
+                "cancel_result": cancelled,
+            },
+            strategy_params=strategy_params,
+        ):
+            logger.critical(
+                "[PolyMonitor] Cancellation ran but its recovery stage could not be persisted"
+            )
             return
-
-        # Step 2: Bound the strategy-stop wait to five seconds.
-        strategies_stopped = False
-        if self.on_trigger_callback:
-            try:
-                await asyncio.wait_for(self.on_trigger_callback(), timeout=5.0)
-                strategies_stopped = True
-                logger.info("[PolyMonitor] Strategies stopped via callback")
-            except asyncio.TimeoutError:
-                logger.error(
-                    "[PolyMonitor] Strategy stop timed out (5s); auto-rebalance blocked"
-                )
-            except Exception as e:
-                logger.error(
-                    f"[PolyMonitor] Strategy stop failed; auto-rebalance blocked: {e}"
-                )
 
         if not self._trigger_generation_active(generation):
             logger.info("[PolyMonitor] Trigger stopped before notification/rebalance")
@@ -600,6 +750,7 @@ class PolyMonitor:
                     poly_token_id=self.state.poly_token_id,
                     old_price_cents=self._old_price_cents,
                     strategy_type=self._strategy_type,
+                    recovery_id=recovery_id,
                 )
             except Exception as e:
                 logger.error(f"[PolyMonitor] Auto-rebalance launch failed: {e}")
@@ -709,3 +860,13 @@ class PolyMonitor:
             "poly_token_id": self.state.poly_token_id,
             "auto_rebalance": self.auto_rebalance.status() if self.auto_rebalance else None,
         }
+
+    def recovery_status(self) -> dict:
+        if self.auto_rebalance is None:
+            return {"required": False, "available": False}
+        return self.auto_rebalance.recovery_status()
+
+    async def recover(self) -> dict:
+        if self.auto_rebalance is None:
+            return {"ok": False, "error": "Auto-Rebalance recovery is unavailable"}
+        return await self.auto_rebalance.recover()

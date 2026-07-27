@@ -1,10 +1,12 @@
 """FastAPI backend for OKX Outcomes Bot — Multi-Account System."""
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
 import secrets
+import threading
 import time
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -24,6 +26,14 @@ from .core.database import (
 from .services.account_manager import AccountManager
 from .services.notifier import TelegramNotifier
 from .services.size_utils import normalize_size_str
+from .services.order_lifecycle import (
+    TERMINAL_ORDER_STATUSES,
+    generate_client_order_id,
+    normalise_order_status,
+    place_and_confirm,
+    cancel_and_confirm,
+    wait_for_order,
+)
 from .services.latency_probe import (
     DEFAULT_WARM_SAMPLES,
     OKX_BASE_URLS,
@@ -46,6 +56,7 @@ from .core.logging_config import (
     flush_logging,
     get_logging_status,
     log_context,
+    market_event,
     shutdown_logging,
 )
 
@@ -60,6 +71,39 @@ logger = logging.getLogger(__name__)
 manager = AccountManager()
 
 
+_WS_TOKEN_TTL_SECONDS = 30.0
+_ws_tokens: dict[str, tuple[str, float]] = {}
+_ws_tokens_lock = threading.Lock()
+
+
+def _issue_ws_token(account_id: str) -> tuple[str, int]:
+    """Create a short-lived, one-use dashboard WebSocket credential."""
+    now = time.monotonic()
+    token = secrets.token_urlsafe(32)
+    expires_at = now + _WS_TOKEN_TTL_SECONDS
+    with _ws_tokens_lock:
+        expired = [key for key, (_, expiry) in _ws_tokens.items() if expiry <= now]
+        for key in expired:
+            _ws_tokens.pop(key, None)
+        _ws_tokens[token] = (str(account_id), expires_at)
+    return token, int(_WS_TOKEN_TTL_SECONDS)
+
+
+def _consume_ws_token(token: str, account_id: str) -> bool:
+    """Validate and consume a WebSocket token exactly once."""
+    if not token:
+        return False
+    now = time.monotonic()
+    with _ws_tokens_lock:
+        entry = _ws_tokens.pop(str(token), None)
+    if entry is None:
+        return False
+    expected_account_id, expires_at = entry
+    return expires_at > now and secrets.compare_digest(
+        expected_account_id, str(account_id)
+    )
+
+
 def _sniper_busy(instance) -> bool:
     sniper = getattr(instance, "sniper", None)
     if sniper is None:
@@ -69,6 +113,16 @@ def _sniper_busy(instance) -> bool:
         or getattr(sniper, "starting", False)
         or getattr(getattr(sniper, "state", None), "locked", False)
         or getattr(sniper, "_persistence_failed", False)
+    )
+
+
+def _sniper_old_busy(instance) -> bool:
+    sniper_old = getattr(instance, "sniper_old", None)
+    if sniper_old is None:
+        return False
+    return bool(
+        getattr(sniper_old, "running", False)
+        or getattr(getattr(sniper_old, "state", None), "locked", False)
     )
 
 
@@ -83,10 +137,11 @@ def _account_trading_busy(instance) -> bool:
         instance.strategy_d.running
         or instance.strategy_s.running
         or _sniper_busy(instance)
-        or instance.sniper_old.running
+        or _sniper_old_busy(instance)
         or instance.poly_monitor.running
         or monitor_enabled
         or rebalancing
+        or getattr(instance, "recovery_locked", False)
     )
 
 
@@ -96,6 +151,125 @@ def _risk_control_busy(instance) -> bool:
         or getattr(getattr(instance.poly_monitor, "state", None), "enabled", False)
         or getattr(getattr(instance, "auto_rebalance", None), "_rebalancing", False)
     )
+
+
+def _automated_trading_active(instance) -> bool:
+    """Return whether a live task can submit or manage exchange orders."""
+    return bool(
+        getattr(getattr(instance, "strategy_d", None), "running", False)
+        or getattr(getattr(instance, "strategy_s", None), "running", False)
+        or getattr(getattr(instance, "sniper", None), "running", False)
+        or getattr(getattr(instance, "sniper", None), "starting", False)
+        or getattr(getattr(instance, "sniper_old", None), "running", False)
+        or getattr(getattr(instance, "poly_monitor", None), "running", False)
+        or getattr(
+            getattr(getattr(instance, "poly_monitor", None), "state", None),
+            "enabled",
+            False,
+        )
+        or getattr(getattr(instance, "auto_rebalance", None), "_rebalancing", False)
+    )
+
+
+def _recovery_status(instance) -> dict:
+    provider = getattr(instance, "recovery_status", None)
+    if callable(provider):
+        try:
+            status = provider()
+            if isinstance(status, dict):
+                return status
+        except Exception:
+            logger.exception("Failed to read account recovery status")
+    return {
+        "locked": bool(getattr(instance, "recovery_locked", False)),
+        "reason": str(getattr(instance, "recovery_reason", "") or ""),
+        "details": getattr(instance, "recovery_details", {}) or {},
+    }
+
+
+async def _refresh_entry_safety(instance) -> dict:
+    """Reconcile exchange state before any action that can increase exposure."""
+    reconcile = getattr(instance, "reconcile_account_safety", None)
+    if callable(reconcile):
+        try:
+            result = await reconcile()
+            if isinstance(result, dict):
+                return result
+        except Exception as exc:
+            logger.exception("Account safety reconciliation failed")
+            if hasattr(instance, "recovery_locked"):
+                instance.recovery_locked = True
+                instance.recovery_reason = f"Account safety reconciliation failed: {exc}"
+    return _recovery_status(instance)
+
+
+async def _entry_safety_response(instance):
+    status = await _refresh_entry_safety(instance)
+    if not status.get("locked"):
+        return None
+    reason = str(status.get("reason") or "Unmanaged orders or positions require reconciliation")
+    return JSONResponse(
+        status_code=409,
+        content={
+            "ok": False,
+            "error": reason,
+            "recovery": status,
+        },
+    )
+
+
+def _activate_account_recovery(instance, reason: str, details: dict) -> None:
+    """Fail closed after an exchange write whose final state is unknown."""
+    activate = getattr(instance, "_activate_recovery_lock", None)
+    if callable(activate):
+        activate(reason, details)
+    else:
+        instance.recovery_locked = True
+        instance.recovery_reason = reason
+        instance.recovery_details = dict(details)
+    audit_event(
+        "account.write_state_unresolved",
+        level=logging.ERROR,
+        account_id=getattr(instance, "account_id", ""),
+        reason=reason,
+        details=details,
+    )
+
+
+async def _rollback_manual_start_after_monitor_failure(instance, strategy_type: str) -> bool:
+    """Stop a just-started Manual strategy and fail closed if cleanup is uncertain."""
+    strategy = instance.strategy_d if strategy_type == "manual-d" else instance.strategy_s
+    strategy_safe = True
+    monitor_safe = True
+    errors = []
+    try:
+        strategy_safe = await strategy.stop()
+    except Exception as exc:
+        strategy_safe = False
+        errors.append(f"strategy stop: {exc}")
+    monitor = getattr(instance, "poly_monitor", None)
+    if monitor is not None and (
+        getattr(monitor, "running", False)
+        or getattr(getattr(monitor, "state", None), "enabled", False)
+    ):
+        try:
+            await monitor.stop()
+        except Exception as exc:
+            monitor_safe = False
+            errors.append(f"monitor stop: {exc}")
+    if strategy_safe is False or not monitor_safe:
+        _activate_account_recovery(
+            instance,
+            "monitor_start_rollback_incomplete",
+            {
+                "strategy": strategy_type,
+                "strategy_safe": strategy_safe,
+                "monitor_safe": monitor_safe,
+                "errors": errors,
+            },
+        )
+        return False
+    return True
 
 
 def _serialize_strategy_lifecycle(handler):
@@ -200,25 +374,82 @@ from collections import defaultdict
 import time as _time
 
 _login_attempts = defaultdict(list)  # ip -> [timestamp, ...]
+_login_attempts_lock = threading.Lock()
 _MAX_ATTEMPTS = 5
 _LOCKOUT_SECONDS = 60
 
+
+def _trusted_proxy_networks():
+    configured = config.get("server", {}).get(
+        "trusted_proxies", ["127.0.0.1/32", "::1/128"]
+    )
+    if isinstance(configured, str):
+        configured = [configured]
+    networks = []
+    for value in configured if isinstance(configured, list) else []:
+        try:
+            networks.append(ipaddress.ip_network(str(value), strict=False))
+        except ValueError:
+            logger.error("Ignoring invalid trusted proxy network: %s", value)
+    return tuple(networks)
+
+
+_TRUSTED_PROXY_NETWORKS = _trusted_proxy_networks()
+
+
+def _request_client_ip(request: Request) -> str:
+    """Resolve the client without trusting spoofed forwarding headers."""
+    peer = request.client.host if request.client else "unknown"
+    try:
+        peer_ip = ipaddress.ip_address(peer)
+    except ValueError:
+        return str(peer)
+    if not any(peer_ip in network for network in _TRUSTED_PROXY_NETWORKS):
+        return peer_ip.compressed
+
+    forwarded = request.headers.get("x-forwarded-for", "")
+    chain = []
+    for value in forwarded.split(","):
+        candidate = value.strip()
+        if not candidate:
+            continue
+        try:
+            chain.append(ipaddress.ip_address(candidate))
+        except ValueError:
+            continue
+    chain.append(peer_ip)
+    for candidate in reversed(chain):
+        if not any(candidate in network for network in _TRUSTED_PROXY_NETWORKS):
+            return candidate.compressed
+    return peer_ip.compressed
+
 def _check_rate_limit(request: Request):
     """Block IP after 5 failed auth attempts within 60 seconds."""
-    ip = request.client.host if request.client else "unknown"
-    now = _time.time()
-    # Clean old entries
-    _login_attempts[ip] = [t for t in _login_attempts[ip] if now - t < _LOCKOUT_SECONDS]
-    if len(_login_attempts[ip]) >= _MAX_ATTEMPTS:
+    ip = _request_client_ip(request)
+    now = _time.monotonic()
+    with _login_attempts_lock:
+        attempts = [
+            timestamp
+            for timestamp in _login_attempts[ip]
+            if now - timestamp < _LOCKOUT_SECONDS
+        ]
+        if attempts:
+            _login_attempts[ip] = attempts
+        else:
+            _login_attempts.pop(ip, None)
+        blocked = len(attempts) >= _MAX_ATTEMPTS
+    if blocked:
         raise HTTPException(status_code=429, detail="Too many attempts. Try again later.")
 
 def _record_failed_attempt(request: Request):
-    ip = request.client.host if request.client else "unknown"
-    _login_attempts[ip].append(_time.time())
+    ip = _request_client_ip(request)
+    with _login_attempts_lock:
+        _login_attempts[ip].append(_time.monotonic())
 
 def _clear_attempts(request: Request):
-    ip = request.client.host if request.client else "unknown"
-    _login_attempts.pop(ip, None)
+    ip = _request_client_ip(request)
+    with _login_attempts_lock:
+        _login_attempts.pop(ip, None)
 
 
 
@@ -377,7 +608,7 @@ async def request_audit_middleware(request: Request, call_next):
     """Record one correlation-friendly timeline entry for every HTTP request."""
     request_id = secrets.token_hex(8)
     started_ns = time.perf_counter_ns()
-    client_host = request.client.host if request.client else "unknown"
+    client_host = _request_client_ip(request)
     client_host, _client_truncated = _bounded_log_text(client_host, 128)
     content_length, _content_length_truncated = _bounded_log_text(
         request.headers.get("content-length", ""), 32
@@ -433,7 +664,7 @@ async def request_audit_middleware(request: Request, call_next):
 
 # Register WebSocket routes for real-time orderbook
 from .ws_book import register_ws_routes
-register_ws_routes(app, manager)
+register_ws_routes(app, manager, token_validator=_consume_ws_token)
 
 # ─── Static pages ───
 
@@ -477,12 +708,16 @@ async def get_status(user: str = Depends(verify_auth)):
             running_strategy = "Bid-Sell" if mode == "bid-sell" else "Manual-S"
         elif _sniper_busy(inst):
             running_strategy = "Sniper" if inst.sniper.running else "Sniper (locked)"
-        elif inst.sniper_old.running:
-            running_strategy = "Sniper-Old"
+        elif _sniper_old_busy(inst):
+            running_strategy = (
+                "Sniper-Old" if inst.sniper_old.running else "Sniper-Old (locked)"
+            )
         elif getattr(inst.auto_rebalance, "_rebalancing", False):
             running_strategy = "Auto-Rebalance"
         elif inst.poly_monitor.running or getattr(inst.poly_monitor.state, "enabled", False):
             running_strategy = "Poly Monitor"
+        elif getattr(inst, "recovery_locked", False):
+            running_strategy = "Recovery Lock"
         # Get per-account stats for cards
         acct_orders = 0
         acct_positions = 0
@@ -523,6 +758,7 @@ async def get_status(user: str = Depends(verify_auth)):
             "orders": acct_orders,
             "positions": acct_positions,
             "balance": acct_balance,
+            "recovery": _recovery_status(inst),
         })
     return {
         **stats,
@@ -557,12 +793,16 @@ async def list_accounts(user: str = Depends(verify_auth)):
                 )
             elif _sniper_busy(inst):
                 strategy = "Sniper" if inst.sniper.running else "Sniper (locked)"
-            elif inst.sniper_old.running:
-                strategy = "Sniper-Old"
+            elif _sniper_old_busy(inst):
+                strategy = (
+                    "Sniper-Old" if inst.sniper_old.running else "Sniper-Old (locked)"
+                )
             elif getattr(inst.auto_rebalance, "_rebalancing", False):
                 strategy = "Auto-Rebalance"
             elif inst.poly_monitor.running or getattr(inst.poly_monitor.state, "enabled", False):
                 strategy = "Poly Monitor"
+            elif getattr(inst, "recovery_locked", False):
+                strategy = "Recovery Lock"
         result.append({
             "id": acc["id"],
             "name": acc["name"],
@@ -572,6 +812,11 @@ async def list_accounts(user: str = Depends(verify_auth)):
             "running": running,
             "strategy": strategy,
             "created_at": acc["created_at"],
+            "recovery": _recovery_status(inst) if inst else {
+                "locked": True,
+                "reason": "Account is not loaded",
+                "details": {},
+            },
         })
     return {"accounts": result}
 
@@ -616,11 +861,45 @@ async def create_new_account(request: Request, user: str = Depends(verify_auth))
         return JSONResponse(status_code=400, content={"ok": False, "error": "region must be AU or CN"})
 
     try:
+        node = PROXY_NODES.get(proxy_node)
+        if node is None:
+            raise ValueError(f"Invalid proxy node: {proxy_node}")
+        node_health = await benchmark_proxy_node(
+            proxy_node,
+            node,
+            region=region,
+            samples=2,
+        )
+        if str(node_health.get("status", "failed")) == "failed":
+            audit_event(
+                "account.create_node_rejected",
+                level=logging.ERROR,
+                proxy_node=proxy_node,
+                region=region,
+                health=node_health,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "ok": False,
+                    "error": "Selected proxy node failed the OKX connectivity check",
+                    "node": {
+                        "id": proxy_node,
+                        "label": node.get("label", proxy_node),
+                        "status": node_health.get("status", "failed"),
+                        "okx": node_health.get("okx", {}),
+                    },
+                },
+            )
         from .core.auth import OKXSigner
         if not OKXSigner(agent_key).address:
             raise ValueError("Invalid agent private key")
         result = await manager.add_account(name, api_key, secret_key, passphrase, agent_key, proxy_node, region=region)
-        return {"ok": True, "account": result}
+        return {
+            "ok": True,
+            "account": result,
+            "node_health": node_health.get("status", "unknown"),
+        }
     except ValueError as e:
         return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
     except Exception as e:
@@ -628,10 +907,45 @@ async def create_new_account(request: Request, user: str = Depends(verify_auth))
 
 
 @app.delete("/api/accounts/{account_id}")
+@_serialize_strategy_lifecycle
 async def remove_account(account_id: str, user: str = Depends(verify_auth)):
-    """Delete an account."""
-    await manager.remove_account(account_id)
-    return {"ok": True}
+    """Flatten verified exchange state before deleting account credentials."""
+    inst = manager.get_instance(account_id)
+    if not inst:
+        raise HTTPException(404, "Account not found")
+
+    close_result = await _flash_close_account(
+        account_id,
+        inst,
+        require_local_reconciliation=True,
+    )
+    if not close_result.get("ok"):
+        audit_event(
+            "account.remove_blocked_exchange_state",
+            level=logging.ERROR,
+            account_id=account_id,
+            result=close_result,
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": (
+                    "Account was not deleted because exchange orders or "
+                    "positions could not be safely cleared"
+                ),
+                "close": close_result,
+            },
+        )
+    try:
+        await manager.remove_account(account_id)
+    except Exception as exc:
+        logger.error("Account removal failed for %s: %s", account_id, exc)
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(exc), "close": close_result},
+        )
+    return {"ok": True, "close": close_result}
 
 
 # ─── Per-Account APIs ───
@@ -650,6 +964,20 @@ async def account_balance(account_id: str, user: str = Depends(verify_auth)):
         return {"balance": "0", "available": "0", "raw": data}
     except Exception as e:
         return {"balance": "--", "available": "--", "error": str(e)}
+
+
+@app.post("/api/accounts/{account_id}/ws-token")
+async def account_ws_token(account_id: str, user: str = Depends(verify_auth)):
+    """Issue a one-use credential for the browser order-book WebSocket."""
+    if not manager.get_instance(account_id):
+        raise HTTPException(404, "Account not found")
+    token, expires_in = _issue_ws_token(account_id)
+    audit_event(
+        "dashboard.websocket_token_issued",
+        account_id=account_id,
+        expires_in_seconds=expires_in,
+    )
+    return {"token": token, "expires_in": expires_in}
 
 
 @app.get("/api/accounts/{account_id}/orders")
@@ -827,12 +1155,15 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         strategy = "bid-sell" if mode == "bid-sell" else "manual-s"
     elif _sniper_busy(inst):
         strategy = "sniper"
-    elif inst.sniper_old.running:
+    elif _sniper_old_busy(inst):
         strategy = "sniper-old"
     elif getattr(inst.auto_rebalance, "_rebalancing", False):
         strategy = "auto-rebalance"
     elif inst.poly_monitor.running or getattr(inst.poly_monitor.state, "enabled", False):
         strategy = "poly-monitor"
+    elif getattr(inst, "recovery_locked", False):
+        strategy = "recovery-lock"
+    recovery = _recovery_status(inst)
     return {
         "manual_running": inst.strategy_d.running,
         "manual_d_scan_interval": getattr(inst.strategy_d.state, "scan_interval", 0.3) if inst.strategy_d.running else 0.3,
@@ -840,7 +1171,10 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         "manual_s_running": inst.strategy_s.running,
         "sniper_running": _sniper_busy(inst),
         "sniper_locked": getattr(inst.sniper.state, "locked", False),
-        "sniper_old_running": inst.sniper_old.running,
+        "sniper_old_running": _sniper_old_busy(inst),
+        "sniper_old_locked": bool(
+            getattr(getattr(inst.sniper_old, "state", None), "locked", False)
+        ),
         "sniper_status": inst.sniper.state.status,
         "sniper_yes_token": getattr(inst.sniper.state, "yes_token_id", ""),
         "sniper_no_token": getattr(inst.sniper.state, "no_token_id", ""),
@@ -848,13 +1182,13 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         "sniper_no_asset": getattr(inst.sniper.state, "no_asset_id", ""),
         "sniper_poly_url": getattr(inst.sniper.state, "poly_url", ""),
         "sniper_selected_outcome": getattr(inst.sniper.state, "selected_outcome", ""),
-        "sniper_old_status": inst.sniper_old.state.status if inst.sniper_old.running else "stopped",
-        "sniper_old_yes_token": getattr(inst.sniper_old.state, "yes_token_id", "") if inst.sniper_old.running else "",
-        "sniper_old_no_token": getattr(inst.sniper_old.state, "no_token_id", "") if inst.sniper_old.running else "",
-        "sniper_old_yes_asset": getattr(inst.sniper_old.state, "yes_asset_id", "") if inst.sniper_old.running else "",
-        "sniper_old_no_asset": getattr(inst.sniper_old.state, "no_asset_id", "") if inst.sniper_old.running else "",
-        "sniper_old_poly_url": getattr(inst.sniper_old.state, "poly_url", "") if inst.sniper_old.running else "",
-        "sniper_old_selected_outcome": getattr(inst.sniper_old.state, "selected_outcome", "") if inst.sniper_old.running else "",
+        "sniper_old_status": getattr(inst.sniper_old.state, "status", "stopped") if _sniper_old_busy(inst) else "stopped",
+        "sniper_old_yes_token": getattr(inst.sniper_old.state, "yes_token_id", "") if _sniper_old_busy(inst) else "",
+        "sniper_old_no_token": getattr(inst.sniper_old.state, "no_token_id", "") if _sniper_old_busy(inst) else "",
+        "sniper_old_yes_asset": getattr(inst.sniper_old.state, "yes_asset_id", "") if _sniper_old_busy(inst) else "",
+        "sniper_old_no_asset": getattr(inst.sniper_old.state, "no_asset_id", "") if _sniper_old_busy(inst) else "",
+        "sniper_old_poly_url": getattr(inst.sniper_old.state, "poly_url", "") if _sniper_old_busy(inst) else "",
+        "sniper_old_selected_outcome": getattr(inst.sniper_old.state, "selected_outcome", "") if _sniper_old_busy(inst) else "",
         "manual_s_price": getattr(inst.strategy_s.state, "price_a", None) if inst.strategy_s.running else None,
         "manual_s_sell_price": getattr(inst.strategy_s.state, "sell_price", None) if inst.strategy_s.running else None,
         "manual_s_mode": getattr(inst.strategy_s.state, "mode", "classic") if inst.strategy_s.running else None,
@@ -872,6 +1206,68 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         "manual_asset_id": inst.strategy_d.state.yes_asset_id if inst.strategy_d.state.running else (inst.strategy_s.state.yes_asset_id if inst.strategy_s.state.running else ''),
         "manual_price": inst.strategy_d.state.price_a if inst.strategy_d.state.running else (inst.strategy_s.state.price_a if inst.strategy_s.state.running else 0),
         "monitor": inst.poly_monitor.status(),
+        "recovery": recovery,
+        "recovery_locked": bool(recovery.get("locked")),
+        "recovery_reason": str(recovery.get("reason") or ""),
+    }
+
+
+@app.get("/api/accounts/{account_id}/recovery/status")
+async def account_recovery_status(account_id: str, user: str = Depends(verify_auth)):
+    inst = manager.get_instance(account_id)
+    if not inst:
+        raise HTTPException(404, "Account not found")
+    return _recovery_status(inst)
+
+
+@app.post("/api/accounts/{account_id}/recovery/reconcile")
+@_serialize_strategy_lifecycle
+async def account_recovery_reconcile(account_id: str, user: str = Depends(verify_auth)):
+    inst = manager.get_instance(account_id)
+    if not inst:
+        raise HTTPException(404, "Account not found")
+    if _automated_trading_active(inst):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "Stop all automated strategies before recovery reconciliation",
+                "recovery": _recovery_status(inst),
+            },
+        )
+    rebalance_result = None
+    rebalance = getattr(inst, "auto_rebalance", None)
+    if bool(getattr(rebalance, "recovery_required", False)):
+        recover = getattr(rebalance, "recover", None)
+        if not callable(recover):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "error": "Auto-Rebalance recovery is required but unavailable",
+                    "recovery": _recovery_status(inst),
+                },
+            )
+        rebalance_result = await recover()
+        if not isinstance(rebalance_result, dict) or not rebalance_result.get("ok"):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "error": (
+                        rebalance_result.get("error", "Auto-Rebalance recovery failed")
+                        if isinstance(rebalance_result, dict)
+                        else "Auto-Rebalance recovery returned an invalid result"
+                    ),
+                    "rebalance_recovery": rebalance_result,
+                    "recovery": _recovery_status(inst),
+                },
+            )
+    status = await _refresh_entry_safety(inst)
+    return {
+        "ok": not bool(status.get("locked")),
+        "recovery": status,
+        "rebalance_recovery": rebalance_result,
     }
 
 
@@ -898,6 +1294,9 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
         return JSONResponse(status_code=400, content={"ok": False, "error": "no_asset_id is required"})
     if strategy_type not in {"manual-d", "manual-s"}:
         return JSONResponse(status_code=400, content={"ok": False, "error": f"Unknown strategy: {strategy_type}"})
+    safety_response = await _entry_safety_response(inst)
+    if safety_response is not None:
+        return safety_response
     if _account_trading_busy(inst):
         return JSONResponse(status_code=400, content={"ok": False, "error": "Another strategy is already running"})
     side = str(side).lower()
@@ -962,7 +1361,7 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
             if not poly_bids:
                 return JSONResponse(status_code=400, content={"ok": False, "error": "Cannot get Poly orderbook or no bids"})
             poly_best_bid = as_decimal(poly_bids[0].get("price", 0))
-            if align_okx_price(poly_best_bid, "buy") != price_decimal:
+            if inst.poly_monitor._risk_bid_price(poly_best_bid) != price_decimal:
                 return JSONResponse(status_code=400, content={
                     "ok": False,
                     "error": f"Poly best bid ({poly_best_bid}) != strategy price ({price_decimal}). Cannot start with monitor."
@@ -977,41 +1376,64 @@ async def start_strategy(account_id: str, request: Request, user: str = Depends(
                 market_id=market_id,
                 yes_asset_id=yes_asset_id,
                 no_asset_id=no_asset_id,
-                price_a=str(price_cents), position_pct=int(body.get("position_pct", 100)))
+                price_a=str(price_cents), position_pct=int(body.get("position_pct", 100)),
+                defer_entry=bool(monitor and monitor.get("poly_token_id")))
         elif strategy_type == "manual-s":
             await inst.strategy_s.start(
                 market_id=market_id,
                 yes_asset_id=yes_asset_id,
                 no_asset_id=no_asset_id,
                 side=side,
-                price_a=str(price_cents), position_pct=int(body.get("position_pct", 100)))
+                price_a=str(price_cents), position_pct=int(body.get("position_pct", 100)),
+                defer_entry=bool(monitor and monitor.get("poly_token_id")))
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
     # If monitor requested, start it now (strategy is already running)
     if monitor and monitor.get("poly_token_id"):
         try:
+            strategy_asset = no_asset_id if expected_poly_side == "no" else yes_asset_id
+            inst.poly_monitor.set_strategy_context(
+                strategy_type,
+                float(price_to_cents(price_decimal)),
+                strategy_asset,
+            )
             result = await inst.poly_monitor.start(
                 poly_token_id=monitor["poly_token_id"],
                 reference_price=float(price_decimal),
                 depth_threshold=float(monitor.get("depth_threshold", 3000)),
             )
             if result.get("ok"):
-                strategy_asset = no_asset_id if expected_poly_side == "no" else yes_asset_id
-                inst.poly_monitor.set_strategy_context(strategy_type, float(price_cents), strategy_asset)
                 _record_monitor_mapping(account_id, market_id, yes_asset_id, no_asset_id, monitor, poly_token_id, side)
+                strategy = (
+                    inst.strategy_d if strategy_type == "manual-d" else inst.strategy_s
+                )
+                if strategy.release_entry_barrier() is not True:
+                    raise RuntimeError("Manual entry barrier could not be released")
             else:
-                if strategy_type == "manual-d":
-                    await inst.strategy_d.stop()
-                else:
-                    await inst.strategy_s.stop()
-                return JSONResponse(status_code=400, content={"ok": False, "error": result.get("error", "Monitor failed to start")})
+                rollback_safe = await _rollback_manual_start_after_monitor_failure(
+                    inst, strategy_type
+                )
+                return JSONResponse(
+                    status_code=400 if rollback_safe else 409,
+                    content={
+                        "ok": False,
+                        "error": result.get("error", "Monitor failed to start"),
+                        **({"recovery": _recovery_status(inst)} if not rollback_safe else {}),
+                    },
+                )
         except Exception as e:
-            if strategy_type == "manual-d":
-                await inst.strategy_d.stop()
-            else:
-                await inst.strategy_s.stop()
-            return JSONResponse(status_code=400, content={"ok": False, "error": f"Monitor start error: {e}"})
+            rollback_safe = await _rollback_manual_start_after_monitor_failure(
+                inst, strategy_type
+            )
+            return JSONResponse(
+                status_code=400 if rollback_safe else 409,
+                content={
+                    "ok": False,
+                    "error": f"Monitor start error: {e}",
+                    **({"recovery": _recovery_status(inst)} if not rollback_safe else {}),
+                },
+            )
 
     return {"ok": True}
 
@@ -1023,38 +1445,137 @@ async def stop_strategy(account_id: str, user: str = Depends(verify_auth)):
     if not inst:
         raise HTTPException(404, "Account not found")
     await inst.auto_rebalance.cancel()
-    if inst.strategy_d.running:
-        await inst.strategy_d.stop()
-    if inst.strategy_s.running:
-        await inst.strategy_s.stop()
-    if inst.sniper.running:
-        await inst.sniper.stop()
-    if inst.sniper_old.running:
-        await inst.sniper_old.stop()
+    manual_d_safe = await inst.strategy_d.stop()
+    manual_s_safe = await inst.strategy_s.stop()
+    sniper_result = None
+    sniper_state = getattr(inst.sniper, "state", None)
+    if inst.sniper.running or bool(getattr(sniper_state, "locked", False)):
+        sniper_result = await inst.sniper.stop()
+    sniper_safe = not (
+        isinstance(sniper_result, dict)
+        and (
+            sniper_result.get("ok") is False
+            or bool(sniper_result.get("needs_reconciliation"))
+            or bool(sniper_result.get("locked"))
+        )
+    )
+    sniper_old_result = None
+    sniper_old_state = getattr(inst.sniper_old, "state", None)
+    if inst.sniper_old.running or bool(getattr(sniper_old_state, "locked", False)):
+        sniper_old_result = await inst.sniper_old.stop()
+    sniper_old_safe = not (
+        sniper_old_result is False
+        or (
+            isinstance(sniper_old_result, dict)
+            and (
+                sniper_old_result.get("ok") is False
+                or bool(sniper_old_result.get("needs_reconciliation"))
+                or bool(sniper_old_result.get("locked"))
+            )
+        )
+    )
     # Always stop monitor when strategy stops (monitor is bound to strategy)
     if inst.poly_monitor.running or inst.poly_monitor.state.enabled:
         await inst.poly_monitor.stop()
-    return {"ok": True}
+    if (
+        manual_d_safe is False
+        or manual_s_safe is False
+        or not sniper_safe
+        or not sniper_old_safe
+    ):
+        _activate_account_recovery(
+            inst,
+            "strategy_stop_reconciliation_incomplete",
+            {
+                "manual_d_safe": manual_d_safe,
+                "manual_s_safe": manual_s_safe,
+                "sniper": sniper_result,
+                "sniper_old": sniper_old_result,
+            },
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "One or more strategies could not complete safe stop reconciliation",
+                "recovery": _recovery_status(inst),
+                "results": {
+                    "manual_d_safe": manual_d_safe,
+                    "manual_s_safe": manual_s_safe,
+                    "sniper": sniper_result,
+                    "sniper_old": sniper_old_result,
+                },
+            },
+        )
+    return {
+        "ok": True,
+        "manual_d_safe": manual_d_safe,
+        "manual_s_safe": manual_s_safe,
+        "sniper": sniper_result,
+        "sniper_old": sniper_old_result,
+    }
 
 
-async def _stop_account_trading(inst) -> None:
+def _stop_result_is_safe(component, result) -> bool:
+    if result is False:
+        return False
+    if isinstance(result, dict) and (
+        result.get("ok") is False
+        or bool(result.get("needs_reconciliation"))
+        or bool(result.get("locked"))
+    ):
+        return False
+    return not bool(getattr(getattr(component, "state", None), "locked", False))
+
+
+async def _stop_account_trading(inst) -> dict:
     """Stop every local task that could submit another account order."""
     auto_rebalance = getattr(inst, "auto_rebalance", None)
     if auto_rebalance is not None:
         await auto_rebalance.cancel()
-    if inst.strategy_s.running:
-        await inst.strategy_s.stop()
-    if inst.strategy_d.running:
-        await inst.strategy_d.stop()
-    if inst.sniper.running:
-        await inst.sniper.stop()
-    if inst.sniper_old.running:
-        await inst.sniper_old.stop()
+    manual_s_stop = getattr(inst.strategy_s, "stop", None)
+    manual_d_stop = getattr(inst.strategy_d, "stop", None)
+    manual_s_safe = await manual_s_stop() if callable(manual_s_stop) else True
+    manual_d_safe = await manual_d_stop() if callable(manual_d_stop) else True
+    sniper_result = None
+    sniper_state = getattr(inst.sniper, "state", None)
+    if inst.sniper.running or bool(getattr(sniper_state, "locked", False)):
+        sniper_result = await inst.sniper.stop()
+    sniper_old_result = None
+    sniper_old_state = getattr(inst.sniper_old, "state", None)
+    if inst.sniper_old.running or bool(getattr(sniper_old_state, "locked", False)):
+        sniper_old_result = await inst.sniper_old.stop()
+    sniper_safe = _stop_result_is_safe(inst.sniper, sniper_result)
+    sniper_old_safe = _stop_result_is_safe(inst.sniper_old, sniper_old_result)
+    if (
+        manual_s_safe is False
+        or manual_d_safe is False
+        or not sniper_safe
+        or not sniper_old_safe
+    ):
+        _activate_account_recovery(
+            inst,
+            "account_stop_reconciliation_incomplete",
+            {
+                "manual_d_safe": manual_d_safe,
+                "manual_s_safe": manual_s_safe,
+                "sniper": sniper_result,
+                "sniper_old": sniper_old_result,
+            },
+        )
     monitor_enabled = bool(
         getattr(getattr(inst.poly_monitor, "state", None), "enabled", False)
     )
     if inst.poly_monitor.running or monitor_enabled:
         await inst.poly_monitor.stop()
+    return {
+        "manual_d_safe": manual_d_safe,
+        "manual_s_safe": manual_s_safe,
+        "sniper": sniper_result,
+        "sniper_safe": sniper_safe,
+        "sniper_old": sniper_old_result,
+        "sniper_old_safe": sniper_old_safe,
+    }
 
 
 async def _query_open_orders_verified(client) -> list[dict]:
@@ -1077,64 +1598,59 @@ async def _query_open_orders_verified(client) -> list[dict]:
 
 
 async def _cancel_open_orders_verified(client) -> dict:
-    """Cancel the current account snapshot and prove that no order remains."""
+    """Cancel exact open orders and prove that no order remains.
+
+    Cancellation is asynchronous.  Each order is followed by orderId/cloid
+    until it reaches a documented terminal state; PENDING_PLACE orders are
+    allowed to become ACTIVE before their cancel request is sent.
+    """
     orders = await _query_open_orders_verified(client)
     if not orders:
         return {"ok": True, "cancelled": 0, "failed": 0, "total": 0, "method": "none"}
 
-    cancels = [
-        {"assetId": order.get("assetId", ""), "oid": order.get("oid", order.get("id", ""))}
-        for order in orders
-        if order.get("assetId") and (order.get("oid") or order.get("id"))
-    ]
+    def _order_key(order: dict) -> str:
+        return str(
+            order.get("oid")
+            or order.get("id")
+            or order.get("clientOrderId")
+            or ""
+        )
+
+    initial_keys = {_order_key(order) for order in orders if _order_key(order)}
     remaining = orders
-    if cancels:
-        try:
-            batch_response = await client.cancel_orders_batch(cancels)
-            if isinstance(batch_response, dict) and str(batch_response.get("code", "")) == "0":
-                await asyncio.sleep(0.5)
-                try:
-                    remaining = await _query_open_orders_verified(client)
-                except Exception:
-                    # Still make the safe, idempotent individual attempts. The
-                    # final query below remains the only success condition.
-                    remaining = orders
-                if not remaining:
-                    return {
-                        "ok": True,
-                        "cancelled": len(orders),
-                        "failed": 0,
-                        "total": len(orders),
-                        "method": "batch",
-                    }
-        except Exception:
-            remaining = orders
-
-    async def _cancel_one(order: dict) -> bool:
-        order_id = order.get("oid", order.get("id", ""))
-        asset_id = order.get("assetId", "")
-        if not order_id or not asset_id:
-            return False
-        try:
-            response = await client.cancel_order(asset_id=asset_id, order_id=order_id)
-            return isinstance(response, dict) and str(response.get("code", "")) == "0"
-        except Exception:
-            return False
-
     for _ in range(2):
-        if remaining:
-            await asyncio.gather(*[_cancel_one(order) for order in remaining])
-            await asyncio.sleep(0.5)
+        operations = []
+        for order in remaining:
+            asset_id = str(order.get("assetId") or "")
+            order_id = str(order.get("oid") or order.get("id") or "")
+            client_order_id = str(order.get("clientOrderId") or "")
+            if not asset_id or (not order_id and not client_order_id):
+                continue
+            market_id = str(order.get("marketId") or "")
+            if not market_id and asset_id.endswith(("000", "100")):
+                market_id = asset_id[:-3]
+            operations.append(cancel_and_confirm(
+                client,
+                client_order_id=client_order_id,
+                order_id=order_id,
+                market_id=market_id,
+                asset_id=asset_id,
+            ))
+        if operations:
+            await asyncio.gather(*operations)
         remaining = await _query_open_orders_verified(client)
         if not remaining:
             break
 
+    remaining_keys = {_order_key(order) for order in remaining if _order_key(order)}
+    cancelled = len(initial_keys - remaining_keys)
+
     return {
         "ok": not remaining,
-        "cancelled": max(0, len(orders) - len(remaining)),
+        "cancelled": cancelled,
         "failed": len(remaining),
         "total": len(orders),
-        "method": "parallel",
+        "method": "lifecycle",
     }
 
 
@@ -1166,6 +1682,286 @@ async def _query_open_positions_verified(client) -> list[dict]:
     return positions
 
 
+def _exchange_order_key(order: dict) -> str:
+    return str(
+        order.get("oid")
+        or order.get("id")
+        or order.get("clientOrderId")
+        or ""
+    )
+
+
+async def _cancel_selected_orders_verified(client, orders: list[dict]) -> dict:
+    """Cancel an exact subset without disturbing protection on other assets."""
+    selected = [order for order in orders if isinstance(order, dict)]
+    if not selected:
+        return {
+            "ok": True,
+            "cancelled": 0,
+            "failed": 0,
+            "total": 0,
+            "remaining_orders": await _query_open_orders_verified(client),
+        }
+
+    selected_keys = {_exchange_order_key(order) for order in selected}
+    selected_keys.discard("")
+    if len(selected_keys) != len(selected):
+        return {
+            "ok": False,
+            "cancelled": 0,
+            "failed": len(selected),
+            "total": len(selected),
+            "remaining_orders": await _query_open_orders_verified(client),
+            "error": "One or more selected orders have no exact exchange identifier",
+        }
+
+    remaining_selected = selected
+    all_open = await _query_open_orders_verified(client)
+    for _ in range(2):
+        operations = []
+        for order in remaining_selected:
+            asset_id = str(order.get("assetId") or "")
+            order_id = str(order.get("oid") or order.get("id") or "")
+            client_order_id = str(order.get("clientOrderId") or "")
+            if not asset_id or (not order_id and not client_order_id):
+                continue
+            market_id = str(order.get("marketId") or "")
+            if not market_id and asset_id.endswith(("000", "100")):
+                market_id = asset_id[:-3]
+            operations.append(
+                cancel_and_confirm(
+                    client,
+                    client_order_id=client_order_id,
+                    order_id=order_id,
+                    market_id=market_id,
+                    asset_id=asset_id,
+                )
+            )
+        if operations:
+            await asyncio.gather(*operations)
+        all_open = await _query_open_orders_verified(client)
+        remaining_selected = [
+            order
+            for order in all_open
+            if _exchange_order_key(order) in selected_keys
+        ]
+        if not remaining_selected:
+            break
+
+    remaining_keys = {
+        _exchange_order_key(order) for order in remaining_selected
+    }
+    return {
+        "ok": not remaining_selected,
+        "cancelled": len(selected_keys - remaining_keys),
+        "failed": len(remaining_selected),
+        "total": len(selected),
+        "remaining_orders": all_open,
+    }
+
+
+async def _flash_exit_plan(
+    client,
+    position: dict,
+    *,
+    account_id: str,
+    trace_id: str,
+    phase: str,
+) -> dict:
+    """Validate one real outcome position and obtain an executable exit bid."""
+    market_id = str(position.get("marketId", "") or "")
+    token_index = str(position.get("tokenIndex", "") or "")
+    token_name = str(position.get("tokenName", "") or "").upper()
+    if not market_id:
+        raise RuntimeError("position is missing marketId")
+    if token_index == "2" or token_name == "NO":
+        is_no = True
+    elif token_index == "1" or token_name == "YES":
+        is_no = False
+    else:
+        raise RuntimeError(f"{market_id}: unknown outcome")
+
+    position_size = as_decimal(
+        position.get("size", position.get("availableSize", "0"))
+    )
+    if position_size <= 0:
+        raise RuntimeError(f"{market_id}: position size is not positive")
+
+    yes_asset_id = f"{market_id}000"
+    trade_asset_id = f"{market_id}100" if is_no else yes_asset_id
+    book = await client.get_orderbook(yes_asset_id, depth=50)
+    market_event(
+        "okx",
+        "book_observed",
+        consumer="flash_close",
+        account_id=account_id,
+        trace_id=trace_id,
+        phase=phase,
+        market_id=market_id,
+        query_asset_id=yes_asset_id,
+        trade_asset_id=trade_asset_id,
+        outcome="NO" if is_no else "YES",
+        raw_book=book,
+    )
+    if not isinstance(book, dict) or str(book.get("code", "0")) != "0":
+        raise RuntimeError(f"{trade_asset_id}: orderbook query failed")
+    book_data = book.get("data", [])
+    if (
+        not isinstance(book_data, list)
+        or not book_data
+        or not isinstance(book_data[0], dict)
+    ):
+        raise RuntimeError(f"{trade_asset_id}: invalid orderbook response")
+    levels = book_data[0].get("asks" if is_no else "bids", [])
+    if not isinstance(levels, list) or not levels:
+        label = "NO" if is_no else "YES"
+        raise RuntimeError(f"{trade_asset_id}: {label} best bid is unavailable")
+
+    cumulative = as_decimal("0")
+    exit_limit = None
+    levels_used = 0
+    for level in levels:
+        if not isinstance(level, (list, tuple)) or len(level) < 2:
+            raise RuntimeError(f"{trade_asset_id}: invalid orderbook level")
+        level_size = as_decimal(level[1])
+        if level_size <= 0:
+            continue
+        cumulative += level_size
+        levels_used += 1
+        raw_price = invert_binary_price(level[0]) if is_no else as_decimal(level[0])
+        exit_limit = format_okx_price(raw_price)
+        if cumulative >= position_size:
+            break
+    if exit_limit is None or cumulative < position_size:
+        raise RuntimeError(
+            f"{trade_asset_id}: verified bid depth {format(cumulative, 'f')} "
+            f"is smaller than position {format(position_size, 'f')}"
+        )
+
+    return {
+        "position": position,
+        "market_id": market_id,
+        "yes_asset_id": yes_asset_id,
+        "trade_asset_id": trade_asset_id,
+        "is_no": is_no,
+        "position_size": position_size,
+        "best_bid": exit_limit,
+        "quote_capacity": cumulative,
+        "levels_used": levels_used,
+    }
+
+
+def _matching_flash_positions(positions: list[dict], plan: dict) -> list[dict]:
+    matches = []
+    for candidate in positions:
+        candidate_market = str(candidate.get("marketId", "") or "")
+        candidate_index = str(candidate.get("tokenIndex", "") or "")
+        candidate_name = str(candidate.get("tokenName", "") or "").upper()
+        if candidate_index == "2" or candidate_name == "NO":
+            candidate_is_no = True
+        elif candidate_index == "1" or candidate_name == "YES":
+            candidate_is_no = False
+        else:
+            continue
+        if (
+            candidate_market == plan["market_id"]
+            and candidate_is_no == plan["is_no"]
+        ):
+            matches.append(candidate)
+    return matches
+
+
+async def _restore_flash_protection(
+    client,
+    *,
+    position: dict,
+    plan: dict,
+    cancelled_orders: list[dict],
+    account_id: str,
+    trace_id: str,
+) -> dict:
+    """Best-effort restore of the least expensive cancelled protective SELL."""
+    sell_prices = []
+    for order in cancelled_orders:
+        if str(order.get("side", "") or "").upper() != "SELL":
+            continue
+        try:
+            sell_prices.append(as_decimal(order.get("price")))
+        except (TypeError, ValueError):
+            continue
+    if not sell_prices:
+        return {
+            "ok": False,
+            "active": False,
+            "reason": "no cancelled protective SELL price is available",
+        }
+
+    available_size = as_decimal(
+        position.get("availableSize", position.get("size", "0"))
+    )
+    if available_size <= 0:
+        return {
+            "ok": False,
+            "active": False,
+            "reason": "remaining position has no available size for restored protection",
+        }
+
+    price = format_okx_price(min(sell_prices), "sell")
+    size = normalize_size_str(available_size)
+    client_order_id = generate_client_order_id(client)
+    audit_event(
+        "account.flash_close_protection_restore_requested",
+        level=logging.WARNING,
+        account_id=account_id,
+        trace_id=trace_id,
+        market_id=plan["market_id"],
+        asset_id=plan["trade_asset_id"],
+        client_order_id=client_order_id,
+        price=price,
+        size=size,
+    )
+    confirmation = await place_and_confirm(
+        client,
+        client_order_id=client_order_id,
+        market_id=plan["market_id"],
+        asset_id=plan["trade_asset_id"],
+        side="sell",
+        price=price,
+        size=size,
+        tif="gtc",
+        reduce_only=True,
+        attempts=20,
+        delay=0.25,
+    )
+    observation = confirmation.observation
+    status = normalise_order_status(observation.status if observation else "")
+    ok = observation is not None and status in {"ACTIVE", "FILLED"}
+    audit_event(
+        "account.flash_close_protection_restore_confirmed",
+        level=logging.WARNING if ok else logging.ERROR,
+        account_id=account_id,
+        trace_id=trace_id,
+        market_id=plan["market_id"],
+        asset_id=plan["trade_asset_id"],
+        client_order_id=client_order_id,
+        order_id=observation.order_id if observation else "",
+        order_status=status,
+        response_code=confirmation.response_code,
+        ok=ok,
+    )
+    return {
+        "ok": ok,
+        "active": status == "ACTIVE",
+        "filled": status == "FILLED",
+        "client_order_id": client_order_id,
+        "order_id": observation.order_id if observation else "",
+        "status": status,
+        "price": price,
+        "size": size,
+        "reason": "" if ok else "restored protective SELL was not confirmed ACTIVE or FILLED",
+    }
+
+
 @app.post("/api/accounts/{account_id}/cancel_all")
 @_serialize_strategy_lifecycle
 async def account_cancel_all(account_id: str, user: str = Depends(verify_auth)):
@@ -1173,17 +1969,53 @@ async def account_cancel_all(account_id: str, user: str = Depends(verify_auth)):
     if not inst:
         raise HTTPException(404, "Account not found")
     try:
-        await _stop_account_trading(inst)
+        stop_results = await _stop_account_trading(inst)
+        stop_safe = bool(
+            stop_results.get("manual_d_safe") is not False
+            and stop_results.get("manual_s_safe") is not False
+            and stop_results.get("sniper_safe", True)
+            and stop_results.get("sniper_old_safe", True)
+        )
         result = await _cancel_open_orders_verified(inst.client)
+        recovery = await _refresh_entry_safety(inst)
+        if not stop_safe:
+            _activate_account_recovery(
+                inst,
+                "cancel_all_strategy_stop_incomplete",
+                {"stop_results": stop_results, "cancel_result": result},
+            )
+            recovery = _recovery_status(inst)
+            return {
+                "ok": False,
+                "error": (
+                    "Orders were processed, but one or more strategy ledgers "
+                    "could not complete stop reconciliation"
+                ),
+                "result": result,
+                "stop": stop_results,
+                "recovery": recovery,
+            }
         if result["total"] == 0:
-            return {"ok": True, "result": {"message": "No orders to cancel", "cancelled": 0}}
+            return {
+                "ok": True,
+                "result": {"message": "No orders to cancel", "cancelled": 0},
+                "stop": stop_results,
+                "recovery": recovery,
+            }
         if not result["ok"]:
             return {
                 "ok": False,
                 "error": f"Cancellation incomplete: {result['failed']} orders remain open",
                 "result": result,
+                "stop": stop_results,
+                "recovery": recovery,
             }
-        return {"ok": True, "result": result}
+        return {
+            "ok": True,
+            "result": result,
+            "stop": stop_results,
+            "recovery": recovery,
+        }
     except Exception as e:
         logger.error("Cancel All failed for account %s: %s", account_id, e)
         return {"ok": False, "error": str(e)}
@@ -1196,16 +2028,15 @@ async def account_ask_sell(account_id: str, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
-    if _account_trading_busy(inst):
+    if _automated_trading_active(inst):
         return JSONResponse(
             status_code=409,
             content={
                 "ok": False,
-                "error": "Ask Sell is disabled while an account strategy is running or locked",
+                "error": "Ask Sell is disabled while an account strategy is running",
             },
         )
     import aiohttp
-    import asyncio as _asyncio
     try:
         poly_map = _load_poly_asset_map()
         open_orders = await _query_open_orders_verified(inst.client)
@@ -1214,17 +2045,12 @@ async def account_ask_sell(account_id: str, user: str = Depends(verify_auth)):
         except Exception as exc:
             return {
                 "ok": False,
-                "error": f"Flash could not verify positions after cancellation: {exc}",
-                "result": {
-                    "cancelled": cancellation["cancelled"],
-                    "submitted": 0,
-                    "closed": 0,
-                    "remaining": None,
-                    "failures": [str(exc)],
-                },
+                "error": f"Ask Sell could not verify positions: {exc}",
+                "results": [],
             }
         results = []
         placed = skipped = cancelled = 0
+        processed_assets = set()
         async with aiohttp.ClientSession() as sess:
             for p in positions:
                 mid = p.get("marketId", "")
@@ -1239,12 +2065,20 @@ async def account_ask_sell(account_id: str, user: str = Depends(verify_auth)):
                 yes_aid = f"{mid}000"
                 no_aid = f"{mid}100"
                 aid = no_aid if token_idx == "2" or str(token_name).upper() == "NO" else yes_aid
+                if aid in processed_assets:
+                    continue
+                processed_assets.add(aid)
                 mapping = poly_map.get(aid)
                 if not mapping or not mapping.get("poly_token_id"):
                     skipped += 1
                     results.append({"asset_id": aid, "size": size, "status": "skipped", "reason": "no_poly_mapping"})
                     continue
                 token_id = mapping["poly_token_id"]
+                protection_attempted = False
+                existing_sells = []
+                fresh_position = None
+                replacement_client_order_id = ""
+                replacement_state_safe = True
                 try:
                     async with sess.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=aiohttp.ClientTimeout(total=8)) as resp:
                         if resp.status != 200:
@@ -1263,26 +2097,58 @@ async def account_ask_sell(account_id: str, user: str = Depends(verify_auth)):
                         results.append({"asset_id": aid, "size": size, "status": "skipped", "reason": "bad_poly_ask"})
                         continue
                     price_str = _okx_price_str(ask1, "sell")
-                    local_cancelled = 0
-                    for o in open_orders:
-                        oid = o.get("oid", o.get("id", ""))
-                        if o.get("assetId") == aid and o.get("side", "").upper() == "SELL" and oid:
-                            try:
-                                cr = await inst.client.cancel_order(asset_id=aid, order_id=oid)
-                                if str(cr.get("code", "")) == "0":
-                                    cancelled += 1
-                                    local_cancelled += 1
-                            except Exception:
-                                pass
-                    if local_cancelled:
-                        await _asyncio.sleep(0.2)
+                    protection_attempted = True
+                    existing_sells = [
+                        order
+                        for order in open_orders
+                        if order.get("assetId") == aid
+                        and str(order.get("side", "")).upper() == "SELL"
+                    ]
+                    unresolved_cancels = []
+                    for order in existing_sells:
+                        oid = str(order.get("oid", order.get("id", "")) or "")
+                        client_order_id = str(order.get("clientOrderId", "") or "")
+                        confirmation = await cancel_and_confirm(
+                            inst.client,
+                            client_order_id=client_order_id,
+                            order_id=oid,
+                            market_id=str(mid),
+                            asset_id=aid,
+                            attempts=10,
+                            delay=0.2,
+                        )
+                        if confirmation.confirmed_terminal:
+                            cancelled += 1
+                        else:
+                            unresolved_cancels.append(
+                                {
+                                    "order_id": oid,
+                                    "client_order_id": client_order_id,
+                                    "response_code": str(
+                                        confirmation.response.get("code", "INVALID")
+                                    ),
+                                }
+                            )
                     matching_open_sells = [
                         order
                         for order in await _query_open_orders_verified(inst.client)
                         if order.get("assetId") == aid
                         and str(order.get("side", "")).upper() == "SELL"
                     ]
-                    if matching_open_sells:
+                    if unresolved_cancels or matching_open_sells:
+                        details = {
+                            "operation": "ask_sell_replace",
+                            "asset_id": aid,
+                            "market_id": str(mid),
+                            "unresolved_cancels": unresolved_cancels,
+                            "remaining_order_ids": [
+                                str(order.get("oid", order.get("id", "")) or "")
+                                for order in matching_open_sells
+                            ],
+                        }
+                        _activate_account_recovery(
+                            inst, "ask_sell_cancel_state_unresolved", details
+                        )
                         skipped += 1
                         results.append({
                             "asset_id": aid,
@@ -1294,135 +2160,786 @@ async def account_ask_sell(account_id: str, user: str = Depends(verify_auth)):
                             ),
                         })
                         continue
-                    sell_resp = await inst.client.place_order(asset_id=aid, side="sell", price=price_str,
-                                                              size=normalize_size_str(size), tif="gtc", reduce_only=True)
-                    if str(sell_resp.get("code", "")) == "0":
+                    fresh_positions = await _query_open_positions_verified(inst.client)
+                    fresh_position = None
+                    for candidate in fresh_positions:
+                        candidate_mid = str(candidate.get("marketId", "") or "")
+                        candidate_idx = str(candidate.get("tokenIndex", "") or "")
+                        candidate_name = str(candidate.get("tokenName", "") or "").upper()
+                        candidate_aid = (
+                            f"{candidate_mid}100"
+                            if candidate_idx == "2" or candidate_name == "NO"
+                            else f"{candidate_mid}000"
+                        )
+                        if candidate_aid == aid:
+                            fresh_position = candidate
+                            break
+                    if fresh_position is None:
+                        results.append({
+                            "asset_id": aid,
+                            "size": "0",
+                            "poly_ask1": price_str,
+                            "status": "position_closed",
+                            "reason": "position closed while replacing the sell order",
+                        })
+                        continue
+                    fresh_size = as_decimal(
+                        fresh_position.get(
+                            "availableSize", fresh_position.get("size", "0")
+                        )
+                    )
+                    total_size = as_decimal(fresh_position.get("size", fresh_size))
+                    if fresh_size <= 0:
+                        details = {
+                            "operation": "ask_sell_replace",
+                            "asset_id": aid,
+                            "market_id": str(mid),
+                            "available_size": format(fresh_size, "f"),
+                            "position_size": format(total_size, "f"),
+                        }
+                        _activate_account_recovery(
+                            inst, "ask_sell_position_unavailable", details
+                        )
+                        skipped += 1
+                        results.append({
+                            "asset_id": aid,
+                            "size": format(total_size, "f"),
+                            "poly_ask1": price_str,
+                            "status": "failed",
+                            "reason": "position remains open but no sellable size is available",
+                        })
+                        continue
+                    size = normalize_size_str(fresh_size)
+                    client_order_id = generate_client_order_id(inst.client)
+                    replacement_client_order_id = client_order_id
+                    replacement_state_safe = False
+                    sell_confirmation = await place_and_confirm(
+                        inst.client,
+                        client_order_id=client_order_id,
+                        market_id=str(mid),
+                        asset_id=aid,
+                        side="sell",
+                        price=price_str,
+                        size=size,
+                        tif="gtc",
+                        reduce_only=True,
+                    )
+                    observation = sell_confirmation.observation
+                    order_status = normalise_order_status(
+                        observation.status if observation is not None else ""
+                    )
+                    if observation is not None and order_status in {"ACTIVE", "FILLED"}:
+                        replacement_state_safe = True
                         placed += 1
                         results.append({"asset_id": aid, "side": mapping.get("side", ""),
-                                        "size": normalize_size_str(size), "poly_ask1": price_str,
-                                        "poly_url": mapping.get("poly_url", ""), "status": "placed"})
+                                        "size": size, "poly_ask1": price_str,
+                                        "poly_url": mapping.get("poly_url", ""), "status": "placed",
+                                        "client_order_id": client_order_id,
+                                        "order_id": observation.order_id,
+                                        "order_status": order_status,
+                                        "filled_size": format(observation.filled_size, "f")})
                     else:
+                        replacement_cleanup = None
+                        replacement_state_safe = bool(
+                            sell_confirmation.rejected
+                            or (
+                                observation is not None
+                                and order_status in TERMINAL_ORDER_STATUSES
+                            )
+                        )
+                        if not replacement_state_safe:
+                            replacement_cleanup = await cancel_and_confirm(
+                                inst.client,
+                                client_order_id=client_order_id,
+                                order_id=observation.order_id if observation else "",
+                                market_id=str(mid),
+                                asset_id=aid,
+                                attempts=20,
+                                delay=0.25,
+                            )
+                            replacement_state_safe = bool(
+                                replacement_cleanup.confirmed_terminal
+                            )
+
+                        rollback_result = None
+                        if replacement_state_safe and existing_sells:
+                            latest_positions = await _query_open_positions_verified(
+                                inst.client
+                            )
+                            latest_position = None
+                            for candidate in latest_positions:
+                                candidate_mid = str(candidate.get("marketId", "") or "")
+                                candidate_idx = str(candidate.get("tokenIndex", "") or "")
+                                candidate_name = str(candidate.get("tokenName", "") or "").upper()
+                                candidate_aid = (
+                                    f"{candidate_mid}100"
+                                    if candidate_idx == "2" or candidate_name == "NO"
+                                    else f"{candidate_mid}000"
+                                )
+                                if candidate_aid == aid:
+                                    latest_position = candidate
+                                    break
+                            if latest_position is not None:
+                                rollback_result = await _restore_flash_protection(
+                                    inst.client,
+                                    position=latest_position,
+                                    plan={
+                                        "market_id": str(mid),
+                                        "trade_asset_id": aid,
+                                    },
+                                    cancelled_orders=existing_sells,
+                                    account_id=account_id,
+                                    trace_id=f"ask-sell-{secrets.token_hex(6)}",
+                                )
+                        _activate_account_recovery(
+                            inst,
+                            "ask_sell_protection_failed",
+                            {
+                                "operation": "ask_sell",
+                                "client_order_id": client_order_id,
+                                "asset_id": aid,
+                                "market_id": str(mid),
+                                "order_status": order_status,
+                                "response_code": sell_confirmation.response_code,
+                                "size": size,
+                                "price": price_str,
+                                "replacement_state_safe": replacement_state_safe,
+                                "rollback": rollback_result,
+                            },
+                        )
                         skipped += 1
                         results.append({"asset_id": aid, "size": size, "poly_ask1": price_str, "status": "failed",
-                                        "reason": sell_resp.get("message", sell_resp.get("msg", str(sell_resp)))})
+                                        "client_order_id": client_order_id,
+                                        "order_status": order_status,
+                                        "filled_size": format(observation.filled_size, "f") if observation else "0",
+                                        "replacement_state_safe": replacement_state_safe,
+                                        "rollback": rollback_result,
+                                        "reason": (
+                                            "order state could not be confirmed"
+                                            if sell_confirmation.unresolved
+                                            else sell_confirmation.response.get(
+                                                "message",
+                                                sell_confirmation.response.get(
+                                                    "msg",
+                                                    f"protective sell reached {order_status or 'unknown'}",
+                                                ),
+                                            )
+                                        )})
                 except Exception as e:
+                    rollback_result = None
+                    if existing_sells and replacement_state_safe:
+                        try:
+                            fallback_position = fresh_position or {
+                                "size": p.get("size", size),
+                                "availableSize": p.get("size", size),
+                            }
+                            rollback_result = await _restore_flash_protection(
+                                inst.client,
+                                position=fallback_position,
+                                plan={
+                                    "market_id": str(mid),
+                                    "trade_asset_id": aid,
+                                },
+                                cancelled_orders=existing_sells,
+                                account_id=account_id,
+                                trace_id=f"ask-sell-{secrets.token_hex(6)}",
+                            )
+                        except Exception as rollback_exc:
+                            rollback_result = {
+                                "ok": False,
+                                "reason": str(rollback_exc),
+                            }
+                    if protection_attempted:
+                        _activate_account_recovery(
+                            inst,
+                            "ask_sell_exception",
+                            {
+                                "operation": "ask_sell",
+                                "asset_id": aid,
+                                "market_id": str(mid),
+                                "error": str(e),
+                                "replacement_client_order_id": replacement_client_order_id,
+                                "replacement_state_safe": replacement_state_safe,
+                                "rollback": rollback_result,
+                            },
+                        )
                     skipped += 1
-                    results.append({"asset_id": aid, "size": size, "status": "failed", "reason": str(e)})
-        return {"ok": True, "placed": placed, "skipped": skipped, "cancelled": cancelled, "results": results}
+                    results.append({
+                        "asset_id": aid,
+                        "size": size,
+                        "status": "failed",
+                        "reason": str(e),
+                        "rollback": rollback_result,
+                    })
+        recovery = None
+        if getattr(inst, "recovery_locked", False):
+            recovery = await _refresh_entry_safety(inst)
+        payload = {
+            "ok": skipped == 0,
+            "placed": placed,
+            "skipped": skipped,
+            "cancelled": cancelled,
+            "results": results,
+            "recovery": recovery,
+        }
+        if skipped:
+            payload["error"] = f"Ask Sell incomplete: {skipped} position(s) were not protected"
+        return payload
     except Exception as e:
         logger.error("Ask Sell failed for account %s: %s", account_id, e)
         return {"ok": False, "error": str(e)}
 
 
-@app.post("/api/accounts/{account_id}/flash_close")
-@_serialize_strategy_lifecycle
-async def account_flash_close(account_id: str, user: str = Depends(verify_auth)):
+async def _flash_close_account(
+    account_id: str,
+    inst,
+    *,
+    require_local_reconciliation: bool = True,
+):
     """Stop account activity and prove the emergency close result."""
-    inst = manager.get_instance(account_id)
-    if not inst:
-        raise HTTPException(404, "Account not found")
+    trace_id = secrets.token_hex(8)
+    started_ns = time.perf_counter_ns()
+    audit_event(
+        "account.flash_close_started",
+        account_id=account_id,
+        trace_id=trace_id,
+        require_local_reconciliation=require_local_reconciliation,
+    )
     try:
-        await _stop_account_trading(inst)
-        cancellation = await _cancel_open_orders_verified(inst.client)
-        if not cancellation["ok"]:
+        stop_results = await _stop_account_trading(inst)
+        audit_event(
+            "account.flash_close_strategies_stopped",
+            account_id=account_id,
+            trace_id=trace_id,
+            result=stop_results,
+        )
+
+        # Freeze local writers first, then prove that every current position has
+        # an executable exit side before dismantling any protective order.
+        open_orders = await _query_open_orders_verified(inst.client)
+        positions = await _query_open_positions_verified(inst.client)
+        exit_plans = []
+        preflight_failures = []
+        for position in positions:
+            try:
+                plan = await _flash_exit_plan(
+                    inst.client,
+                    position,
+                    account_id=account_id,
+                    trace_id=trace_id,
+                    phase="preflight",
+                )
+                exit_plans.append(plan)
+                audit_event(
+                    "account.flash_close_preflight_position_ok",
+                    account_id=account_id,
+                    trace_id=trace_id,
+                    market_id=plan["market_id"],
+                    asset_id=plan["trade_asset_id"],
+                    outcome="NO" if plan["is_no"] else "YES",
+                    position_size=plan["position_size"],
+                    best_bid=plan["best_bid"],
+                )
+            except Exception as exc:
+                preflight_failures.append(str(exc))
+                audit_event(
+                    "account.flash_close_preflight_position_failed",
+                    level=logging.ERROR,
+                    account_id=account_id,
+                    trace_id=trace_id,
+                    market_id=str(position.get("marketId", "") or ""),
+                    error=exc,
+                )
+
+        if preflight_failures:
+            _activate_account_recovery(
+                inst,
+                "flash_close_preflight_failed",
+                {
+                    "trace_id": trace_id,
+                    "failures": preflight_failures,
+                    "open_order_count": len(open_orders),
+                    "position_count": len(positions),
+                },
+            )
+            result = {
+                "cancelled": 0,
+                "submitted": 0,
+                "closed": 0,
+                "remaining": len(positions),
+                "failures": preflight_failures,
+                "strategy_stop": stop_results,
+                "protection_preserved": True,
+            }
+            audit_event(
+                "account.flash_close_preflight_failed",
+                level=logging.ERROR,
+                account_id=account_id,
+                trace_id=trace_id,
+                failures=preflight_failures,
+                elapsed_ms=(time.perf_counter_ns() - started_ns) / 1_000_000,
+            )
             return {
                 "ok": False,
                 "error": (
-                    "Flash stopped before closing positions: "
-                    f"{cancellation['failed']} orders remain open"
+                    "Flash stopped before cancelling protection because one or "
+                    "more positions have no verified exit quote"
                 ),
-                "result": {
-                    "cancelled": cancellation["cancelled"],
-                    "submitted": 0,
-                    "closed": 0,
-                    "remaining": None,
-                },
+                "result": result,
+                "recovery": _recovery_status(inst),
             }
 
-        positions = await _query_open_positions_verified(inst.client)
+        cancelled = 0
         submitted = 0
         failures = []
-        initial_assets = set()
-        for position in positions:
-            market_id = str(position.get("marketId", "") or "")
-            token_index = str(position.get("tokenIndex", "") or "")
-            token_name = str(position.get("tokenName", "") or "").upper()
-            if not market_id:
-                failures.append("position is missing marketId")
-                continue
-            if token_index == "2" or token_name == "NO":
-                is_no = True
-            elif token_index == "1" or token_name == "YES":
-                is_no = False
-            else:
-                failures.append(f"{market_id}: unknown outcome")
-                continue
-
-            yes_asset_id = f"{market_id}000"
-            trade_asset_id = f"{market_id}100" if is_no else yes_asset_id
-            initial_assets.add(trade_asset_id)
+        initial_assets = {plan["trade_asset_id"] for plan in exit_plans}
+        current_open_orders = open_orders
+        cancelled_orders_by_asset: dict[str, list[dict]] = {}
+        plans_by_asset = {plan["trade_asset_id"]: plan for plan in exit_plans}
+        for plan in exit_plans:
+            market_id = plan["market_id"]
+            trade_asset_id = plan["trade_asset_id"]
+            active_plan = plan
             try:
-                available_size = as_decimal(
-                    position.get("availableSize", position.get("size", "0"))
-                )
-                if available_size <= 0:
-                    failures.append(f"{trade_asset_id}: no available position to close")
-                    continue
-
-                book = await inst.client.get_orderbook(yes_asset_id, depth=1)
-                if not isinstance(book, dict) or str(book.get("code", "0")) != "0":
-                    raise RuntimeError("orderbook query failed")
-                book_data = book.get("data", [])
-                if not isinstance(book_data, list) or not book_data or not isinstance(book_data[0], dict):
-                    raise RuntimeError("invalid orderbook response")
-                if is_no:
-                    asks = book_data[0].get("asks", [])
-                    if not asks:
-                        raise RuntimeError("NO best bid is unavailable")
-                    best_bid = format_okx_price(invert_binary_price(asks[0][0]))
-                else:
-                    bids = book_data[0].get("bids", [])
-                    if not bids:
-                        raise RuntimeError("YES best bid is unavailable")
-                    best_bid = format_okx_price(bids[0][0])
-
-                response = await inst.client.place_order(
-                    asset_id=trade_asset_id,
-                    side="sell",
-                    price=best_bid,
-                    size=normalize_size_str(available_size),
-                    tif="ioc",
-                    reduce_only=True,
-                )
-                if not isinstance(response, dict) or str(response.get("code", "")) != "0":
-                    message = (
-                        response.get("message", response.get("msg", "order rejected"))
-                        if isinstance(response, dict)
-                        else "invalid order response"
+                asset_orders = [
+                    order
+                    for order in current_open_orders
+                    if str(order.get("assetId") or "") == trade_asset_id
+                ]
+                if asset_orders:
+                    cancel_result = await _cancel_selected_orders_verified(
+                        inst.client, asset_orders
                     )
-                    raise RuntimeError(message)
-                submitted += 1
+                    cancelled += cancel_result["cancelled"]
+                    current_open_orders = cancel_result["remaining_orders"]
+                    audit_event(
+                        "account.flash_close_asset_orders_cancelled",
+                        level=(
+                            logging.INFO if cancel_result["ok"] else logging.ERROR
+                        ),
+                        account_id=account_id,
+                        trace_id=trace_id,
+                        market_id=market_id,
+                        asset_id=trade_asset_id,
+                        result={
+                            key: value
+                            for key, value in cancel_result.items()
+                            if key != "remaining_orders"
+                        },
+                    )
+                    if not cancel_result["ok"]:
+                        raise RuntimeError(
+                            f"{trade_asset_id}: {cancel_result['failed']} related orders remain open"
+                        )
+                    cancelled_orders_by_asset[trade_asset_id] = list(asset_orders)
+
+                    # Protective SELLs can reserve availableSize. Once their
+                    # terminal cancellation is proven, refresh both the exact
+                    # remaining position and its latest executable quote.
+                    fresh_positions = await _query_open_positions_verified(
+                        inst.client
+                    )
+                    matching = _matching_flash_positions(fresh_positions, plan)
+                    if not matching:
+                        audit_event(
+                            "account.flash_close_position_closed_during_cancel",
+                            account_id=account_id,
+                            trace_id=trace_id,
+                            market_id=market_id,
+                            asset_id=trade_asset_id,
+                        )
+                        continue
+                    if len(matching) != 1:
+                        raise RuntimeError(
+                            f"{trade_asset_id}: duplicate live position rows"
+                        )
+                    active_plan = await _flash_exit_plan(
+                        inst.client,
+                        matching[0],
+                        account_id=account_id,
+                        trace_id=trace_id,
+                        phase="post_cancel",
+                    )
+
+                exit_completed = False
+                exit_failure = "exit did not complete"
+                for exit_attempt in range(5):
+                    available_size = as_decimal(
+                        active_plan["position"].get(
+                            "availableSize",
+                            active_plan["position"].get("size", "0"),
+                        )
+                    )
+                    if available_size <= 0:
+                        raise RuntimeError(
+                            f"{trade_asset_id}: no available position to close"
+                        )
+
+                    client_order_id = generate_client_order_id(inst.client)
+                    size_text = normalize_size_str(available_size)
+                    audit_event(
+                        "account.flash_close_exit_requested",
+                        account_id=account_id,
+                        trace_id=trace_id,
+                        market_id=market_id,
+                        asset_id=trade_asset_id,
+                        client_order_id=client_order_id,
+                        price=active_plan["best_bid"],
+                        size=size_text,
+                        tif="ioc",
+                        reduce_only=True,
+                        attempt=exit_attempt + 1,
+                    )
+                    confirmation = await place_and_confirm(
+                        inst.client,
+                        client_order_id=client_order_id,
+                        market_id=market_id,
+                        asset_id=trade_asset_id,
+                        side="sell",
+                        price=active_plan["best_bid"],
+                        size=size_text,
+                        tif="ioc",
+                        reduce_only=True,
+                        attempts=20,
+                        delay=0.25,
+                    )
+                    observation = confirmation.observation
+                    if confirmation.rejected:
+                        exit_failure = str(
+                            confirmation.response.get(
+                                "message",
+                                confirmation.response.get("msg", "order rejected"),
+                            )
+                        )
+                        audit_event(
+                            "account.flash_close_exit_rejected",
+                            level=logging.WARNING,
+                            account_id=account_id,
+                            trace_id=trace_id,
+                            market_id=market_id,
+                            asset_id=trade_asset_id,
+                            client_order_id=client_order_id,
+                            attempt=exit_attempt + 1,
+                            response_code=confirmation.response_code,
+                            error=exit_failure,
+                        )
+                    else:
+                        if confirmation.response_code == "0" or observation is not None:
+                            submitted += 1
+                        if (
+                            observation is not None
+                            and observation.status not in TERMINAL_ORDER_STATUSES
+                        ):
+                            observation = await wait_for_order(
+                                inst.client,
+                                client_order_id=client_order_id,
+                                order_id=observation.order_id,
+                                market_id=market_id,
+                                accepted_statuses=TERMINAL_ORDER_STATUSES,
+                                attempts=20,
+                                delay=0.25,
+                            )
+                        if observation is None:
+                            _activate_account_recovery(
+                                inst,
+                                "flash_exit_order_unresolved",
+                                {
+                                    "asset_id": trade_asset_id,
+                                    "market_id": market_id,
+                                    "client_order_id": client_order_id,
+                                    "response_code": confirmation.response_code,
+                                    "attempt": exit_attempt + 1,
+                                },
+                            )
+                            raise RuntimeError(
+                                "IOC exit order final state could not be confirmed"
+                            )
+                        audit_event(
+                            "account.flash_close_exit_confirmed",
+                            level=(
+                                logging.INFO
+                                if observation.status == "FILLED"
+                                else logging.WARNING
+                            ),
+                            account_id=account_id,
+                            trace_id=trace_id,
+                            market_id=market_id,
+                            asset_id=trade_asset_id,
+                            client_order_id=client_order_id,
+                            order_id=observation.order_id,
+                            order_status=observation.status,
+                            filled_size=observation.filled_size,
+                            attempt=exit_attempt + 1,
+                        )
+                        if observation.status == "FILLED":
+                            exit_completed = True
+                            break
+                        exit_failure = (
+                            f"IOC reached {observation.status} with "
+                            f"filledSize={format(observation.filled_size, 'f')}"
+                        )
+
+                    live_positions = await _query_open_positions_verified(inst.client)
+                    matching = _matching_flash_positions(live_positions, plan)
+                    if not matching:
+                        exit_completed = True
+                        break
+                    if len(matching) != 1:
+                        raise RuntimeError(
+                            f"{trade_asset_id}: duplicate live position rows"
+                        )
+                    if exit_attempt >= 4:
+                        break
+                    active_plan = await _flash_exit_plan(
+                        inst.client,
+                        matching[0],
+                        account_id=account_id,
+                        trace_id=trace_id,
+                        phase=f"retry_{exit_attempt + 2}",
+                    )
+                    audit_event(
+                        "account.flash_close_exit_retry",
+                        level=logging.WARNING,
+                        account_id=account_id,
+                        trace_id=trace_id,
+                        market_id=market_id,
+                        asset_id=trade_asset_id,
+                        next_attempt=exit_attempt + 2,
+                        reason=exit_failure,
+                        remaining_size=active_plan["position_size"],
+                        next_limit=active_plan["best_bid"],
+                    )
+
+                if not exit_completed:
+                    failures.append(f"{trade_asset_id}: {exit_failure}")
             except Exception as exc:
                 failures.append(f"{trade_asset_id}: {exc}")
 
-        if submitted:
-            await asyncio.sleep(0.5)
+        # Before the final account-wide cleanup, prove positions are flat. If
+        # any exit remains, restore a confirmed reduce-only SELL from the
+        # cancelled protection instead of returning a naked position.
+        try:
+            positions_before_final_cancel = await _query_open_positions_verified(
+                inst.client
+            )
+        except Exception as exc:
+            emergency_restore = {}
+            for asset_id, cancelled_orders in cancelled_orders_by_asset.items():
+                plan = plans_by_asset[asset_id]
+                try:
+                    emergency_restore[asset_id] = await _restore_flash_protection(
+                        inst.client,
+                        position=plan["position"],
+                        plan=plan,
+                        cancelled_orders=cancelled_orders,
+                        account_id=account_id,
+                        trace_id=trace_id,
+                    )
+                except Exception as restore_exc:
+                    emergency_restore[asset_id] = {
+                        "ok": False,
+                        "reason": str(restore_exc),
+                    }
+            progress = {
+                "cancelled": cancelled,
+                "submitted": submitted,
+                "closed": 0,
+                "remaining": None,
+                "failures": [
+                    *failures,
+                    f"pre-final position verification: {exc}",
+                ],
+                "strategy_stop": stop_results,
+                "protection_restored": emergency_restore,
+            }
+            _activate_account_recovery(
+                inst,
+                "flash_pre_final_verification_failed",
+                {
+                    "trace_id": trace_id,
+                    "error": str(exc),
+                    "protection_restore": emergency_restore,
+                },
+            )
+            return {
+                "ok": False,
+                "error": f"Flash could not verify positions before final cancellation: {exc}",
+                "result": progress,
+                "recovery": _recovery_status(inst),
+            }
 
-        # IOC acceptance is not proof of a fill. Re-read both account states
-        # and report success only when the exchange confirms they are empty.
+        if positions_before_final_cancel:
+            open_before_restore = await _query_open_orders_verified(inst.client)
+            existing_sell_assets = {
+                str(order.get("assetId") or "")
+                for order in open_before_restore
+                if str(order.get("side") or "").upper() == "SELL"
+            }
+            restoration_results = {}
+            for position in positions_before_final_cancel:
+                matching_plans = [
+                    candidate
+                    for candidate in exit_plans
+                    if _matching_flash_positions([position], candidate)
+                ]
+                if len(matching_plans) != 1:
+                    continue
+                remaining_plan = matching_plans[0]
+                asset_id = remaining_plan["trade_asset_id"]
+                if asset_id in existing_sell_assets:
+                    restoration_results[asset_id] = {
+                        "ok": True,
+                        "active": True,
+                        "status": "EXISTING_ACTIVE_SELL",
+                    }
+                    continue
+                try:
+                    restoration_results[asset_id] = await _restore_flash_protection(
+                        inst.client,
+                        position=position,
+                        plan=remaining_plan,
+                        cancelled_orders=cancelled_orders_by_asset.get(asset_id, []),
+                        account_id=account_id,
+                        trace_id=trace_id,
+                    )
+                except Exception as restore_exc:
+                    restoration_results[asset_id] = {
+                        "ok": False,
+                        "active": False,
+                        "reason": str(restore_exc),
+                    }
+
+            remaining_positions = await _query_open_positions_verified(inst.client)
+            remaining_orders = await _query_open_orders_verified(inst.client)
+            if remaining_positions:
+                remaining_assets = set()
+                for position in remaining_positions:
+                    for candidate in exit_plans:
+                        if _matching_flash_positions([position], candidate):
+                            remaining_assets.add(candidate["trade_asset_id"])
+                            break
+                protected_order_ids = {
+                    str(order.get("clientOrderId") or order.get("oid") or order.get("id") or "")
+                    for order in remaining_orders
+                    if str(order.get("side") or "").upper() == "SELL"
+                    and str(order.get("assetId") or "") in remaining_assets
+                }
+                non_protective_orders = [
+                    order
+                    for order in remaining_orders
+                    if not (
+                        str(order.get("side") or "").upper() == "SELL"
+                        and str(order.get("assetId") or "") in remaining_assets
+                    )
+                ]
+                if non_protective_orders:
+                    cleanup = await _cancel_selected_orders_verified(
+                        inst.client, non_protective_orders
+                    )
+                    cancelled += cleanup["cancelled"]
+                    remaining_orders = cleanup["remaining_orders"]
+                protected_assets = {
+                    str(order.get("assetId") or "")
+                    for order in remaining_orders
+                    if str(order.get("side") or "").upper() == "SELL"
+                }
+                protection_complete = remaining_assets <= protected_assets
+                progress = {
+                    "cancelled": cancelled,
+                    "submitted": submitted,
+                    "closed": len(initial_assets - remaining_assets),
+                    "remaining": len(remaining_positions),
+                    "failures": list(failures),
+                    "strategy_stop": stop_results,
+                    "protection_restored": restoration_results,
+                    "protection_complete": protection_complete,
+                    "protected_order_ids": sorted(
+                        order_id for order_id in protected_order_ids if order_id
+                    ),
+                }
+                _activate_account_recovery(
+                    inst,
+                    "flash_positions_remain",
+                    {
+                        "trace_id": trace_id,
+                        "remaining_position_count": len(remaining_positions),
+                        "protection_complete": protection_complete,
+                        "restoration_results": restoration_results,
+                    },
+                )
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Flash incomplete: {len(remaining_positions)} positions remain; "
+                        + (
+                            "protective SELL coverage was verified"
+                            if protection_complete
+                            else "full protective SELL coverage could not be verified"
+                        )
+                    ),
+                    "result": progress,
+                    "recovery": _recovery_status(inst),
+                }
+
+        # Positions are now verified flat. Remaining account orders can be
+        # removed without exposing a live position.
+        cancellation = await _cancel_open_orders_verified(inst.client)
+        cancelled += cancellation["cancelled"]
+        if not cancellation["ok"]:
+            _activate_account_recovery(
+                inst,
+                "flash_cancel_incomplete",
+                {
+                    "trace_id": trace_id,
+                    "cancelled": cancelled,
+                    "remaining_order_count": cancellation["failed"],
+                },
+            )
+            return {
+                "ok": False,
+                "error": (
+                    "Flash stopped before final verification: "
+                    f"{cancellation['failed']} orders remain open"
+                ),
+                "result": {
+                    "cancelled": cancelled,
+                    "submitted": submitted,
+                    "closed": 0,
+                    "remaining": None,
+                    "failures": failures,
+                    "strategy_stop": stop_results,
+                },
+                "recovery": _recovery_status(inst),
+            }
+
+        # A terminal IOC status is still not proof that the whole position was
+        # closed.  Poll both exchange views and succeed only when orders and
+        # positions are independently confirmed empty.
         progress = {
-            "cancelled": cancellation["cancelled"],
+            "cancelled": cancelled,
             "submitted": submitted,
             "closed": 0,
             "remaining": None,
             "failures": list(failures),
+            "strategy_stop": stop_results,
         }
         try:
-            final_cancellation = await _cancel_open_orders_verified(inst.client)
-            progress["cancelled"] += final_cancellation["cancelled"]
-            remaining_positions = await _query_open_positions_verified(inst.client)
+            remaining_orders = []
+            remaining_positions = []
+            for attempt in range(10):
+                remaining_orders = await _query_open_orders_verified(inst.client)
+                remaining_positions = await _query_open_positions_verified(inst.client)
+                if not remaining_orders and not remaining_positions:
+                    break
+                if attempt < 9:
+                    await asyncio.sleep(0.3)
         except Exception as exc:
             progress["failures"].append(f"final verification: {exc}")
+            _activate_account_recovery(
+                inst,
+                "flash_final_verification_failed",
+                {"trace_id": trace_id, "error": str(exc), "progress": progress},
+            )
             return {
                 "ok": False,
                 "error": f"Flash final verification failed: {exc}",
@@ -1443,54 +2960,158 @@ async def account_flash_close(account_id: str, user: str = Depends(verify_auth))
         progress["closed"] = closed
         progress["remaining"] = len(remaining_positions)
         result = progress
-        if not final_cancellation["ok"]:
+        if remaining_orders:
+            _activate_account_recovery(
+                inst,
+                "flash_orders_remain",
+                {
+                    "trace_id": trace_id,
+                    "remaining_order_count": len(remaining_orders),
+                    "progress": result,
+                },
+            )
             return {
                 "ok": False,
                 "error": (
                     "Flash incomplete: "
-                    f"{final_cancellation['failed']} orders remain open"
+                    f"{len(remaining_orders)} orders remain open"
                 ),
                 "result": result,
             }
         if remaining_positions:
+            _activate_account_recovery(
+                inst,
+                "flash_positions_remain",
+                {
+                    "trace_id": trace_id,
+                    "remaining_position_count": len(remaining_positions),
+                    "progress": result,
+                },
+            )
             return {
                 "ok": False,
                 "error": f"Flash incomplete: {len(remaining_positions)} positions remain open",
                 "result": result,
             }
-        sniper = getattr(inst, "sniper", None)
-        if sniper is not None and getattr(
-            getattr(sniper, "state", None), "locked", False
-        ):
-            try:
-                reconciliation = await sniper.stop()
-                still_locked = bool(
-                    getattr(getattr(sniper, "state", None), "locked", False)
-                    or (
-                        isinstance(reconciliation, dict)
-                        and reconciliation.get("needs_reconciliation")
+        if not require_local_reconciliation:
+            return {"ok": True, "result": result}
+
+        unresolved_components = []
+        reconciliation_specs = (
+            (
+                "Manual-D",
+                getattr(inst, "strategy_d", None),
+                stop_results.get("manual_d_safe") is False,
+            ),
+            (
+                "Manual-S",
+                getattr(inst, "strategy_s", None),
+                stop_results.get("manual_s_safe") is False,
+            ),
+            (
+                "Sniper",
+                getattr(inst, "sniper", None),
+                not bool(stop_results.get("sniper_safe", True))
+                or bool(
+                    getattr(
+                        getattr(getattr(inst, "sniper", None), "state", None),
+                        "locked",
+                        False,
                     )
+                ),
+            ),
+            (
+                "Sniper Old",
+                getattr(inst, "sniper_old", None),
+                not bool(stop_results.get("sniper_old_safe", True))
+                or bool(
+                    getattr(
+                        getattr(getattr(inst, "sniper_old", None), "state", None),
+                        "locked",
+                        False,
+                    )
+                ),
+            ),
+        )
+        for label, component, needs_reconciliation in reconciliation_specs:
+            if component is None or not needs_reconciliation:
+                continue
+            try:
+                reconciliation = await component.stop()
+                state = getattr(component, "state", None)
+                still_locked = (
+                    not _stop_result_is_safe(component, reconciliation)
+                    or bool(getattr(state, "deployment_blocked", False))
                 )
             except Exception as exc:
                 still_locked = True
-                result["failures"].append(f"Sniper reconciliation: {exc}")
-            result["needs_reconciliation"] = still_locked
+                reconciliation = {"ok": False, "error": str(exc)}
+                result["failures"].append(f"{label} reconciliation: {exc}")
+            result[f"{label.lower().replace(' ', '_')}_reconciliation"] = reconciliation
             if still_locked:
-                return {
-                    "ok": False,
-                    "error": (
-                        "Flash closed the verified exchange exposure, but "
-                        "Sniper still requires reconciliation"
-                    ),
-                    "result": result,
-                }
+                unresolved_components.append(label)
+        result["needs_reconciliation"] = bool(unresolved_components)
+        if unresolved_components:
+            return {
+                "ok": False,
+                "error": (
+                    "Flash closed the verified exchange exposure, but "
+                    f"{', '.join(unresolved_components)} still requires reconciliation"
+                ),
+                "result": result,
+            }
+        recovery = await _refresh_entry_safety(inst)
+        result["recovery"] = recovery
+        if recovery.get("locked"):
+            return {
+                "ok": False,
+                "error": (
+                    "Flash closed the verified exchange exposure, but account "
+                    "recovery is still required"
+                ),
+                "result": result,
+            }
+        audit_event(
+            "account.flash_close_completed",
+            account_id=account_id,
+            trace_id=trace_id,
+            result=result,
+            elapsed_ms=(time.perf_counter_ns() - started_ns) / 1_000_000,
+        )
         return {"ok": True, "result": result}
     except Exception as e:
         logger.error("Flash close failed for account %s: %s", account_id, e)
-        return {"ok": False, "error": str(e)}
+        _activate_account_recovery(
+            inst,
+            "flash_close_exception",
+            {"trace_id": trace_id, "error": str(e)},
+        )
+        audit_event(
+            "account.flash_close_failed",
+            level=logging.ERROR,
+            account_id=account_id,
+            trace_id=trace_id,
+            error=e,
+            elapsed_ms=(time.perf_counter_ns() - started_ns) / 1_000_000,
+        )
+        return {
+            "ok": False,
+            "error": str(e),
+            "recovery": _recovery_status(inst),
+        }
+
+
+@app.post("/api/accounts/{account_id}/flash_close")
+@_serialize_strategy_lifecycle
+async def account_flash_close(account_id: str, user: str = Depends(verify_auth)):
+    inst = manager.get_instance(account_id)
+    if not inst:
+        raise HTTPException(404, "Account not found")
+    return await _flash_close_account(account_id, inst)
 
 
 @app.post("/api/accounts/{account_id}/cancel_order")
+@_serialize_strategy_lifecycle
 async def account_cancel_order(account_id: str, request: Request, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
@@ -1501,15 +3122,57 @@ async def account_cancel_order(account_id: str, request: Request, user: str = De
     if not order_id or not asset_id:
         return JSONResponse(status_code=400, content={"ok": False, "error": "order_id and asset_id required"})
     try:
-        result = await inst.client.cancel_order(asset_id=asset_id, order_id=order_id)
-        if not isinstance(result, dict) or str(result.get("code", "")) != "0":
-            message = (
-                result.get("message", result.get("msg", "cancellation rejected"))
-                if isinstance(result, dict)
-                else "invalid cancellation response"
-            )
-            return {"ok": False, "error": message, "result": result}
-        return {"ok": True, "result": result}
+        client_order_id = ""
+        market_id = str(asset_id)[:-3] if str(asset_id).endswith(("000", "100")) else ""
+        try:
+            for order in await _query_open_orders_verified(inst.client):
+                candidate_id = str(order.get("oid", order.get("id", "")) or "")
+                if candidate_id == str(order_id):
+                    client_order_id = str(order.get("clientOrderId", "") or "")
+                    market_id = str(order.get("marketId", "") or market_id)
+                    break
+        except Exception:
+            # The exact exchange order ID is still sufficient for the
+            # lifecycle helper; it will query both open and closed views.
+            pass
+        confirmation = await cancel_and_confirm(
+            inst.client,
+            client_order_id=client_order_id,
+            order_id=str(order_id),
+            market_id=market_id,
+            asset_id=str(asset_id),
+        )
+        if confirmation.confirmed_terminal and confirmation.observation is not None:
+            observation = confirmation.observation
+            recovery = None
+            if getattr(inst, "recovery_locked", False):
+                recovery = await _refresh_entry_safety(inst)
+            return {
+                "ok": True,
+                "result": dict(confirmation.response),
+                "client_order_id": observation.client_order_id or client_order_id,
+                "order_id": observation.order_id or str(order_id),
+                "order_status": observation.status,
+                "filled_size": format(observation.filled_size, "f"),
+                "recovery": recovery,
+            }
+        details = {
+            "operation": "cancel_order",
+            "client_order_id": client_order_id,
+            "order_id": str(order_id),
+            "asset_id": str(asset_id),
+            "response_code": str(confirmation.response.get("code", "INVALID")),
+        }
+        _activate_account_recovery(inst, "cancel_order_state_unresolved", details)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "Cancellation was submitted but terminal order state could not be confirmed",
+                "result": dict(confirmation.response),
+                "recovery": _recovery_status(inst),
+            },
+        )
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -1613,22 +3276,42 @@ async def account_manual_place(account_id: str, request: Request, user: str = De
     if tif not in ("gtc", "ioc"):
         return JSONResponse(status_code=400, content={"ok": False, "error": "tif must be gtc or ioc"})
     sniper = getattr(inst, "sniper", None)
+    if sniper is not None and (
+        getattr(sniper, "running", False) or getattr(sniper, "starting", False)
+    ):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "Manual orders are disabled while Sniper is running or starting",
+            },
+        )
+    if _automated_trading_active(inst):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "Manual orders are disabled while an automated strategy or risk-control task is active",
+            },
+        )
+    if side == "BUY":
+        safety_response = await _entry_safety_response(inst)
+        if safety_response is not None:
+            return safety_response
+        if _sniper_old_busy(inst):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "error": "Manual buys are disabled while Sniper-Old is running or requires reconciliation",
+                },
+            )
     if sniper is not None and getattr(sniper, "_persistence_failed", False):
         return JSONResponse(
             status_code=409,
             content={
                 "ok": False,
                 "error": "Manual orders are disabled until the critical Sniper state is persisted",
-            },
-        )
-    if sniper is not None and (
-        sniper.running or getattr(sniper, "starting", False)
-    ):
-        return JSONResponse(
-            status_code=409,
-            content={
-                "ok": False,
-                "error": "Manual orders are disabled while Sniper is running",
             },
         )
     if (
@@ -1744,7 +3427,17 @@ async def account_manual_place(account_id: str, request: Request, user: str = De
         tif,
     )
     try:
-        result = await inst.client.place_order(
+        client_order_id = generate_client_order_id(inst.client)
+        asset_id_text = str(asset_id)
+        market_id = (
+            asset_id_text[:-3]
+            if asset_id_text.endswith(("000", "100"))
+            else ""
+        )
+        confirmation = await place_and_confirm(
+            inst.client,
+            client_order_id=client_order_id,
+            market_id=market_id,
             asset_id=asset_id,
             side=side.lower(),
             price=price_str,
@@ -1752,15 +3445,152 @@ async def account_manual_place(account_id: str, request: Request, user: str = De
             tif=tif,
             reduce_only=(side.lower() == "sell"),
         )
-        if isinstance(result, dict) and str(result.get("code", "")) == "0":
-            return {
-                "ok": True,
-                "result": result,
-                "price": price_str,
-                "price_cents": format(actual_price_cents, "f"),
-            }
-        logger.warning("Manual order rejected by OKX: %s", result)
-        return {"ok": False, "error": result.get("message", result.get("msg", str(result)))}
+        observation = confirmation.observation
+        if confirmation.unresolved:
+            cancellation = await cancel_and_confirm(
+                inst.client,
+                client_order_id=client_order_id,
+                order_id="",
+                market_id=market_id,
+                asset_id=asset_id_text,
+                attempts=20,
+                delay=0.25,
+            )
+            observation = cancellation.observation
+            audit_event(
+                "manual.order_unresolved_cancel_result",
+                level=(
+                    logging.WARNING
+                    if cancellation.confirmed_terminal
+                    else logging.ERROR
+                ),
+                account_id=account_id,
+                client_order_id=client_order_id,
+                asset_id=asset_id_text,
+                side=side,
+                tif=tif,
+                response_code=confirmation.response_code,
+                cancel_confirmed_terminal=cancellation.confirmed_terminal,
+                terminal_status=(observation.status if observation else ""),
+            )
+            if observation is None or not cancellation.confirmed_terminal:
+                details = {
+                    "operation": "manual_place",
+                    "client_order_id": client_order_id,
+                    "asset_id": asset_id_text,
+                    "side": side,
+                    "tif": tif,
+                    "response_code": confirmation.response_code,
+                }
+                _activate_account_recovery(
+                    inst, "manual_order_state_unresolved", details
+                )
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "ok": False,
+                        "error": (
+                            "Order submission was not acknowledged and its "
+                            "terminal exchange state could not be confirmed"
+                        ),
+                        "client_order_id": client_order_id,
+                        "recovery": _recovery_status(inst),
+                    },
+                )
+        if confirmation.rejected or observation is None:
+            result = dict(confirmation.response)
+            logger.warning("Manual order rejected by OKX: %s", result)
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error": result.get(
+                        "message", result.get("msg", "Order rejected")
+                    ),
+                    "client_order_id": client_order_id,
+                    "result": result,
+                },
+            )
+
+        status = normalise_order_status(observation.status)
+        if tif == "ioc" and status not in TERMINAL_ORDER_STATUSES:
+            terminal_observation = await wait_for_order(
+                inst.client,
+                client_order_id=client_order_id,
+                order_id=observation.order_id,
+                market_id=market_id,
+                accepted_statuses=TERMINAL_ORDER_STATUSES,
+                attempts=20,
+                delay=0.25,
+            )
+            if terminal_observation is None:
+                cancellation = await cancel_and_confirm(
+                    inst.client,
+                    client_order_id=client_order_id,
+                    order_id=observation.order_id,
+                    market_id=market_id,
+                    asset_id=asset_id_text,
+                    attempts=20,
+                    delay=0.25,
+                )
+                terminal_observation = cancellation.observation
+            if terminal_observation is None:
+                _activate_account_recovery(
+                    inst,
+                    "manual_ioc_terminal_state_unresolved",
+                    {
+                        "client_order_id": client_order_id,
+                        "order_id": observation.order_id,
+                        "asset_id": asset_id_text,
+                        "side": side,
+                        "last_status": status,
+                    },
+                )
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "ok": False,
+                        "error": "IOC order did not reach a confirmed terminal state",
+                        "client_order_id": client_order_id,
+                        "order_id": observation.order_id,
+                        "recovery": _recovery_status(inst),
+                    },
+                )
+            observation = terminal_observation
+            status = normalise_order_status(observation.status)
+        filled_size = observation.filled_size
+        successful = (
+            (tif == "gtc" and status == "ACTIVE")
+            or status == "FILLED"
+            or (status in TERMINAL_ORDER_STATUSES and filled_size > 0)
+        )
+        payload = {
+            "ok": successful,
+            "result": dict(confirmation.response),
+            "client_order_id": client_order_id,
+            "order_id": observation.order_id,
+            "order_status": status,
+            "filled_size": format(filled_size, "f"),
+            "price": price_str,
+            "price_cents": format(actual_price_cents, "f"),
+        }
+        audit_event(
+            "manual.order_confirmed",
+            level=logging.INFO if successful else logging.WARNING,
+            account_id=account_id,
+            client_order_id=client_order_id,
+            order_id=observation.order_id,
+            asset_id=asset_id_text,
+            side=side,
+            tif=tif,
+            order_status=status,
+            filled_size=filled_size,
+            successful=successful,
+        )
+        if successful:
+            return payload
+        payload["error"] = f"Order reached {status or 'an unknown terminal state'} without a fill"
+        return JSONResponse(status_code=409, content=payload)
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -1806,6 +3636,9 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
+    safety_response = await _entry_safety_response(inst)
+    if safety_response is not None:
+        return safety_response
     # Mutex check
     if inst.strategy_d.running:
         return JSONResponse(status_code=400, content={"ok": False, "error": "Manual-D already running."})
@@ -1813,8 +3646,10 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
         return JSONResponse(status_code=400, content={"ok": False, "error": "Manual-S is running. Stop it first."})
     if _sniper_busy(inst):
         return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper is running or locked. Resolve it first."})
-    if inst.sniper_old.running:
-        return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper-Old is running. Stop it first."})
+    if _sniper_old_busy(inst):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper-Old is running or locked. Resolve it first."})
+    if _risk_control_busy(inst):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Monitor or Auto-Rebalance is still active. Stop it first."})
     body = await request.json()
     asset_id = body.get("asset_id", "")
     price = body.get("price", 0)
@@ -1885,33 +3720,55 @@ async def account_manual_start_v2(account_id: str, request: Request, user: str =
             if not poly_bids:
                 return JSONResponse(status_code=400, content={"ok": False, "error": "No Poly bids found"})
             poly_best_bid = as_decimal(poly_bids[0].get("price", 0))
-            if align_okx_price(poly_best_bid, "buy") != expected_okx_bid:
+            if inst.poly_monitor._risk_bid_price(poly_best_bid) != expected_okx_bid:
                 return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly best bid ({poly_best_bid}) does not map to YES buy bid ({expected_okx_bid})"})
         except Exception as e:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly book check: {e}"})
 
     try:
-        await inst.strategy_d.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=str(price_cents), position_pct=int(body.get("position_pct", 100)), scan_interval=float(body.get("scan_interval", 0.3)), stabilize_secs=float(body.get("stabilize_secs", 0.3)))
+        await inst.strategy_d.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=str(price_cents), position_pct=int(body.get("position_pct", 100)), scan_interval=float(body.get("scan_interval", 0.3)), stabilize_secs=float(body.get("stabilize_secs", 0.3)), defer_entry=bool(monitor and monitor.get("poly_token_id")))
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
     # Auto-start monitor if requested
     if monitor and monitor.get("poly_token_id"):
         try:
+            inst.poly_monitor.set_strategy_context(
+                "manual-d", float(price_to_cents(expected_okx_bid)), asset_id
+            )
             r = await inst.poly_monitor.start(
                 poly_token_id=monitor["poly_token_id"],
-                reference_price=float(price_decimal),
+                reference_price=float(expected_okx_bid),
                 depth_threshold=float(monitor.get("depth_threshold", 3000)),
             )
             if r and r.get("ok"):
-                inst.poly_monitor.set_strategy_context("manual-d", float(price_cents), asset_id)
                 _record_monitor_mapping(account_id, market_id, asset_id, no_asset_id, monitor, poly_token_id, "yes")
+                if inst.strategy_d.release_entry_barrier() is not True:
+                    raise RuntimeError("Manual-D entry barrier could not be released")
             else:
-                await inst.strategy_d.stop()
-                return JSONResponse(status_code=400, content={"ok": False, "error": (r or {}).get("error", "Monitor failed to start")})
+                rollback_safe = await _rollback_manual_start_after_monitor_failure(
+                    inst, "manual-d"
+                )
+                return JSONResponse(
+                    status_code=400 if rollback_safe else 409,
+                    content={
+                        "ok": False,
+                        "error": (r or {}).get("error", "Monitor failed to start"),
+                        **({"recovery": _recovery_status(inst)} if not rollback_safe else {}),
+                    },
+                )
         except Exception as e:
-            await inst.strategy_d.stop()
-            return JSONResponse(status_code=400, content={"ok": False, "error": f"Monitor start error: {e}"})
+            rollback_safe = await _rollback_manual_start_after_monitor_failure(
+                inst, "manual-d"
+            )
+            return JSONResponse(
+                status_code=400 if rollback_safe else 409,
+                content={
+                    "ok": False,
+                    "error": f"Monitor start error: {e}",
+                    **({"recovery": _recovery_status(inst)} if not rollback_safe else {}),
+                },
+            )
 
     return {"ok": True}
 
@@ -1923,12 +3780,25 @@ async def account_manual_stop_v2(account_id: str, user: str = Depends(verify_aut
     if not inst:
         raise HTTPException(404, "Account not found")
     await inst.auto_rebalance.cancel()
-    if inst.strategy_d.running:
-        await inst.strategy_d.stop()
+    safe = await inst.strategy_d.stop()
     # Stop monitor (bound to strategy)
     if inst.poly_monitor.running or inst.poly_monitor.state.enabled:
         await inst.poly_monitor.stop()
-    return {"ok": True}
+    if safe is False:
+        _activate_account_recovery(
+            inst,
+            "manual_d_stop_reconciliation_incomplete",
+            {"strategy": "manual-d"},
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "Manual-D stopped locally but owned BUY cancellation is unresolved",
+                "recovery": _recovery_status(inst),
+            },
+        )
+    return {"ok": True, "safe": safe}
 
 
 
@@ -1944,6 +3814,15 @@ async def account_monitor_start(account_id: str, request: Request, user: str = D
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
+    if getattr(inst, "recovery_locked", False):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "Recovery lock blocks starting Poly Monitor",
+                "recovery": _recovery_status(inst),
+            },
+        )
     body = await request.json()
     poly_token_id = body.get("poly_token_id", "")
     reference_price = float(body.get("reference_price", 0))
@@ -1981,6 +3860,16 @@ async def account_rebalance_toggle(account_id: str, request: Request, user: str 
                 "ok": False,
                 "enabled": inst.auto_rebalance.enabled,
                 "error": "enabled must be a boolean",
+            },
+        )
+    if enabled and getattr(inst, "recovery_locked", False):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "enabled": inst.auto_rebalance.enabled,
+                "error": "Recovery lock blocks enabling Auto-Rebalance",
+                "recovery": _recovery_status(inst),
             },
         )
     if not inst.auto_rebalance.set_enabled(enabled):
@@ -2039,10 +3928,13 @@ async def sniper_start(account_id: str, request: Request, user: str = Depends(ve
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
+    safety_response = await _entry_safety_response(inst)
+    if safety_response is not None:
+        return safety_response
     if (
         inst.strategy_s.running
         or inst.strategy_d.running
-        or inst.sniper_old.running
+        or _sniper_old_busy(inst)
         or _risk_control_busy(inst)
     ):
         return {"ok": False, "error": "Cannot run sniper while another strategy is active"}
@@ -2112,26 +4004,78 @@ async def sniper_old_start(account_id: str, request: Request, user: str = Depend
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
+    safety_response = await _entry_safety_response(inst)
+    if safety_response is not None:
+        return safety_response
     if (
         inst.strategy_s.running
         or inst.strategy_d.running
         or _sniper_busy(inst)
+        or _sniper_old_busy(inst)
         or _risk_control_busy(inst)
     ):
         return {"ok": False, "error": "Cannot run sniper-old while another strategy is active"}
     body = await request.json()
+    required = (
+        "yes_token_id",
+        "no_token_id",
+        "yes_asset_id",
+        "no_asset_id",
+        "market_id",
+    )
+    missing = [field for field in required if not str(body.get(field) or "").strip()]
+    if missing:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "error": f"Missing required Sniper-Old fields: {', '.join(missing)}",
+            },
+        )
+    try:
+        threshold_cents = int(body.get("threshold_cents", 40))
+        ask_levels = int(body.get("ask_levels", 5))
+        position_pct = int(body.get("position_pct", 100))
+        timeout_secs = int(body.get("timeout_secs", 120))
+        settle_ms = int(body.get("settle_ms", 0))
+        window_ms = int(body.get("window_ms", 150))
+    except (TypeError, ValueError):
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "Sniper-Old numeric settings must be integers"},
+        )
+    numeric_error = next(
+        (
+            message
+            for invalid, message in (
+                (threshold_cents <= 0, "threshold_cents must be positive"),
+                (ask_levels < 1, "ask_levels must be at least 1"),
+                (not 1 <= position_pct <= 100, "position_pct must be between 1 and 100"),
+                (timeout_secs <= 0, "timeout_secs must be positive"),
+                (settle_ms < 0, "settle_ms cannot be negative"),
+                (window_ms < 1, "window_ms must be at least 1"),
+            )
+            if invalid
+        ),
+        None,
+    )
+    if numeric_error:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": numeric_error},
+        )
     result = await inst.sniper_old.start(
         yes_token_id=body.get("yes_token_id", ""),
         no_token_id=body.get("no_token_id", ""),
         yes_asset_id=body.get("yes_asset_id", ""),
         no_asset_id=body.get("no_asset_id", ""),
         market_id=body.get("market_id", ""),
-        threshold_cents=int(body.get("threshold_cents", 40)),
-        ask_levels=int(body.get("ask_levels", 5)),
-        position_pct=int(body.get("position_pct", 100)),
-        timeout_secs=int(body.get("timeout_secs", 120)),
-        settle_ms=int(body.get("settle_ms", 0)),
-        window_ms=int(body.get("window_ms", 150)),
+        threshold_cents=threshold_cents,
+        ask_levels=ask_levels,
+        position_pct=position_pct,
+        timeout_secs=timeout_secs,
+        settle_ms=settle_ms,
+        window_ms=window_ms,
         poly_url=body.get("poly_url", ""),
         selected_outcome=body.get("selected_outcome", ""),
     )
@@ -2155,8 +4099,38 @@ async def sniper_old_stop(account_id: str, user: str = Depends(verify_auth)):
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
-    await inst.sniper_old.stop()
-    return {"ok": True}
+    safe = await inst.sniper_old.stop()
+    locked = bool(getattr(getattr(inst.sniper_old, "state", None), "locked", False))
+    if safe is False or locked:
+        _activate_account_recovery(
+            inst,
+            "sniper_old_stop_reconciliation_incomplete",
+            {
+                "strategy": "poly-sniper-old",
+                "safe": safe,
+                "locked": locked,
+                "status": getattr(
+                    getattr(inst.sniper_old, "state", None), "status", "unknown"
+                ),
+                "reconciliation_error": getattr(
+                    getattr(inst.sniper_old, "state", None),
+                    "reconciliation_error",
+                    "",
+                ),
+            },
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "Sniper Old stopped receiving signals but exchange reconciliation is incomplete",
+                "recovery": _recovery_status(inst),
+            },
+        )
+    recovery = None
+    if getattr(inst, "recovery_locked", False):
+        recovery = await _refresh_entry_safety(inst)
+    return {"ok": True, "safe": True, "recovery": recovery}
 
 
 @app.get("/api/accounts/{account_id}/sniper-old/status")
@@ -2193,6 +4167,9 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
+    safety_response = await _entry_safety_response(inst)
+    if safety_response is not None:
+        return safety_response
     # Mutex check
     if inst.strategy_s.running:
         return JSONResponse(status_code=400, content={"ok": False, "error": "Manual-S already running."})
@@ -2200,8 +4177,8 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
         return JSONResponse(status_code=400, content={"ok": False, "error": "Manual-D is running. Stop it first."})
     if _sniper_busy(inst):
         return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper is running or locked. Resolve it first."})
-    if inst.sniper_old.running:
-        return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper-Old is running. Stop it first."})
+    if _sniper_old_busy(inst):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Sniper-Old is running or locked. Resolve it first."})
     if _risk_control_busy(inst):
         return JSONResponse(status_code=400, content={"ok": False, "error": "Monitor or Auto-Rebalance is still active. Stop it first."})
     body = await request.json()
@@ -2291,35 +4268,60 @@ async def account_manual_s_start(account_id: str, request: Request, user: str = 
             if not poly_bids:
                 return JSONResponse(status_code=400, content={"ok": False, "error": "No Poly bids found"})
             poly_best_bid = as_decimal(poly_bids[0].get("price", 0))
-            if align_okx_price(poly_best_bid, "buy") != monitor_ref:
+            if inst.poly_monitor._risk_bid_price(poly_best_bid) != monitor_ref:
                 return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly best bid ({poly_best_bid}) does not map to monitor price ({monitor_ref})"})
         except Exception as e:
             return JSONResponse(status_code=400, content={"ok": False, "error": f"Poly book check: {e}"})
 
     try:
-        await inst.strategy_s.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=str(price_cents), sell_price=str(sell_price_input), mode=mode, side=side_normalized, position_pct=int(body.get("position_pct", 100)), scan_interval=float(body.get("scan_interval", 0.3)), stabilize_secs=float(body.get("stabilize_secs", 0.3)))
+        await inst.strategy_s.start(market_id=market_id, yes_asset_id=asset_id, no_asset_id=no_asset_id, price_a=str(price_cents), sell_price=str(sell_price_input), mode=mode, side=side_normalized, position_pct=int(body.get("position_pct", 100)), scan_interval=float(body.get("scan_interval", 0.3)), stabilize_secs=float(body.get("stabilize_secs", 0.3)), defer_entry=bool(monitor and monitor.get("poly_token_id")))
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
     # Auto-start monitor if requested
     if monitor and monitor.get("poly_token_id"):
         try:
+            strategy_price_cents = price_to_cents(monitor_ref)
+            strategy_asset_id = no_asset_id if is_no_side else asset_id
+            inst.poly_monitor.set_strategy_context(
+                "manual-s",
+                float(strategy_price_cents),
+                strategy_asset_id,
+                mode=mode,
+            )
             r = await inst.poly_monitor.start(
                 poly_token_id=monitor["poly_token_id"],
                 reference_price=float(monitor_ref),
                 depth_threshold=float(monitor.get("depth_threshold", 3000)),
             )
             if r and r.get("ok"):
-                strategy_price_cents = price_to_cents(monitor_ref)
-                strategy_asset_id = no_asset_id if is_no_side else asset_id
-                inst.poly_monitor.set_strategy_context("manual-s", float(strategy_price_cents), strategy_asset_id, mode=mode)
                 _record_monitor_mapping(account_id, market_id, asset_id, no_asset_id, monitor, poly_token_id, side.lower())
+                if inst.strategy_s.release_entry_barrier() is not True:
+                    raise RuntimeError("Manual-S entry barrier could not be released")
             else:
-                await inst.strategy_s.stop()
-                return JSONResponse(status_code=400, content={"ok": False, "error": (r or {}).get("error", "Monitor failed to start")})
+                rollback_safe = await _rollback_manual_start_after_monitor_failure(
+                    inst, "manual-s"
+                )
+                return JSONResponse(
+                    status_code=400 if rollback_safe else 409,
+                    content={
+                        "ok": False,
+                        "error": (r or {}).get("error", "Monitor failed to start"),
+                        **({"recovery": _recovery_status(inst)} if not rollback_safe else {}),
+                    },
+                )
         except Exception as e:
-            await inst.strategy_s.stop()
-            return JSONResponse(status_code=400, content={"ok": False, "error": f"Monitor start error: {e}"})
+            rollback_safe = await _rollback_manual_start_after_monitor_failure(
+                inst, "manual-s"
+            )
+            return JSONResponse(
+                status_code=400 if rollback_safe else 409,
+                content={
+                    "ok": False,
+                    "error": f"Monitor start error: {e}",
+                    **({"recovery": _recovery_status(inst)} if not rollback_safe else {}),
+                },
+            )
 
     return {"ok": True}
 
@@ -2331,12 +4333,25 @@ async def account_manual_s_stop(account_id: str, user: str = Depends(verify_auth
     if not inst:
         raise HTTPException(404, "Account not found")
     await inst.auto_rebalance.cancel()
-    if inst.strategy_s.running:
-        await inst.strategy_s.stop()
+    safe = await inst.strategy_s.stop()
     # Stop monitor (bound to strategy)
     if inst.poly_monitor.running or inst.poly_monitor.state.enabled:
         await inst.poly_monitor.stop()
-    return {"ok": True}
+    if safe is False:
+        _activate_account_recovery(
+            inst,
+            "manual_s_stop_reconciliation_incomplete",
+            {"strategy": "manual-s"},
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "error": "Manual-S stopped locally but owned BUY cancellation is unresolved",
+                "recovery": _recovery_status(inst),
+            },
+        )
+    return {"ok": True, "safe": safe}
 
 
 @app.get("/api/accounts/{account_id}/config")
@@ -2350,12 +4365,21 @@ async def account_config_v2(account_id: str, user: str = Depends(verify_auth)):
     base_url = acc.get("base_url", "https://us.okx.com")
     region = "CN" if "www.okx.com" in base_url else "AU"
     return {
-        "api_key": acc.get("api_key", ""),
-        "secret_key": acc.get("secret_key", ""),
-        "passphrase": acc.get("passphrase", ""),
-        "agent_key": acc.get("agent_private_key", ""),
+        # Never return decrypted credentials to the dashboard.  Blank input
+        # means "keep the stored value" in the update route below.
+        "api_key": "",
+        "secret_key": "",
+        "passphrase": "",
+        "agent_key": "",
+        "credentials_configured": {
+            "api_key": bool(acc.get("api_key")),
+            "secret_key": bool(acc.get("secret_key")),
+            "passphrase": bool(acc.get("passphrase")),
+            "agent_key": bool(acc.get("agent_private_key")),
+        },
         "region": region,
-        "tg_token": get_global_config("tg_token", ""),
+        "tg_token": "",
+        "tg_token_configured": bool(get_global_config("tg_token", "")),
         "tg_chats": [c.strip() for c in tg_chats_str.split(",") if c.strip()] if tg_chats_str else [],
         "depth_threshold": acc.get("depth_threshold", 90),
         "price_tick": acc.get("price_tick", 0),
@@ -2873,8 +4897,10 @@ async def poly_book(token_id: str = "", user: str = Depends(verify_auth)):
 
 @app.get("/api/global/config")
 async def get_global_config_route(user: str = Depends(verify_auth)):
+    token = get_global_config("tg_token", "")
     return {
-        "tg_token": get_global_config("tg_token", ""),
+        "tg_token": "",
+        "tg_token_configured": bool(token),
         "tg_chats": get_global_config("tg_chats", ""),
     }
 
@@ -2882,14 +4908,23 @@ async def get_global_config_route(user: str = Depends(verify_auth)):
 @app.post("/api/global/config")
 async def save_global_config(request: Request, user: str = Depends(verify_auth)):
     body = await request.json()
-    token = str(body.get("tg_token", "") or "")
+    stored_token = get_global_config("tg_token", "")
+    supplied_token = str(body.get("tg_token", "") or "").strip()
+    clear_token = body.get("clear_tg_token", False)
+    if type(clear_token) is not bool:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "clear_tg_token must be boolean"},
+        )
+    token = "" if clear_token else (supplied_token or stored_token)
     chats_raw = body.get("tg_chats", "")
     chats = (
         [c.strip() for c in chats_raw.split(",") if c.strip()]
         if isinstance(chats_raw, str)
         else [str(c).strip() for c in chats_raw if str(c).strip()]
     )
-    set_global_config("tg_token", token)
+    if token != stored_token:
+        set_global_config("tg_token", token)
     set_global_config("tg_chats", ",".join(chats))
     if manager.notifier:
         if manager.notifier._session and not manager.notifier._session.closed:

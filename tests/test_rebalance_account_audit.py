@@ -41,6 +41,7 @@ class RebalanceAuditTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_one_rebalance_id_covers_every_success_stage(self):
         rebalance = AutoRebalance(object(), "audit-flow-no-file")
+        rebalance._save_layers = lambda: None
         params = strategy_params()
         rebalance.get_strategy_params = lambda: params
         rebalance._cancel_all_verified = AsyncMock(
@@ -97,6 +98,7 @@ class RebalanceAuditTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failure_records_the_exact_stage(self):
         rebalance = AutoRebalance(object(), "audit-failure-no-file")
+        rebalance._save_layers = lambda: None
         params = strategy_params()
         rebalance.get_strategy_params = lambda: params
         rebalance._cancel_all_verified = AsyncMock(return_value={"ok": True})

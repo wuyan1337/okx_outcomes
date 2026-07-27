@@ -59,6 +59,23 @@ class ProxyNodeNormalisationTests(unittest.TestCase):
         )
         self.assertEqual(nodes["JP2"]["route"], "direct")
         self.assertIsNone(nodes["JP2"]["host"])
+        self.assertNotIn("JP4", nodes)
+        self.assertNotIn("JP5", nodes)
+
+    def test_retired_nodes_cannot_be_resolved_or_registered(self):
+        with self.assertRaisesRegex(ValueError, "retired"):
+            proxy_nodes.require_proxy_node("JP4")
+        with self.assertRaisesRegex(ValueError, "retired"):
+            proxy_nodes.normalise_proxy_node(
+                "JP5",
+                {
+                    "name": "JP-TYO-05",
+                    "location": "Tokyo",
+                    "route": "tunnel",
+                    "host": "127.0.0.1",
+                    "port": 9115,
+                },
+            )
 
     def test_direct_route_requires_null_proxy_coordinates(self):
         with self.assertRaisesRegex(ValueError, "null host and port"):
@@ -190,6 +207,25 @@ class ProxyNodeRegistryTests(unittest.TestCase):
 
         self.assertEqual(set(nodes), set(proxy_nodes.BUILTIN_PROXY_NODES))
 
+    def test_local_registry_cannot_revive_a_retired_node(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_registry(directory, {
+                "version": 1,
+                "nodes": {
+                    "JP4": {
+                        "name": "JP-TYO-04",
+                        "location": "Tokyo",
+                        "route": "tunnel",
+                        "host": "127.0.0.1",
+                        "port": 9114,
+                    },
+                },
+            })
+
+            nodes = proxy_nodes.load_proxy_nodes(path)
+
+        self.assertNotIn("JP4", nodes)
+
     def test_registration_cli_writes_the_backend_schema_atomically(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "proxy_nodes.json"
@@ -316,6 +352,19 @@ class ProxyNodeBenchmarkCliTests(unittest.IsolatedAsyncioTestCase):
         benchmark.assert_awaited_once()
         self.assertIsNone(benchmark.await_args.kwargs["header_factory"])
         self.assertEqual(benchmark.await_args.kwargs["yes_asset_id"], "")
+
+    def test_cli_connectivity_benchmark_accepts_missing_account_id(self):
+        parsed = proxy_nodes_cli.build_parser().parse_args([
+            "benchmark",
+            "--region",
+            "AU",
+            "--samples",
+            "1",
+            "--node",
+            "JP2",
+        ])
+
+        self.assertIsNone(parsed.account_id)
 
     async def test_signed_path_exactly_matches_outgoing_book_url(self):
         account = {

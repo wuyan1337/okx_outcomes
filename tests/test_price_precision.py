@@ -1,5 +1,6 @@
 import asyncio
 from decimal import Decimal
+import inspect
 import json
 from types import SimpleNamespace
 import unittest
@@ -15,6 +16,7 @@ from backend.core.price_utils import (
 )
 from backend.services.manual_strategy_d import ManualStrategyD
 from backend.services.manual_strategy_s import ManualStrategyS
+from backend.services.auto_rebalance import AutoRebalance
 
 try:
     from backend import app as app_module
@@ -74,6 +76,26 @@ class ManualStrategyPriceTests(unittest.TestCase):
         self.assertEqual(sell_yes, Decimal("1.100"))
         self.assertEqual(sell_no, Decimal("99.900"))
 
+    def test_manual_d_no_exit_uses_the_executable_aligned_buy(self):
+        buy_yes, buy_no, sell_yes, sell_no = ManualStrategyD._derive_prices("3.9")
+        self.assertEqual(buy_yes, Decimal("3.900"))
+        self.assertEqual(buy_no, Decimal("95.00"))
+        self.assertEqual(sell_yes, Decimal("5.00"))
+        self.assertEqual(sell_no, Decimal("96.00"))
+
+    def test_rebalance_uses_the_same_manual_d_boundary_prices(self):
+        targets = AutoRebalance._target_prices(
+            Decimal("3.9"),
+            {
+                "strategy_type": "manual-d",
+                "yes_asset_id": "yes-asset",
+                "no_asset_id": "no-asset",
+            },
+        )
+        self.assertEqual(targets["asset_sells"]["yes-asset"], Decimal("5.00"))
+        self.assertEqual(targets["asset_sells"]["no-asset"], Decimal("96.00"))
+        self.assertIn("NO B95.00¢/S96.00¢", targets["display"])
+
     def test_manual_d_does_not_clear_rebalance_on_stop(self):
         strategy = ManualStrategyD(object(), account_id="unit-test-no-file")
         marker = object()
@@ -99,6 +121,11 @@ class ManualOrderAvailabilityTests(unittest.IsolatedAsyncioTestCase):
             self.available_size = available_size
             self.total_size = total_size
             self.placed = []
+            self._cloid = 0
+
+        def generate_client_order_id(self):
+            self._cloid += 1
+            return f"0x01{self._cloid:030x}"
 
         async def get_positions(self, status="open", market_id=None):
             return {
@@ -117,7 +144,29 @@ class ManualOrderAvailabilityTests(unittest.IsolatedAsyncioTestCase):
 
         async def place_order(self, **kwargs):
             self.placed.append(kwargs)
-            return {"code": "0"}
+            return {
+                "code": "0",
+                "_clientOrderId": kwargs["client_order_id"],
+            }
+
+        async def get_orders(self, status="open", market_id=None):
+            orders = []
+            if status == "open":
+                orders = [
+                    {
+                        "oid": f"order-{index}",
+                        "clientOrderId": order["client_order_id"],
+                        "marketId": "123",
+                        "assetId": order["asset_id"],
+                        "side": order["side"].upper(),
+                        "status": "ACTIVE",
+                        "price": order["price"],
+                        "size": order["size"],
+                        "filledSize": "0",
+                    }
+                    for index, order in enumerate(self.placed, start=1)
+                ]
+            return {"code": "0", "data": {"list": orders}}
 
     async def test_positions_expose_total_and_available_size(self):
         client = self.Client()
@@ -337,6 +386,59 @@ class ManualOrderAvailabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(client.placed), 1)
         self.assertTrue(client.placed[0]["reduce_only"])
 
+    async def test_manual_ioc_active_is_not_reported_success_before_terminal(self):
+        client = self.Client()
+        instance = SimpleNamespace(client=client)
+        manager = SimpleNamespace(get_instance=lambda _account_id: instance)
+        active = SimpleNamespace(
+            status="ACTIVE",
+            order_id="order-1",
+            filled_size=Decimal("0"),
+        )
+        cancelled = SimpleNamespace(
+            status="CANCELLED",
+            order_id="order-1",
+            filled_size=Decimal("0"),
+        )
+        confirmation = SimpleNamespace(
+            response={"code": "0"},
+            response_code="0",
+            observation=active,
+            unresolved=False,
+            rejected=False,
+        )
+
+        with (
+            mock.patch.object(app_module, "manager", manager),
+            mock.patch.object(
+                app_module,
+                "place_and_confirm",
+                new=mock.AsyncMock(return_value=confirmation),
+            ),
+            mock.patch.object(
+                app_module,
+                "wait_for_order",
+                new=mock.AsyncMock(return_value=cancelled),
+            ) as wait_for_order,
+        ):
+            response = await app_module.account_manual_place(
+                "account-a",
+                self.Request({
+                    "asset_id": "123100",
+                    "side": "BUY",
+                    "price": "1",
+                    "size": "100",
+                    "tif": "ioc",
+                }),
+                user="test",
+            )
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["order_status"], "CANCELLED")
+        wait_for_order.assert_awaited_once()
+
 
 @unittest.skipUnless(OPTIONAL_DEPS_AVAILABLE, "runtime dependencies are not installed")
 class AccountStatsTests(unittest.IsolatedAsyncioTestCase):
@@ -382,10 +484,18 @@ class AccountStatsTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(OPTIONAL_DEPS_AVAILABLE, "runtime dependencies are not installed")
 class MonitorPriceTests(unittest.TestCase):
-    def test_monitor_floors_bid_to_executable_tick(self):
-        self.assertEqual(PolyMonitor._risk_bid_price("0.5599"), Decimal("0.55"))
+    def test_monitor_rounds_bid_half_up_to_executable_tick(self):
+        self.assertEqual(PolyMonitor._risk_bid_price("0.5549"), Decimal("0.55"))
+        self.assertEqual(PolyMonitor._risk_bid_price("0.5550"), Decimal("0.56"))
+        self.assertEqual(PolyMonitor._risk_bid_price("0.5599"), Decimal("0.56"))
         self.assertEqual(PolyMonitor._risk_bid_price("0.5601"), Decimal("0.56"))
-        self.assertEqual(PolyMonitor._risk_bid_price("0.0399"), Decimal("0.039"))
+        self.assertEqual(PolyMonitor._risk_bid_price("0.0394"), Decimal("0.039"))
+        self.assertEqual(PolyMonitor._risk_bid_price("0.0395"), Decimal("0.040"))
+
+    def test_monitor_start_checks_use_the_same_half_up_mapping(self):
+        source = inspect.getsource(app_module)
+        self.assertNotIn("align_okx_price(poly_best_bid", source)
+        self.assertEqual(source.count("_risk_bid_price(poly_best_bid)"), 3)
 
 
 @unittest.skipUnless(OPTIONAL_DEPS_AVAILABLE, "runtime dependencies are not installed")

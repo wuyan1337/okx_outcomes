@@ -517,7 +517,7 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument(
         "--account-id",
         type=_account_id,
-        default="",
+        default=None,
         help="local account used to sign --yes-asset-id book probes",
     )
     benchmark.add_argument("--node", action="append", type=_stable_id, default=[])

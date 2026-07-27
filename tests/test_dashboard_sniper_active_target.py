@@ -206,11 +206,12 @@ function deferred(){{let resolve;let promise=new Promise((done)=>{{resolve=done;
   let loadOne=loadFullCfg(),loadTwo=loadFullCfg();
   assert.equal(requests[1][0],'/api/accounts/acct-a/config');
   assert.equal(requests[2][0],'/api/accounts/acct-a/config');
-  second.resolve({{ok:true,json:async()=>({{api_key:'new',secret_key:'s',passphrase:'p',agent_key:'g',region:'CN'}})}});
+  second.resolve({{ok:true,json:async()=>({{credentials_configured:{{api_key:true,secret_key:true,passphrase:true,agent_key:true}},region:'CN'}})}});
   await loadTwo;
   first.resolve({{ok:true,json:async()=>({{api_key:'old',region:'AU'}})}});
   await loadOne;
-  assert.equal(elements['cfg-ak'].value,'new');
+  assert.equal(elements['cfg-ak'].value,'');
+  assert(elements['cfg-ak'].placeholder.includes('Configured'));
   assert.equal(elements['cfg-region'].value,'CN');
 
   elements['cfg-ak'].value='key';elements['cfg-sk'].value='secret';

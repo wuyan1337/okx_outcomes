@@ -114,6 +114,40 @@ class SniperDatabaseTests(unittest.TestCase):
             self.assertEqual(restored["runtime"], runtime)
             self.assertTrue(restored["running"])
 
+    def test_sniper_old_snapshot_round_trip(self):
+        database = _load_database_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database.DB_PATH = Path(temp_dir) / "accounts.db"
+            database.init_db()
+            connection = database.get_db()
+            connection.execute(
+                """
+                INSERT INTO accounts
+                    (id, name, api_key, secret_key, passphrase,
+                     agent_private_key, proxy_node)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("account-old", "old", "a", "b", "c", "d", "JP2"),
+            )
+            connection.commit()
+            connection.close()
+
+            config = {"threshold_cents": 40, "timeout_secs": 120}
+            runtime = {
+                "status": "holding",
+                "holding_side": "yes",
+                "buy_client_order_id": "entry-1",
+                "buy_size": 5,
+            }
+            database.save_sniper_old_state(
+                "account-old", config, runtime, True
+            )
+
+            restored = database.get_sniper_old_state("account-old")
+            self.assertEqual(restored["config"], config)
+            self.assertEqual(restored["runtime"], runtime)
+            self.assertTrue(restored["running"])
+
 
 class ClientPaginationTests(unittest.IsolatedAsyncioTestCase):
     async def test_order_list_uses_documented_limit_and_cursor(self):

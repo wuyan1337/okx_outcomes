@@ -34,20 +34,131 @@ class PositionAndOrderClient:
     def __init__(self, positions=None, orders=None):
         self.positions = positions or []
         self.orders = orders or []
+        self.open_orders = []
         self.place_calls = []
+        self._cloid = 0
 
     async def get_positions(self, status="open", market_id=None):
         return {"code": "0", "data": {"list": list(self.positions)}}
 
     async def get_orders(self, status="closed", market_id=None):
-        return {"code": "0", "data": {"list": list(self.orders)}}
+        selected = self.open_orders if status == "open" else self.orders
+        return {"code": "0", "data": {"list": list(selected)}}
+
+    def generate_client_order_id(self):
+        self._cloid += 1
+        return f"0x00{self._cloid:030x}"
 
     async def place_order(self, **kwargs):
         self.place_calls.append(kwargs)
-        return {"code": "0", "data": {"oid": f"sell-{len(self.place_calls)}"}}
+        oid = f"sell-{len(self.place_calls)}"
+        self.open_orders.append(
+            {
+                "oid": oid,
+                "clientOrderId": kwargs["client_order_id"],
+                "assetId": kwargs["asset_id"],
+                "side": "SELL",
+                "status": "ACTIVE",
+            }
+        )
+        return {
+            "code": "0",
+            "data": {"oid": oid},
+            "_clientOrderId": kwargs["client_order_id"],
+        }
 
 
 class RebalanceLayerTests(unittest.IsolatedAsyncioTestCase):
+    def test_position_outcome_requires_known_matching_index_and_name(self):
+        self.assertEqual(
+            AutoRebalance._position_asset_id(
+                {"marketId": "42", "tokenIndex": "1", "tokenName": "YES"}
+            ),
+            "42000",
+        )
+        self.assertEqual(
+            AutoRebalance._position_asset_id(
+                {"marketId": "42", "tokenIndex": "2", "tokenName": "NO"}
+            ),
+            "42100",
+        )
+        invalid = (
+            {},
+            {"marketId": "42"},
+            {"marketId": "42", "tokenIndex": "1"},
+            {"marketId": "42", "tokenName": "YES"},
+            {"marketId": "42", "tokenIndex": "3", "tokenName": "YES"},
+            {"marketId": "42", "tokenIndex": "1", "tokenName": "MAYBE"},
+            {"marketId": "42", "tokenIndex": "1", "tokenName": "NO"},
+            {"marketId": "42", "tokenIndex": "2", "tokenName": "YES"},
+        )
+        for position in invalid:
+            with self.subTest(position=position), self.assertRaises(ValueError):
+                AutoRebalance._position_asset_id(position)
+
+    async def test_position_reconciliation_fails_closed_on_invalid_outcome(self):
+        client = PositionAndOrderClient(
+            positions=[
+                {
+                    "marketId": "market-1",
+                    "tokenIndex": "1",
+                    "tokenName": "NO",
+                    "size": "3",
+                }
+            ]
+        )
+        rebalance = AutoRebalance(client, "invalid-outcome-no-file")
+        params = single_params(asset_id="market-1000", asset_cost_cents={"market-1000": Decimal("55")})
+        assets = rebalance._active_assets(params)
+
+        with self.assertRaisesRegex(ValueError, "conflicting position outcome"):
+            await rebalance._fetch_position_sizes(params, assets)
+
+    async def test_flat_recovery_fails_closed_on_invalid_position_outcome(self):
+        client = PositionAndOrderClient(
+            positions=[{"marketId": "market-1", "size": "0"}]
+        )
+        rebalance = AutoRebalance(client, "invalid-flat-outcome-no-file")
+
+        with self.assertRaisesRegex(RuntimeError, "outcome or size is invalid"):
+            await rebalance._verify_account_flat()
+
+    def test_cost_layer_write_failure_rolls_back_memory(self):
+        rebalance = AutoRebalance(object(), "layer-write-failure-no-file")
+        rebalance.cost_layers = {}
+        rebalance._save_layers = unittest.mock.MagicMock(return_value=False)
+
+        with self.assertRaisesRegex(RuntimeError, "persistence failed"):
+            rebalance.add_to_layer(
+                "yes-asset", Decimal("55"), 3, market_id="market-1"
+            )
+
+        self.assertEqual(rebalance.cost_layers, {})
+
+    def test_recovery_journal_survives_reload_and_blocks_enable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.json"
+            rebalance = AutoRebalance(object(), "recovery-reload-source")
+            rebalance._layers_file = path
+            self.assertTrue(
+                rebalance.prepare_recovery(
+                    rebalance_id="rb-persisted",
+                    stage="cancel_open_orders",
+                    context={"old_price_cents": "55"},
+                    strategy_params=single_params(),
+                )
+            )
+
+            restored = AutoRebalance(object(), "recovery-reload-target")
+            restored._layers_file = path
+            restored._load_layers()
+
+            self.assertTrue(restored.recovery_required)
+            self.assertEqual(
+                restored.recovery_status()["rebalance_id"], "rb-persisted"
+            )
+            self.assertFalse(restored.set_enabled(True))
+
     def test_same_price_layers_do_not_cross_market_or_asset(self):
         rebalance = AutoRebalance(object(), "scope-no-file")
         rebalance.cost_layers = {}
@@ -124,12 +235,14 @@ class RebalanceLayerTests(unittest.IsolatedAsyncioTestCase):
                 "tokenId": "0x-not-an-okx-asset-id",
                 "marketId": "42",
                 "tokenIndex": "1",
+                "tokenName": "YES",
                 "size": "5",
             },
             {
                 "tokenId": "0x-also-not-an-okx-asset-id",
                 "marketId": "42",
                 "tokenIndex": "2",
+                "tokenName": "NO",
                 "size": "6",
             },
         ])
@@ -182,6 +295,136 @@ class RebalanceLayerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RebalanceFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_destructive_stage_persists_before_and_after_operation(self):
+        rebalance = AutoRebalance(object(), "stage-journal-no-file")
+        events = []
+
+        def persist(**kwargs):
+            events.append(("persist", kwargs["phase"]))
+            return True
+
+        async def operation():
+            events.append(("operation",))
+            return {"ok": True}
+
+        rebalance.prepare_recovery = persist
+        result = await rebalance._run_stage(
+            "rb-stage",
+            "cancel_open_orders",
+            operation,
+            destructive=True,
+            strategy_params=single_params(),
+        )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(
+            events,
+            [("persist", "before"), ("operation",), ("persist", "after")],
+        )
+
+    async def test_recovery_repairs_protection_without_restarting_entry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rebalance = AutoRebalance(object(), "recover-interface-no-file")
+            rebalance._layers_file = Path(temp_dir) / "state.json"
+            params = single_params()
+            self.assertTrue(
+                rebalance.prepare_recovery(
+                    rebalance_id="rb-recover",
+                    stage="monitor_cancel_all",
+                    context={"old_price_cents": "55"},
+                    strategy_params=params,
+                )
+            )
+            rebalance.stop_strategy = AsyncMock(return_value=True)
+            rebalance.stop_monitor = AsyncMock()
+            rebalance.restart_strategy = AsyncMock()
+            rebalance.restart_monitor = AsyncMock()
+            rebalance._cancel_all_verified = AsyncMock(return_value={"ok": True})
+            rebalance._capture_partial_fills = AsyncMock()
+            rebalance._reconcile_with_positions = AsyncMock()
+            rebalance._sync_positions = AsyncMock()
+            rebalance._post_layer_sells = AsyncMock(return_value=1)
+
+            result = await rebalance.recover()
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(rebalance.recovery_required)
+            rebalance.stop_strategy.assert_awaited_once_with()
+            rebalance.stop_monitor.assert_awaited_once_with()
+            rebalance.restart_strategy.assert_not_awaited()
+            rebalance.restart_monitor.assert_not_awaited()
+
+    async def test_recovery_does_not_cancel_when_manual_stop_is_unsafe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rebalance = AutoRebalance(object(), "recover-unsafe-stop-no-file")
+            rebalance._layers_file = Path(temp_dir) / "state.json"
+            self.assertTrue(
+                rebalance.prepare_recovery(
+                    rebalance_id="rb-unsafe-stop",
+                    stage="monitor_strategy_stop",
+                    context={"old_price_cents": "55"},
+                    strategy_params=single_params(),
+                )
+            )
+            rebalance.stop_strategy = AsyncMock(return_value=False)
+            rebalance.stop_monitor = AsyncMock()
+            rebalance._cancel_all_verified = AsyncMock(return_value={"ok": True})
+
+            result = await rebalance.recover()
+
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["recovery_required"])
+            self.assertIn("not safely confirmed", result["error"])
+            rebalance._cancel_all_verified.assert_not_awaited()
+            rebalance.stop_monitor.assert_not_awaited()
+
+    async def test_protective_sell_rejects_unsafe_terminal_statuses(self):
+        class Client:
+            def __init__(self, status):
+                self.status = status
+                self.client_order_id = "0x00000000000000000000000000000001"
+
+            def generate_client_order_id(self):
+                return self.client_order_id
+
+            async def place_order(self, **kwargs):
+                return {
+                    "code": "0",
+                    "_clientOrderId": kwargs["client_order_id"],
+                }
+
+            async def get_orders(self, status="open", market_id=None):
+                orders = []
+                if status == "closed":
+                    orders = [
+                        {
+                            "clientOrderId": self.client_order_id,
+                            "assetId": "yes-asset",
+                            "status": self.status,
+                        }
+                    ]
+                return {"code": "0", "data": {"list": orders}}
+
+        for unsafe_status in (
+            "PARTIALLY_FILLED",
+            "FAILED",
+            "CANCELLED",
+            "EXPIRED",
+        ):
+            with self.subTest(status=unsafe_status):
+                rebalance = AutoRebalance(
+                    Client(unsafe_status), f"protective-{unsafe_status}-no-file"
+                )
+                rebalance.cost_layers = {
+                    "market-1": {"yes-asset": {Decimal("55"): 2.0}}
+                }
+                with self.assertRaisesRegex(RuntimeError, unsafe_status):
+                    await rebalance._post_layer_sells(
+                        single_params(),
+                        rebalance._active_assets(single_params()),
+                        {"yes-asset": Decimal("56")},
+                    )
+
     async def test_manual_d_full_flow_reposts_both_assets(self):
         client = PositionAndOrderClient(positions=[
             {"assetId": "yes-asset", "size": "10"},
@@ -244,8 +487,42 @@ class RebalanceFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(rebalance.rebalancing)
         self.assertEqual(events, ["strategy", "monitor"])
 
+    async def test_cancel_records_false_strategy_stop_and_keeps_recovery(self):
+        rebalance = AutoRebalance(object(), "cancel-unsafe-stop-no-file")
+        rebalance._save_layers = lambda: True
+        rebalance._rebalancing = True
+        rebalance._active_rebalance_id = "rebalance-cancel"
+        rebalance._active_stage = "restart_monitor_and_strategy"
+        rebalance._recovery = {
+            **rebalance._empty_recovery(),
+            "required": True,
+            "rebalance_id": "rebalance-cancel",
+            "stage": "restart_monitor_and_strategy",
+            "phase": "before",
+        }
+        rebalance.stop_strategy = AsyncMock(return_value=False)
+        rebalance.stop_monitor = AsyncMock()
+
+        with patch.object(rebalance, "_audit") as audit:
+            result = await rebalance.cancel()
+
+        self.assertFalse(result)
+        self.assertTrue(rebalance.recovery_required)
+        self.assertEqual(rebalance._recovery["phase"], "cleanup_failed")
+        failure = next(
+            call for call in audit.call_args_list
+            if call.args and call.args[0] == "cancel_cleanup_failed"
+        )
+        self.assertEqual(failure.kwargs["component"], "strategy")
+        completed = next(
+            call for call in audit.call_args_list
+            if call.args and call.args[0] == "cancel_completed"
+        )
+        self.assertFalse(completed.kwargs["cleanup_ok"])
+
     async def test_same_price_still_syncs_and_reposts_before_restart(self):
         rebalance = AutoRebalance(object(), "same-price-no-file")
+        rebalance._save_layers = lambda: None
         params = single_params()
         rebalance.get_strategy_params = lambda: params
         calls = []
@@ -277,6 +554,7 @@ class RebalanceFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bid_sell_stable_poly_bid_floors_then_becomes_sell_level(self):
         rebalance = AutoRebalance(object(), "bid-sell-floor-no-file")
+        rebalance._save_layers = lambda: None
         params = single_params(
             mode="bid-sell",
             price_cents=Decimal("54"),
@@ -358,6 +636,40 @@ class RebalanceFlowTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(calls, ["monitor", "strategy", "stop-monitor"])
 
+    async def test_strategy_restart_failure_records_false_strategy_cleanup(self):
+        rebalance = AutoRebalance(object(), "strategy-restart-unsafe-stop-no-file")
+        rebalance._recovery = {
+            **rebalance._empty_recovery(),
+            "required": True,
+            "rebalance_id": "rebalance-strategy-restart",
+            "stage": "restart_monitor_and_strategy",
+            "phase": "before",
+        }
+        rebalance.restart_monitor = AsyncMock(return_value={"ok": True})
+        rebalance.restart_strategy = AsyncMock(
+            side_effect=RuntimeError("strategy refused")
+        )
+        rebalance.stop_strategy = AsyncMock(return_value=False)
+        rebalance.stop_monitor = AsyncMock()
+
+        with (
+            patch.object(rebalance, "_audit") as audit,
+            self.assertRaisesRegex(RuntimeError, "strategy refused"),
+        ):
+            await rebalance._restart(
+                Decimal("55"), "poly", Decimal("0.55"), "manual-s"
+            )
+
+        self.assertTrue(rebalance.recovery_required)
+        failure = next(
+            call for call in audit.call_args_list
+            if call.args and call.args[0] == "restart_cleanup_failed"
+        )
+        self.assertEqual(failure.kwargs["component"], "strategy")
+        self.assertEqual(
+            failure.kwargs["cleanup_context"], "strategy restart error"
+        )
+
     async def test_monitor_restart_failure_never_starts_strategy(self):
         rebalance = AutoRebalance(object(), "monitor-fail-no-file")
         strategy = AsyncMock(return_value={"ok": True})
@@ -372,8 +684,71 @@ class RebalanceFlowTests(unittest.IsolatedAsyncioTestCase):
             )
         strategy.assert_not_awaited()
 
+    async def test_monitor_restart_failure_records_false_strategy_cleanup(self):
+        rebalance = AutoRebalance(object(), "monitor-restart-unsafe-stop-no-file")
+        rebalance._recovery = {
+            **rebalance._empty_recovery(),
+            "required": True,
+            "rebalance_id": "rebalance-monitor-restart",
+            "stage": "restart_monitor_and_strategy",
+            "phase": "before",
+        }
+        rebalance.restart_strategy = AsyncMock(return_value={"ok": True})
+        rebalance.restart_monitor = AsyncMock(
+            return_value={"ok": False, "error": "monitor unavailable"}
+        )
+        rebalance.stop_strategy = AsyncMock(return_value=False)
+        rebalance.stop_monitor = AsyncMock()
+
+        with (
+            patch.object(rebalance, "_audit") as audit,
+            self.assertRaisesRegex(RuntimeError, "monitor unavailable"),
+        ):
+            await rebalance._restart(
+                Decimal("55"), "poly", Decimal("0.55"), "manual-s"
+            )
+
+        self.assertTrue(rebalance.recovery_required)
+        failure = next(
+            call for call in audit.call_args_list
+            if call.args and call.args[0] == "restart_cleanup_failed"
+        )
+        self.assertEqual(failure.kwargs["component"], "strategy")
+        self.assertEqual(
+            failure.kwargs["cleanup_context"], "monitor restart error"
+        )
+
+    async def test_journal_failure_cleanup_records_false_strategy_stop(self):
+        rebalance = AutoRebalance(object(), "journal-cleanup-unsafe-stop-no-file")
+        rebalance._save_layers = lambda: True
+        rebalance._active_rebalance_id = "rebalance-journal"
+        rebalance._active_stage = "restart_monitor_and_strategy"
+        rebalance._recovery = {
+            **rebalance._empty_recovery(),
+            "required": True,
+            "rebalance_id": "rebalance-journal",
+            "stage": "restart_monitor_and_strategy",
+            "phase": "before",
+        }
+        rebalance.stop_strategy = AsyncMock(return_value=False)
+        rebalance.stop_monitor = AsyncMock()
+
+        with patch.object(rebalance, "_audit") as audit:
+            result = await rebalance._stop_restarted_components()
+
+        self.assertFalse(result)
+        self.assertTrue(rebalance.recovery_required)
+        self.assertEqual(rebalance._recovery["phase"], "cleanup_failed")
+        failure = next(
+            call for call in audit.call_args_list
+            if call.args
+            and call.args[0] == "restart_persistence_cleanup_failed"
+        )
+        self.assertEqual(failure.kwargs["component"], "strategy")
+
     async def test_protective_sell_failure_prevents_restart_and_success(self):
         rebalance = AutoRebalance(object(), "sell-fail-flow-no-file")
+        rebalance._save_layers = lambda: None
         params = single_params()
         rebalance.get_strategy_params = lambda: params
         notices = []
@@ -436,13 +811,44 @@ class MonitorCancellationTests(unittest.IsolatedAsyncioTestCase):
         monitor._strategy_type = "manual-s"
         monitor._old_price_cents = Decimal("55")
         monitor._fast_cancel_all = AsyncMock(return_value={"ok": False})
-        monitor.on_trigger_callback = AsyncMock()
-        auto = SimpleNamespace(enabled=True, execute=AsyncMock())
+        monitor.on_trigger_callback = AsyncMock(return_value=True)
+        auto = SimpleNamespace(
+            enabled=True,
+            execute=AsyncMock(),
+            prepare_recovery=unittest.mock.MagicMock(return_value=True),
+            get_strategy_params=lambda: single_params(),
+        )
         monitor.auto_rebalance = auto
 
         await monitor._trigger("risk")
 
+        monitor._fast_cancel_all.assert_awaited_once_with()
         auto.execute.assert_not_awaited()
+
+    async def test_account_stop_all_strategies_requires_both_strict_true(self):
+        instance = AccountInstance.__new__(AccountInstance)
+        instance.account_id = "strict-stop"
+        instance.strategy_d = SimpleNamespace(stop=AsyncMock(return_value=True))
+        instance.strategy_s = SimpleNamespace(stop=AsyncMock(return_value=False))
+
+        result = await instance._stop_all_strategies()
+
+        self.assertFalse(result)
+        instance.strategy_d.stop.assert_awaited_once_with()
+        instance.strategy_s.stop.assert_awaited_once_with()
+
+    async def test_account_stop_all_strategies_attempts_both_after_exception(self):
+        instance = AccountInstance.__new__(AccountInstance)
+        instance.account_id = "strict-stop-error"
+        instance.strategy_d = SimpleNamespace(
+            stop=AsyncMock(side_effect=RuntimeError("stop failed"))
+        )
+        instance.strategy_s = SimpleNamespace(stop=AsyncMock(return_value=True))
+
+        result = await instance._stop_all_strategies()
+
+        self.assertFalse(result)
+        instance.strategy_s.stop.assert_awaited_once_with()
 
 
 class AccountRestartTests(unittest.IsolatedAsyncioTestCase):
@@ -553,6 +959,9 @@ class AccountRestartTests(unittest.IsolatedAsyncioTestCase):
                 self.state.price_a = float(kwargs["price_a"])
                 self.state.sell_price = float(kwargs["sell_price"])
 
+            def release_entry_barrier(self):
+                return self.running
+
         class Monitor:
             def __init__(self):
                 self._strategy_type = "manual-s"
@@ -591,10 +1000,82 @@ class AccountRestartTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             Decimal(instance.strategy_s.start_kwargs["sell_price"]), Decimal("1.1")
         )
+        self.assertTrue(instance.strategy_s.start_kwargs["defer_entry"])
         self.assertEqual(instance.poly_monitor.start_kwargs["depth_threshold"], 4321.0)
         # Poly 55.10¢ is a bid: floor to the 55¢ OKX tick, then use that
         # resulting level as Bid-Sell's SELL monitor reference.
         self.assertEqual(instance.poly_monitor.context[0][1], Decimal("55.00"))
+
+    async def test_manual_restart_refuses_persisted_deployment_lock(self):
+        strategy = SimpleNamespace(
+            running=False,
+            state=SimpleNamespace(
+                running=False,
+                deployment_blocked=True,
+                block_reason="owned order state is unknown",
+            ),
+            start=AsyncMock(),
+        )
+        instance = AccountInstance.__new__(AccountInstance)
+        instance.strategy_s = strategy
+        instance.strategy_d = SimpleNamespace(
+            running=False,
+            state=SimpleNamespace(running=False, start_time=0, yes_asset_id=""),
+        )
+        instance.poly_monitor = SimpleNamespace(_strategy_type="manual-s")
+        instance.auto_rebalance = AutoRebalance(
+            object(), "restart-blocked-no-file"
+        )
+        instance._get_strategy_params = lambda: single_params()
+
+        with self.assertRaisesRegex(
+            RuntimeError, "owned order state is unknown"
+        ):
+            await instance._restart_strategy(Decimal("55"), "manual-s")
+
+        strategy.start.assert_not_awaited()
+
+    async def test_manual_restart_does_not_release_entry_when_start_blocks(self):
+        barrier = unittest.mock.MagicMock(return_value=True)
+
+        async def start(**_kwargs):
+            strategy.running = True
+            strategy.state.running = True
+            strategy.state.deployment_blocked = True
+            strategy.state.block_reason = "startup reconciliation failed"
+
+        strategy = SimpleNamespace(
+            running=False,
+            state=SimpleNamespace(
+                running=False,
+                deployment_blocked=False,
+                block_reason="",
+                position_pct=100,
+                scan_interval=0.3,
+                stabilize_secs=10,
+                mode="classic",
+            ),
+            start=start,
+            release_entry_barrier=barrier,
+        )
+        instance = AccountInstance.__new__(AccountInstance)
+        instance.strategy_s = strategy
+        instance.strategy_d = SimpleNamespace(
+            running=False,
+            state=SimpleNamespace(running=False, start_time=0, yes_asset_id=""),
+        )
+        instance.poly_monitor = SimpleNamespace(_strategy_type="manual-s")
+        instance.auto_rebalance = AutoRebalance(
+            object(), "restart-startup-block-no-file"
+        )
+        instance._get_strategy_params = lambda: single_params()
+
+        with self.assertRaisesRegex(
+            RuntimeError, "startup reconciliation failed"
+        ):
+            await instance._restart_strategy(Decimal("55"), "manual-s")
+
+        barrier.assert_not_called()
 
 
 if __name__ == "__main__":

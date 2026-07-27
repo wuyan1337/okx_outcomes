@@ -12,8 +12,8 @@ import aiohttp
 from aiohttp_socks import ProxyConnector
 
 from .auth import OKXAuth, OKXSigner
-from .database import PROXY_NODES
 from .logging_config import audit_event
+from .proxy_nodes import require_proxy_node
 
 logger = logging.getLogger(__name__)
 
@@ -35,15 +35,16 @@ class OKXOutcomesClient:
         self.signer = OKXSigner(agent_private_key)
         self._session: Optional[aiohttp.ClientSession] = None
         self._proxy_node = proxy_node
+        require_proxy_node(self._proxy_node)
         self.last_heartbeat: Optional[str] = None
         # Region for clientOrderId: 0=CN(www.okx.com), 1=AU(us.okx.com)
         self._region = 1 if 'us.okx.com' in base_url else 0
 
     def _get_connector(self):
         """Create a SOCKS5 connector if proxy_node is configured."""
-        if not self._proxy_node or self._proxy_node not in PROXY_NODES:
+        node = require_proxy_node(self._proxy_node)
+        if node is None:
             return None
-        node = PROXY_NODES[self._proxy_node]
         if node["host"] is None:
             return None
         proxy_url = f"socks5://{node['host']}:{node['port']}"

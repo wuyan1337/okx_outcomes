@@ -24,7 +24,7 @@ import aiohttp
 from aiohttp_socks import ProxyConnector
 
 from ..core.logging_config import audit_event, log_context, market_event
-from ..core.proxy_nodes import PROXY_NODES
+from ..core.proxy_nodes import PROXY_NODES, require_proxy_node
 from .size_utils import normalize_buy_size_str, normalize_size_str
 
 logger = logging.getLogger(__name__)
@@ -931,8 +931,8 @@ class PolySniper:
 
         connector = None
         proxy_node = str(getattr(self.client, "_proxy_node", "") or "")
-        node = PROXY_NODES.get(proxy_node, {})
-        if node.get("host") is not None:
+        node = require_proxy_node(proxy_node)
+        if node is not None and node.get("host") is not None:
             connector = ProxyConnector.from_url(
                 f"socks5://{node['host']}:{node['port']}"
             )
@@ -1832,7 +1832,7 @@ class PolySniper:
                     f"Entry rejected: {response.get('message', response.get('msg', ''))}",
                     logging.WARNING,
                 )
-                if str(response.get("code", "")).upper() in {"TIMEOUT", "ERROR"}:
+                if response_code.upper() in UNACKNOWLEDGED_RESPONSE_CODES:
                     await self._cancel_strategy_order(target.asset_id, client_oid)
                     filled_size, filled_amount, entry_final = await self._wait_order_final(
                         client_oid, target.asset_id, "BUY"
@@ -2261,7 +2261,7 @@ class PolySniper:
                         f"Exit attempt {attempt + 1} rejected: {response.get('msg', '')}",
                         logging.WARNING,
                     )
-                    if str(response.get("code", "")).upper() in {"TIMEOUT", "ERROR"}:
+                    if str(response.get("code", "")).upper() in UNACKNOWLEDGED_RESPONSE_CODES:
                         filled, _, final = await self._wait_order_final(
                             client_oid, target.asset_id, "SELL"
                         )

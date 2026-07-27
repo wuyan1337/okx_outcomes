@@ -21,14 +21,14 @@ ROUTE_LABELS = {
     "socks5": "SOCKS5",
     "tunnel": "SSH tunnel",
 }
+RETIRED_PROXY_NODE_IDS = frozenset({"JP4", "JP5"})
 
-# IDs are persistent database values.  Do not rename them when changing labels.
+# Active IDs are persistent database values.  Do not rename them when changing labels.
+# Retired IDs stay reserved so an old local registry cannot silently revive them.
 BUILTIN_PROXY_NODES = {
     "JP1": {"name": "JP-TYO-01", "location": "Tokyo", "route": "socks5", "host": "168.138.196.214", "port": 9111},
     "JP2": {"name": "JP-TYO-02", "location": "Tokyo", "route": "direct", "host": None, "port": None},
     "JP3": {"name": "JP-TYO-03", "location": "Tokyo", "route": "socks5", "host": "3.112.202.198", "port": 9111},
-    "JP4": {"name": "JP-TYO-04", "location": "Tokyo", "route": "tunnel", "host": "127.0.0.1", "port": 9114},
-    "JP5": {"name": "JP-TYO-05", "location": "Tokyo", "route": "tunnel", "host": "127.0.0.1", "port": 9115},
     "OSAKA": {"name": "JP-OSA-01", "location": "Osaka", "route": "socks5", "host": "217.142.250.144", "port": 9111},
     "SG1": {"name": "SG-SIN-01", "location": "Singapore", "route": "socks5", "host": "13.213.17.198", "port": 9111},
     "K1": {"name": "KR-SEL-01", "location": "Seoul", "route": "socks5", "host": "13.125.182.63", "port": 9111},
@@ -48,6 +48,8 @@ def normalise_proxy_node(node_id: str, raw: Mapping) -> dict:
     node_id = str(node_id or "").strip().upper()
     if not NODE_ID_PATTERN.fullmatch(node_id):
         raise ValueError("node id must use 1-32 uppercase letters, digits, '_' or '-'")
+    if node_id in RETIRED_PROXY_NODE_IDS:
+        raise ValueError(f"proxy node {node_id} is retired and cannot be registered")
     if not isinstance(raw, Mapping):
         raise ValueError("node definition must be an object")
     unknown_fields = sorted(
@@ -101,6 +103,20 @@ def normalise_proxy_node(node_id: str, raw: Mapping) -> dict:
         "port": port,
     }
     node["label"] = canonical_proxy_label(node_id, node)
+    return node
+
+
+def require_proxy_node(node_id: Optional[str]) -> Optional[dict]:
+    """Resolve a configured route and refuse unknown/retired Direct fallback."""
+    if not node_id:
+        return None
+    key = str(node_id).strip()
+    node = PROXY_NODES.get(key)
+    if node is None:
+        status = "retired" if key.upper() in RETIRED_PROXY_NODE_IDS else "unknown"
+        raise ValueError(
+            f"Proxy node {key!r} is {status}; refusing automatic Direct fallback"
+        )
     return node
 
 

@@ -360,13 +360,21 @@ class _JsonLineFormatter(logging.Formatter):
 
 
 class _NonBlockingQueueHandler(logging.handlers.QueueHandler):
-    """Queue handler that never waits on disk and records bounded-queue loss."""
+    """Queue handler with loss accounting and an audit-only disk fallback."""
 
-    def __init__(self, record_queue: queue.Queue[logging.LogRecord], channel: str):
+    def __init__(
+        self,
+        record_queue: queue.Queue[logging.LogRecord],
+        channel: str,
+        synchronous_fallback_handlers: tuple[logging.Handler, ...] = (),
+    ):
         super().__init__(record_queue)
         self.channel = channel
+        self.synchronous_fallback_handlers = synchronous_fallback_handlers
         self.accepting = True
         self.dropped_records = 0
+        self.synchronous_fallback_records = 0
+        self.synchronous_fallback_failures = 0
         self._unreported_drops = 0
         self._last_warning_ns = 0
         self._drop_lock = threading.Lock()
@@ -390,7 +398,48 @@ class _NonBlockingQueueHandler(logging.handlers.QueueHandler):
                 if unreported:
                     self._unreported_drops -= unreported
         except queue.Full:
+            if self._synchronous_fallback(record):
+                return
             self._record_drop()
+
+    def _synchronous_fallback(self, record: logging.LogRecord) -> bool:
+        """Persist an audit record inline when its queue is saturated.
+
+        Market-data and general logging intentionally remain non-blocking and
+        may be dropped with counters.  Audit records describe order and risk
+        decisions, so silently losing them is less safe than briefly blocking
+        the caller on the exceptional queue-full path.
+        """
+
+        if not self.synchronous_fallback_handlers:
+            return False
+        payload = getattr(record, "structured_payload", None)
+        if isinstance(payload, dict):
+            payload["queue_delivery"] = "synchronous_fallback"
+        eligible = [
+            handler
+            for handler in self.synchronous_fallback_handlers
+            if record.levelno >= handler.level
+        ]
+        if not eligible:
+            return False
+        try:
+            for handler in eligible:
+                handler.handle(record)
+        except Exception:
+            with self._drop_lock:
+                self.synchronous_fallback_failures += 1
+            try:
+                sys.stderr.write(
+                    "logging synchronous fallback failed: "
+                    f"channel={self.channel}\n"
+                )
+            except Exception:
+                pass
+            return False
+        with self._drop_lock:
+            self.synchronous_fallback_records += 1
+        return True
 
     def _record_drop(self) -> None:
         now_ns = time.monotonic_ns()
@@ -614,9 +663,15 @@ def _new_channel(
     name: str,
     size: int,
     handlers: tuple[logging.Handler, ...],
+    *,
+    synchronous_fallback: bool = False,
 ) -> _ChannelRuntime:
     record_queue: queue.Queue[logging.LogRecord] = queue.Queue(maxsize=size)
-    queue_handler = _NonBlockingQueueHandler(record_queue, name)
+    queue_handler = _NonBlockingQueueHandler(
+        record_queue,
+        name,
+        handlers if synchronous_fallback else (),
+    )
     queue_handler.setLevel(logging.DEBUG)
     listener = _BlockingStopQueueListener(
         record_queue, *handlers, respect_handler_level=True
@@ -711,6 +766,7 @@ def configure_logging(
                     "audit",
                     settings.queue_sizes["audit"],
                     (audit_handler, error_handler),
+                    synchronous_fallback=True,
                 ),
                 _new_channel(
                     "market", settings.queue_sizes["market"], (market_handler,)
@@ -924,6 +980,12 @@ def get_logging_status() -> dict[str, Any]:
                     "capacity": channel.record_queue.maxsize,
                     "dropped_records": channel.queue_handler.dropped_records,
                     "unreported_drops": channel.queue_handler._unreported_drops,
+                    "synchronous_fallback_records": (
+                        channel.queue_handler.synchronous_fallback_records
+                    ),
+                    "synchronous_fallback_failures": (
+                        channel.queue_handler.synchronous_fallback_failures
+                    ),
                 }
                 for channel in runtime.channels
             },

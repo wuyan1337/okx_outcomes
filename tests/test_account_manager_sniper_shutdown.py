@@ -98,6 +98,70 @@ class FakeClient:
 
 
 class AccountManagerSniperShutdownTests(unittest.IsolatedAsyncioTestCase):
+    async def test_running_sniper_resumes_only_after_account_reconciliation(self):
+        events = []
+
+        class Sniper:
+            state = SimpleNamespace(status="stopped", locked=False)
+
+            async def restore(self, _state, resume=False):
+                events.append("restore_resume" if resume else "restore_stopped")
+                return {
+                    "ok": True,
+                    "resumed": bool(resume),
+                    "needs_reconciliation": False,
+                }
+
+        async def reconcile(startup=False):
+            events.append("account_reconcile")
+            return {"ok": True, "locked": False}
+
+        def start_heartbeat():
+            events.append("heartbeat")
+
+        instance = SimpleNamespace(
+            sniper=Sniper(),
+            recovery_locked=False,
+            recovery_reason="",
+            _sniper_snapshot_corrupt=False,
+            _sniper_snapshot_write_blocked=False,
+            _persist_sniper_snapshot=MagicMock(return_value=True),
+            reconcile_account_safety=reconcile,
+            start_account_heartbeat=start_heartbeat,
+            _activate_recovery_lock=MagicMock(),
+        )
+        account = {
+            "id": "account-a",
+            "name": "Account A",
+            "api_key": "api",
+            "secret_key": "secret",
+            "passphrase": "pass",
+            "agent_private_key": "1" * 64,
+            "base_url": "https://us.okx.com",
+            "proxy_node": "JP2",
+        }
+        snapshot = {
+            "config": {"targets": [{"id": "target-a"}]},
+            "runtime": {"locked": False},
+            "running": True,
+            "corrupt": False,
+        }
+        manager = account_manager.AccountManager()
+
+        with (
+            patch.object(account_manager, "get_account_decrypted", return_value=account),
+            patch.object(account_manager, "get_sniper_state", return_value=snapshot),
+            patch.object(account_manager, "OKXOutcomesClient"),
+            patch.object(account_manager, "AccountInstance", return_value=instance),
+        ):
+            loaded = await manager._load_account("account-a")
+
+        self.assertIs(loaded, instance)
+        self.assertEqual(
+            events,
+            ["restore_stopped", "account_reconcile", "restore_resume", "heartbeat"],
+        )
+
     def test_snapshot_callback_reports_database_failure(self):
         instance = account_manager.AccountInstance.__new__(account_manager.AccountInstance)
         instance.account_id = "account-a"
@@ -239,6 +303,19 @@ class AccountManagerSniperShutdownTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[0], "account-a")
         self.assertTrue(args[2]["running"])
         self.assertTrue(args[3])
+
+    async def test_remove_account_does_not_cancel_all_after_verified_flat(self):
+        manager = account_manager.AccountManager()
+        instance = SimpleNamespace(close=AsyncMock())
+        manager.instances["account-a"] = instance
+
+        with patch.object(account_manager, "delete_account") as delete:
+            result = await manager.remove_account("account-a")
+
+        self.assertTrue(result)
+        instance.close.assert_awaited_once_with(cancel_orders=False)
+        delete.assert_called_once_with("account-a")
+        self.assertNotIn("account-a", manager.instances)
 
 
 if __name__ == "__main__":

@@ -72,6 +72,156 @@ def idle_instance(client):
 
 
 class AccountConfigSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_account_reconcile_repairs_rebalance_journal_first(self):
+        class RecoverableRebalance:
+            def __init__(self):
+                self.recovery_required = True
+                self._rebalancing = False
+                self.called = 0
+
+            async def recover(self):
+                self.called += 1
+                self.recovery_required = False
+                return {"ok": True, "recovery_required": False}
+
+        instance = idle_instance(FlatClient())
+        instance.auto_rebalance = RecoverableRebalance()
+        instance.recovery_locked = True
+        instance.recovery_reason = "auto_rebalance_recovery_required"
+        instance.recovery_details = {}
+        instance.recovery_status = lambda: {
+            "locked": instance.recovery_locked,
+            "reason": instance.recovery_reason,
+            "details": {},
+        }
+
+        async def reconcile():
+            instance.recovery_locked = False
+            instance.recovery_reason = ""
+            return {"ok": True, "locked": False, "reason": "", "details": {}}
+
+        instance.reconcile_account_safety = reconcile
+        manager = SimpleNamespace(get_instance=lambda _account_id: instance)
+        with mock.patch.object(app_module, "manager", manager):
+            response = await app_module.account_recovery_reconcile(
+                "account-a", user="test"
+            )
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(instance.auto_rebalance.called, 1)
+        self.assertTrue(response["rebalance_recovery"]["ok"])
+
+    async def test_recovery_lock_blocks_monitor_and_rebalance_enable(self):
+        instance = idle_instance(FlatClient())
+        instance.recovery_locked = True
+        instance.recovery_reason = "unmanaged_exchange_state"
+        instance.recovery_details = {}
+        instance.poly_monitor.start = mock.AsyncMock()
+        instance.auto_rebalance = SimpleNamespace(
+            enabled=False,
+            _rebalancing=False,
+            set_enabled=mock.MagicMock(return_value=True),
+            cancel=mock.AsyncMock(),
+        )
+        manager = SimpleNamespace(get_instance=lambda _account_id: instance)
+        with mock.patch.object(app_module, "manager", manager):
+            monitor = await app_module.account_monitor_start(
+                "account-a", Request({"poly_token_id": "poly"}), user="test"
+            )
+            rebalance = await app_module.account_rebalance_toggle(
+                "account-a", Request({"enabled": True}), user="test"
+            )
+
+        self.assertEqual(monitor.status_code, 409)
+        self.assertEqual(rebalance.status_code, 409)
+        instance.poly_monitor.start.assert_not_awaited()
+        instance.auto_rebalance.set_enabled.assert_not_called()
+
+    async def test_recovery_lock_still_allows_rebalance_disable(self):
+        instance = idle_instance(FlatClient())
+        instance.recovery_locked = True
+        instance.recovery_reason = "unmanaged_exchange_state"
+        instance.recovery_details = {}
+        instance.auto_rebalance = SimpleNamespace(
+            enabled=True,
+            _rebalancing=False,
+            set_enabled=mock.MagicMock(return_value=True),
+            cancel=mock.AsyncMock(),
+        )
+        manager = SimpleNamespace(get_instance=lambda _account_id: instance)
+        with mock.patch.object(app_module, "manager", manager):
+            response = await app_module.account_rebalance_toggle(
+                "account-a", Request({"enabled": False}), user="test"
+            )
+
+        self.assertTrue(response["ok"])
+        instance.auto_rebalance.set_enabled.assert_called_once_with(False)
+        instance.auto_rebalance.cancel.assert_awaited_once_with()
+
+    async def test_account_config_never_returns_decrypted_credentials(self):
+        account = stored_account()
+        account["passphrase"] = "private-passphrase-value"
+        with (
+            mock.patch.object(database, "get_account_decrypted", return_value=account),
+            mock.patch.object(
+                database,
+                "get_global_config",
+                side_effect=lambda key, default="": (
+                    "telegram-secret" if key == "tg_token" else default
+                ),
+            ),
+        ):
+            response = await app_module.account_config_v2(
+                "account-a", user="test"
+            )
+
+        self.assertEqual(response["api_key"], "")
+        self.assertEqual(response["secret_key"], "")
+        self.assertEqual(response["passphrase"], "")
+        self.assertEqual(response["agent_key"], "")
+        self.assertEqual(response["tg_token"], "")
+        self.assertTrue(all(response["credentials_configured"].values()))
+        self.assertTrue(response["tg_token_configured"])
+        serialised = json.dumps(response)
+        for secret in (
+            "api-key",
+            "secret-key",
+            "private-passphrase-value",
+            "1" * 64,
+            "telegram-secret",
+        ):
+            self.assertNotIn(secret, serialised)
+
+    async def test_global_config_hides_token_and_blank_update_preserves_it(self):
+        stored = {"tg_token": "telegram-secret", "tg_chats": "123,456"}
+        writes = []
+
+        def get_value(key, default=""):
+            return stored.get(key, default)
+
+        def set_value(key, value):
+            writes.append((key, value))
+            stored[key] = value
+
+        manager = SimpleNamespace(notifier=None)
+        with (
+            mock.patch.object(app_module, "get_global_config", side_effect=get_value),
+            mock.patch.object(app_module, "set_global_config", side_effect=set_value),
+            mock.patch.object(app_module, "manager", manager),
+        ):
+            response = await app_module.get_global_config_route(user="test")
+            saved = await app_module.save_global_config(
+                Request({"tg_token": "", "tg_chats": "123,456"}),
+                user="test",
+            )
+
+        self.assertEqual(response["tg_token"], "")
+        self.assertTrue(response["tg_token_configured"])
+        self.assertNotIn("telegram-secret", json.dumps(response))
+        self.assertTrue(saved["ok"])
+        self.assertEqual(stored["tg_token"], "telegram-secret")
+        self.assertNotIn(("tg_token", ""), writes)
+
     async def test_rebalance_toggle_persists_enabled_state(self):
         instance = idle_instance(FlatClient())
         rebalance = AutoRebalance(object(), "toggle-success-no-file")

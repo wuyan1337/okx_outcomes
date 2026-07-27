@@ -28,6 +28,22 @@ from ..core.price_utils import (
     price_to_cents,
 )
 from ..core.logging_config import audit_event, log_context
+from .order_lifecycle import (
+    PLACE_CONFIRMATION_STATUSES,
+    RESERVING_ORDER_STATUSES,
+    TERMINAL_ORDER_STATUSES,
+    archive_completed_order_groups,
+    atomic_write_json,
+    cancel_and_confirm,
+    decimal_text,
+    generate_client_order_id,
+    normalise_order_status,
+    observation_from_order,
+    owned_order_remaining,
+    place_and_confirm,
+    update_owned_record,
+    wait_for_order,
+)
 from .size_utils import normalize_size_str
 
 if TYPE_CHECKING:
@@ -50,10 +66,14 @@ class ManualStateS:
     yes_asset_id: str = ""
     no_asset_id: str = ""
     asset_id: str = ""        # The one we're trading (yes or no asset)
-    pending_sells: Dict[str, float] = field(default_factory=dict)
+    pending_sells: Dict[str, Decimal] = field(default_factory=dict)
+    owned_orders: Dict[str, dict] = field(default_factory=dict)
+    order_archive: list = field(default_factory=list)
     posted_sells: Set[str] = field(default_factory=set)  # sell order IDs we posted
     sell_retry_counts: Dict[str, int] = field(default_factory=dict)
     sell_retry_after: Dict[str, float] = field(default_factory=dict)
+    deployment_blocked: bool = False
+    block_reason: str = ""
     start_time: int = 0
     total_sells_posted: int = 0
     total_profit: float = 0.0
@@ -74,12 +94,15 @@ class ManualStrategyS:
         self.account_name = ""
         self.state = ManualStateS()
         self._main_task: Optional[asyncio.Task] = None
-        self._heartbeat_task: Optional[asyncio.Task] = None
         self.notifier = None
         self.running = False
         self.cycles = 0
         self.auto_rebalance = None
         self._run_id = ""
+        self._order_confirmation_attempts = 10
+        self._order_confirmation_delay = 0.3
+        self._entry_release_event = asyncio.Event()
+        self._entry_release_event.set()
         self._sells_file = Path(str(SELLS_FILE_S).format(account_id=account_id))
         self._load_pending_sells()
 
@@ -89,25 +112,74 @@ class ManualStrategyS:
             if self._sells_file.exists():
                 with open(self._sells_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError("manual state root must be an object")
                 raw = data.get("oids", [])
                 if isinstance(raw, dict):
-                    self.state.pending_sells = {k: float(v) for k, v in raw.items()}
+                    self.state.pending_sells = {
+                        str(k): as_decimal(v) for k, v in raw.items()
+                    }
                 else:
-                    self.state.pending_sells = {oid: 999999.0 for oid in raw}
-                self.state.start_time = data.get("start_time", 0)
+                    self.state.pending_sells = {
+                        str(oid): Decimal("999999") for oid in raw
+                    }
+                owned = data.get("owned_orders", {})
+                if not isinstance(owned, dict):
+                    raise ValueError("owned_orders must be an object")
+                self.state.owned_orders = {}
+                for client_order_id, value in owned.items():
+                    if not isinstance(value, dict):
+                        raise ValueError("owned order records must be objects")
+                    client_order_id = str(client_order_id or "")
+                    if not client_order_id:
+                        raise ValueError("owned order is missing clientOrderId")
+                    record = dict(value)
+                    record["client_order_id"] = client_order_id
+                    record["status"] = normalise_order_status(record.get("status")) or "UNKNOWN"
+                    for key in (
+                        "size",
+                        "filled_size",
+                        "filled_amount",
+                        "accounted_fill_size",
+                        "layer_recorded_size",
+                    ):
+                        record[key] = decimal_text(record.get(key, "0"))
+                    self.state.owned_orders[client_order_id] = record
+                raw_archive = data.get("order_archive", [])
+                if isinstance(raw_archive, list):
+                    self.state.order_archive = [
+                        dict(item) for item in raw_archive if isinstance(item, dict)
+                    ][-200:]
+                self.state.start_time = int(data.get("start_time", 0) or 0)
+                self.state.deployment_blocked = bool(data.get("deployment_blocked", False))
+                self.state.block_reason = str(data.get("block_reason") or "")
                 logger.info(f"[S] Loaded {len(self.state.pending_sells)} pending sells from disk")
         except Exception as e:
             logger.warning(f"[S] Failed to load pending sells: {e}")
+            self.state.deployment_blocked = True
+            self.state.block_reason = f"state load failed: {e}"
 
-    def _save_pending_sells(self):
+    def _state_payload(self) -> dict:
+        return {
+            "version": 4,
+            "oids": {
+                str(key): decimal_text(value)
+                for key, value in self.state.pending_sells.items()
+            },
+            "start_time": self.state.start_time,
+            "owned_orders": {
+                str(client_order_id): dict(record)
+                for client_order_id, record in self.state.owned_orders.items()
+            },
+            "order_archive": [dict(item) for item in self.state.order_archive[-200:]],
+            "deployment_blocked": bool(self.state.deployment_blocked),
+            "block_reason": self.state.block_reason,
+        }
+
+    def _save_pending_sells(self) -> bool:
         """Persist pending_sells to disk."""
         try:
-            self._sells_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._sells_file, "w", encoding="utf-8") as f:
-                json.dump({
-                    "oids": dict(self.state.pending_sells),
-                    "start_time": self.state.start_time,
-                }, f)
+            atomic_write_json(self._sells_file, self._state_payload())
             audit_event(
                 "manual.pending_sells_saved",
                 account_id=self.account_id,
@@ -115,8 +187,12 @@ class ManualStrategyS:
                 run_id=self._run_id,
                 path=self._sells_file,
                 pending_count=len(self.state.pending_sells),
+                owned_order_count=len(self.state.owned_orders),
             )
+            return True
         except Exception as e:
+            self.state.deployment_blocked = True
+            self.state.block_reason = f"state write failed: {e}"
             logger.warning(f"[S] Failed to save pending sells: {e}")
             audit_event(
                 "manual.pending_sells_save_failed",
@@ -126,6 +202,28 @@ class ManualStrategyS:
                 run_id=self._run_id,
                 error=e,
             )
+            return False
+
+    def _persist_state(self) -> bool:
+        """Treat legacy test overrides returning None as a successful write."""
+        archived = archive_completed_order_groups(
+            owned_orders=self.state.owned_orders,
+            pending_sells=self.state.pending_sells,
+            sell_retry_counts=self.state.sell_retry_counts,
+            sell_retry_after=self.state.sell_retry_after,
+            archive=self.state.order_archive,
+        )
+        if archived:
+            audit_event(
+                "manual.orders_archived",
+                account_id=self.account_id,
+                strategy="manual-s",
+                run_id=self._run_id,
+                archived_groups=archived,
+                active_order_count=len(self.state.owned_orders),
+                archive_count=len(self.state.order_archive),
+            )
+        return self._save_pending_sells() is not False
 
     def log(self, msg: str, level: str = "INFO"):
         now = datetime.now()
@@ -153,7 +251,8 @@ class ManualStrategyS:
         )
 
     async def start(self, market_id: str, yes_asset_id: str, no_asset_id: str,
-                    side: str, price_a: float, sell_price: float = 0, mode: str = "classic", size: int = 0, position_pct: int = 100, scan_interval: float = 0.3, stabilize_secs: float = 0.3):
+                    side: str, price_a: float, sell_price: float = 0, mode: str = "classic", size: int = 0, position_pct: int = 100, scan_interval: float = 0.3, stabilize_secs: float = 0.3,
+                    defer_entry: bool = False):
         """Start single-side strategy."""
         if self.state.running:
             return
@@ -192,10 +291,18 @@ class ManualStrategyS:
         self.state.scan_interval = max(0.3, min(120.0, float(scan_interval)))
         self.state.stabilize_secs = max(0.3, min(120.0, float(stabilize_secs)))
         self.state.consecutive_failures = 0
+        if defer_entry:
+            self._entry_release_event.clear()
+        else:
+            self._entry_release_event.set()
 
         import time as _time
         self.state.start_time = int(_time.time() * 1000)
-        self._save_pending_sells()
+        if not self._persist_state():
+            self.state.running = False
+            self.running = False
+            self._entry_release_event.set()
+            raise RuntimeError("Manual-S state could not be persisted")
 
         label = "Yes" if side == "yes" else "No"
         self.log(f"Manual-S started: Buy {label}@{a}¢ → Sell {label}@{actual_sell}¢")
@@ -221,7 +328,16 @@ class ManualStrategyS:
             mode=self.state.mode,
         ):
             self._main_task = asyncio.create_task(self._seed_then_run())
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    def release_entry_barrier(self) -> bool:
+        """Allow new BUY deployment after the caller finishes atomic startup."""
+        if not self.state.running:
+            return False
+        was_deferred = not self._entry_release_event.is_set()
+        self._entry_release_event.set()
+        if was_deferred:
+            self.log("Entry barrier released; new BUY deployment is enabled")
+        return True
 
     async def _seed_then_run(self):
         """Seed notified_fills + _notified_amounts with existing orders so we don't spam old fills."""
@@ -263,17 +379,62 @@ class ManualStrategyS:
                     if sfilled > 0:
                         self.state._sell_fills_tracked[oid] = sfilled
             self.log(f"Pre-seeded {len(self.state.notified_fills)} existing fills, {len(self.state._sell_fills_tracked)} sell fills")
+            if str(resp.get("code", "")) != "0" or str(resp2.get("code", "")) != "0":
+                self._block_new_deployments(
+                    "initial owned-order reconciliation snapshot failed"
+                )
+            else:
+                await self._check_sell_fills(all_orders)
+                await self._check_fills_post_sells(all_orders)
         except Exception as e:
             self.log(f"Seed fills error: {e}", "WARN")
+            self._block_new_deployments(
+                f"initial owned-order reconciliation failed: {e}"
+            )
         await self._main_loop()
 
     async def stop(self):
-        if not self.state.running:
-            return
+        needs_reconcile = self.state.deployment_blocked or any(
+            normalise_order_status(record.get("status")) in RESERVING_ORDER_STATUSES
+            for record in self.state.owned_orders.values()
+        )
+        if not self.state.running and not needs_reconcile:
+            self._entry_release_event.set()
+            return True
         self.state.running = False
         self.running = False
-        self._save_pending_sells()
-        self.log("已停止 (挂单保留)")
+        if self._main_task:
+            self._main_task.cancel()
+            try:
+                await self._main_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._entry_release_event.set()
+        safe = True
+        for entry in list(self.state.owned_orders.values()):
+            if entry.get("role") != "entry_buy":
+                continue
+            if normalise_order_status(entry.get("status")) in RESERVING_ORDER_STATUSES:
+                safe = (await self._cancel_owned_entry(entry)) and safe
+        safe = (await self._reconcile_protective_orders()) and safe
+        for entry in list(self.state.owned_orders.values()):
+            if entry.get("role") == "entry_buy" and as_decimal(
+                entry.get("filled_size", "0") or "0"
+            ) > 0:
+                safe = (await self._ensure_protection_for_entry(entry)) and safe
+        if safe:
+            self.state.deployment_blocked = False
+            self.state.block_reason = ""
+        if not self._persist_state():
+            safe = False
+        if safe:
+            self.log("已停止 (owned Buy 已终态确认，ACTIVE protective Sell 保留)")
+        else:
+            self.log("停止未完成安全对账；新部署保持锁定", "ERROR")
+            self.state.deployment_blocked = True
+            if not self.state.block_reason:
+                self.state.block_reason = "stop reconciliation incomplete"
+            self._persist_state()
         audit_event(
             "strategy.stopped",
             account_id=self.account_id,
@@ -281,50 +442,61 @@ class ManualStrategyS:
             run_id=self._run_id,
             mode=self.state.mode,
             pending_count=len(self.state.pending_sells),
+            safe=safe,
         )
-        for task in [self._main_task, self._heartbeat_task]:
-            if task:
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+        return safe
 
     # ─── Main Loop ───
 
     async def _main_loop(self):
         try:
-            await self._deploy_balance()
+            if self._entry_release_event.is_set():
+                await self._deploy_balance()
             while self.state.running:
-                await asyncio.sleep(self.state.scan_interval)
+                if self._entry_release_event.is_set():
+                    await asyncio.sleep(self.state.scan_interval)
+                else:
+                    try:
+                        await asyncio.wait_for(
+                            self._entry_release_event.wait(),
+                            timeout=self.state.scan_interval,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
                 if not self.state.running:
                     break
-                # Fetch both closed AND open orders to catch partial fills
+                # Fetch a complete lifecycle snapshot.  A partial/failed
+                # snapshot is never followed by new deployment.
                 _closed_orders = []
                 _open_orders = []
+                snapshot_ok = True
                 try:
                     _resp = await self.client.get_orders(status="closed")
                     if str(_resp.get("code", "")) == "0":
                         _closed_orders = _resp.get("data", {}).get("list", [])
+                    else:
+                        snapshot_ok = False
                 except Exception as e:
+                    snapshot_ok = False
                     self.log(f"Fetch closed orders error: {e}", "WARN")
                 try:
                     _resp2 = await self.client.get_orders(status="open")
                     if str(_resp2.get("code", "")) == "0":
                         _open_orders = _resp2.get("data", {}).get("list", [])
+                    else:
+                        snapshot_ok = False
                 except Exception as e:
+                    snapshot_ok = False
                     self.log(f"Fetch open orders error: {e}", "WARN")
 
-                # Combine: closed + open orders that have partial fills
-                _all_filled = _closed_orders + [
-                    o for o in _open_orders
-                    if float(o.get("filledSize", "0") or "0") > 0
-                ]
-
-                await self._notify_all_fills(_all_filled)
-                await self._check_fills_post_sells(_all_filled)
-                await self._check_sell_fills(_all_filled)
-                await self._deploy_balance()
+                if not snapshot_ok:
+                    continue
+                _all_orders = _closed_orders + _open_orders
+                await self._notify_all_fills(_all_orders)
+                await self._check_sell_fills(_all_orders)
+                await self._check_fills_post_sells(_all_orders)
+                if self._entry_release_event.is_set():
+                    await self._deploy_balance()
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -332,197 +504,396 @@ class ManualStrategyS:
             self.state.running = False
             self.running = False
 
+    def _owned_record_for_order(self, order: dict, role: str = ""):
+        observation = observation_from_order(order)
+        record = self.state.owned_orders.get(observation.client_order_id)
+        if record is None and observation.order_id:
+            for candidate in self.state.owned_orders.values():
+                if str(candidate.get("order_id") or "") == observation.order_id:
+                    record = candidate
+                    break
+        if record is None or (role and record.get("role") != role):
+            return None, observation
+        if (
+            str(record.get("asset_id") or "") != observation.asset_id
+            or str(record.get("side") or "").upper() != observation.side
+        ):
+            self._block_new_deployments(
+                f"owned order identity mismatch for {record.get('client_order_id', '')}"
+            )
+            return None, observation
+        return record, observation
+
+    async def _place_owned_order(
+        self,
+        *,
+        role: str,
+        asset_id: str,
+        side: str,
+        price: str,
+        size,
+        outcome: str,
+        parent_buy_cloid: str = "",
+        exit_price: str = "",
+        market_id: str = "",
+        reduce_only: bool = False,
+    ):
+        try:
+            client_order_id = generate_client_order_id(self.client)
+        except Exception as exc:
+            self._block_new_deployments(f"clientOrderId generation failed: {exc}")
+            return None, None
+        size_text = decimal_text(size)
+        record = {
+            "client_order_id": client_order_id,
+            "order_id": "",
+            "role": role,
+            "market_id": str(market_id or self.state.market_id),
+            "asset_id": str(asset_id),
+            "side": str(side).upper(),
+            "status": "PREPARED",
+            "price": str(price),
+            "size": size_text,
+            "filled_size": "0",
+            "filled_amount": "0",
+            "accounted_fill_size": "0",
+            "outcome": outcome,
+            "parent_buy_cloid": parent_buy_cloid,
+            "exit_price": str(exit_price or (price if role == "protective_sell" else "")),
+            "run_id": self._run_id,
+        }
+        self.state.owned_orders[client_order_id] = record
+        if not self._persist_state():
+            self._block_new_deployments(
+                f"{role} clientOrderId snapshot could not be persisted",
+                persist=False,
+            )
+            return record, None
+        confirmation = await place_and_confirm(
+            self.client,
+            client_order_id=client_order_id,
+            market_id=str(market_id or self.state.market_id),
+            asset_id=str(asset_id),
+            side=str(side).lower(),
+            price=str(price),
+            size=size_text,
+            tif="gtc",
+            reduce_only=reduce_only,
+            attempts=self._order_confirmation_attempts,
+            delay=self._order_confirmation_delay,
+        )
+        record["response_code"] = confirmation.response_code
+        if confirmation.observation is not None:
+            update_owned_record(record, confirmation.observation)
+        elif confirmation.rejected:
+            record["status"] = "FAILED"
+            record["error"] = str(
+                confirmation.response.get("message")
+                or confirmation.response.get("msg")
+                or confirmation.response_code
+            )
+        else:
+            record["status"] = "UNKNOWN"
+            record["error"] = str(
+                confirmation.response.get("message")
+                or confirmation.response.get("msg")
+                or confirmation.response_code
+            )
+        if not self._persist_state():
+            self._block_new_deployments(
+                f"{role} result could not be persisted",
+                persist=False,
+            )
+        if confirmation.unresolved:
+            self._block_new_deployments(
+                f"{role} {client_order_id} final placement state is unknown"
+            )
+        return record, confirmation
+
+    def _entry_coverage(self, buy_cloid: str) -> tuple[Decimal, Decimal]:
+        exited = Decimal("0")
+        reserved = Decimal("0")
+        for record in self.state.owned_orders.values():
+            if (
+                record.get("role") != "protective_sell"
+                or str(record.get("parent_buy_cloid") or "") != buy_cloid
+            ):
+                continue
+            filled = as_decimal(record.get("filled_size", "0") or "0")
+            exited += filled
+            if normalise_order_status(record.get("status")) in RESERVING_ORDER_STATUSES:
+                reserved += owned_order_remaining(record)
+        return exited, reserved
+
+    def _sync_pending_marker(self, entry: dict) -> None:
+        buy_cloid = str(entry.get("client_order_id") or "")
+        filled = as_decimal(entry.get("filled_size", "0") or "0")
+        exited, reserved = self._entry_coverage(buy_cloid)
+        covered = min(filled, exited + reserved)
+        if covered > 0:
+            self.state.pending_sells[buy_cloid] = covered
+        else:
+            self.state.pending_sells.pop(buy_cloid, None)
+
+    def _record_entry_cost_layer(self, entry: dict) -> None:
+        filled = as_decimal(entry.get("filled_size", "0") or "0")
+        recorded = as_decimal(entry.get("layer_recorded_size", "0") or "0")
+        delta = filled - recorded
+        if delta <= 0:
+            return
+        if self.auto_rebalance:
+            self.auto_rebalance.add_to_layer(
+                str(entry.get("asset_id") or ""),
+                price_to_cents(entry.get("price") or "0"),
+                delta,
+                market_id=str(entry.get("market_id") or self.state.market_id),
+            )
+        entry["layer_recorded_size"] = decimal_text(filled)
+
+    def _account_protective_fill(self, record: dict) -> None:
+        filled = as_decimal(record.get("filled_size", "0") or "0")
+        accounted = as_decimal(record.get("accounted_fill_size", "0") or "0")
+        delta = filled - accounted
+        if delta <= 0:
+            return
+        parent = self.state.owned_orders.get(
+            str(record.get("parent_buy_cloid") or "")
+        )
+        if parent is None:
+            self._block_new_deployments(
+                f"protective SELL {record.get('client_order_id', '')} is missing its parent BUY"
+            )
+            return
+        if self.auto_rebalance:
+            self.auto_rebalance.remove_from_highest_layer(
+                str(record.get("asset_id") or ""),
+                delta,
+                market_id=str(record.get("market_id") or self.state.market_id),
+            )
+        buy_price = as_decimal(parent.get("price", "0") or "0")
+        sell_price = as_decimal(record.get("price", "0") or "0")
+        profit_delta = delta * (sell_price - buy_price)
+        record["accounted_fill_size"] = decimal_text(filled)
+        self.state.total_profit += float(profit_delta)
+        label = str(record.get("outcome") or "")
+        self.log(
+            f"💰 Sell {label} 成交 x{normalize_size_str(delta)} "
+            f"@{record.get('price', '?')} | {float(profit_delta):+.2f} xp"
+        )
+        if self.notifier:
+            asyncio.create_task(self.notifier.send(
+                f"[{self.account_name}] 💰 Sell {label} 成交 "
+                f"x{normalize_size_str(delta)} @{record.get('price', '?')}"
+            ))
+
+    async def _ensure_protection_for_entry(self, entry: dict) -> bool:
+        buy_cloid = str(entry.get("client_order_id") or "")
+        filled = as_decimal(entry.get("filled_size", "0") or "0")
+        if not buy_cloid or filled < Decimal("0.01"):
+            return True
+        self._record_entry_cost_layer(entry)
+        exited, reserved = self._entry_coverage(buy_cloid)
+        unprotected = filled - exited - reserved
+        self._sync_pending_marker(entry)
+        if unprotected < Decimal("0.01"):
+            return True
+        if self.state.sell_retry_after.get(buy_cloid, 0.0) > asyncio.get_running_loop().time():
+            return False
+        asset_id = str(entry.get("asset_id") or "")
+        label = str(entry.get("outcome") or ("Yes" if self.state.side == "yes" else "No"))
+        sell_price = str(entry.get("exit_price") or "")
+        if not sell_price:
+            sell_price = self._cents_to_price_str(self.state.sell_price, "sell")
+            entry["exit_price"] = sell_price
+        sell_cents = price_to_cents(sell_price)
+        size_text = decimal_text(unprotected)
+        sell_notional = sell_cents / Decimal("100") * unprotected
+        if sell_notional < Decimal("1"):
+            if await self._is_full_available_position(
+                asset_id,
+                unprotected,
+                market_id=str(entry.get("market_id") or self.state.market_id),
+            ):
+                self.log(
+                    f"Sell {label} @{sell_price} x{size_text} uses OKX sell-all exception"
+                )
+            else:
+                self._defer_failed_sell(
+                    buy_cloid,
+                    label,
+                    f"{size_text} x {sell_cents}¢ = {sell_notional:.2f} xp below 1 xp minimum",
+                )
+                return False
+        sell_record, confirmation = await self._place_owned_order(
+            role="protective_sell",
+            asset_id=asset_id,
+            side="SELL",
+            price=sell_price,
+            size=unprotected,
+            outcome=label,
+            parent_buy_cloid=buy_cloid,
+            market_id=str(entry.get("market_id") or self.state.market_id),
+            reduce_only=True,
+        )
+        if sell_record is None or confirmation is None:
+            return False
+        status = normalise_order_status(sell_record.get("status"))
+        self._account_protective_fill(sell_record)
+        self._sync_pending_marker(entry)
+        if status in {"ACTIVE", "FILLED"}:
+            self.state.sell_retry_counts.pop(buy_cloid, None)
+            self.state.sell_retry_after.pop(buy_cloid, None)
+            self.state.total_sells_posted += 1
+            self.state.consecutive_failures = 0
+            self.log(f"挂 Sell {label} @{sell_price} x{size_text} ({status})")
+            if self.notifier:
+                asyncio.create_task(self.notifier.send(
+                    f"[{self.account_name}] ✅ Buy {label} 成交 x{size_text} "
+                    f"→ Sell @{sell_price} {status}"
+                ))
+            self._persist_state()
+            return True
+        if status == "PARTIALLY_FILLED":
+            self.state.sell_retry_after.pop(buy_cloid, None)
+            self.log(
+                f"Sell {label} 部分成交后终止；剩余未保护数量将在下一轮重挂",
+                "WARN",
+            )
+            self._persist_state()
+            return False
+        if status in {"FAILED", "CANCELLED", "EXPIRED"}:
+            self._defer_failed_sell(
+                buy_cloid, label, str(sell_record.get("error") or status)
+            )
+            self._persist_state()
+            return False
+        return False
+
+    async def _cancel_owned_entry(self, entry: dict) -> bool:
+        if normalise_order_status(entry.get("status")) in TERMINAL_ORDER_STATUSES:
+            return True
+        confirmation = await cancel_and_confirm(
+            self.client,
+            client_order_id=str(entry.get("client_order_id") or ""),
+            order_id=str(entry.get("order_id") or ""),
+            market_id=str(entry.get("market_id") or self.state.market_id),
+            asset_id=str(entry.get("asset_id") or ""),
+            attempts=self._order_confirmation_attempts,
+            delay=self._order_confirmation_delay,
+        )
+        if confirmation.observation is None:
+            self._block_new_deployments(
+                f"entry BUY {entry.get('client_order_id', '')} cancellation final state is unknown"
+            )
+            return False
+        update_owned_record(entry, confirmation.observation)
+        if not self._persist_state():
+            self._block_new_deployments(
+                "entry BUY cancellation result could not be persisted",
+                persist=False,
+            )
+            return False
+        return confirmation.confirmed_terminal
+
+    async def _reconcile_protective_orders(self) -> bool:
+        safe = True
+        for record in list(self.state.owned_orders.values()):
+            if record.get("role") != "protective_sell":
+                continue
+            if normalise_order_status(record.get("status")) not in RESERVING_ORDER_STATUSES:
+                self._account_protective_fill(record)
+                continue
+            observation = await wait_for_order(
+                self.client,
+                client_order_id=str(record.get("client_order_id") or ""),
+                order_id=str(record.get("order_id") or ""),
+                market_id=str(record.get("market_id") or self.state.market_id),
+                accepted_statuses=PLACE_CONFIRMATION_STATUSES,
+                attempts=self._order_confirmation_attempts,
+                delay=self._order_confirmation_delay,
+            )
+            if observation is None:
+                safe = False
+                self._block_new_deployments(
+                    f"protective SELL {record.get('client_order_id', '')} state is unknown"
+                )
+                continue
+            update_owned_record(record, observation)
+            self._account_protective_fill(record)
+        for entry in self.state.owned_orders.values():
+            if entry.get("role") == "entry_buy":
+                self._sync_pending_marker(entry)
+        if not self._persist_state():
+            safe = False
+        return safe
+
     async def _check_fills_post_sells(self, order_list=None):
         try:
             if order_list is None:
-                resp = await self.client.get_orders(status="closed")
-                if str(resp.get("code", "")) != "0":
-                    return
-                order_list = resp.get("data", {}).get("list", [])
+                order_list = []
+                for query_status in ("closed", "open"):
+                    response = await self.client.get_orders(status=query_status)
+                    if str(response.get("code", "")) != "0":
+                        return
+                    order_list.extend((response.get("data") or {}).get("list", []))
             changed = False
-
             for o in order_list:
-                oid = o.get("id", o.get("oid", ""))
-                if not oid:
+                record, observation = self._owned_record_for_order(o, "entry_buy")
+                if record is None:
                     continue
-                prev_processed = self.state.pending_sells.get(oid, 0.0)
-
-                created = int(o.get("createdAt", "0") or "0")
-                if created < self.state.start_time:
-                    continue
-
-                side = o.get("side", "").upper()
-                filled_size = o.get("filledSize", o.get("size", "0"))
-                status = o.get("status", "").upper()
-
-                # Handle both FILLED and PARTIALLY_FILLED
-                if status not in ("FILLED", "PARTIALLY_FILLED", "ACTIVE"):
-                    continue
-                if side != "BUY":
-                    continue
-                if o.get("assetId", "") != self.state.asset_id:
-                    continue
-
-                filled = float(filled_size)
-                if filled < 0.01:
-                    continue
-                new_fill = filled - prev_processed
-                if new_fill < 0.01:
-                    continue
-                if self.state.sell_retry_after.get(oid, 0.0) > asyncio.get_running_loop().time():
-                    continue
-
-                sell_cents = self.state.sell_price
-                sell_price = self._cents_to_price_str(sell_cents, "sell")
-                label = "Yes" if self.state.side == "yes" else "No"
-
-                size_str = f"{new_fill:.10f}".rstrip("0").rstrip(".")
-                sell_notional = as_decimal(sell_cents) / Decimal("100") * as_decimal(new_fill)
-                if sell_notional < Decimal("1"):
-                    if await self._is_full_available_position(self.state.asset_id, new_fill):
-                        self.log(
-                            f"Sell {label} @{sell_price} x{size_str} uses OKX sell-all exception"
-                        )
-                    else:
-                        self._defer_failed_sell(
-                            oid,
-                            label,
-                            f"{size_str} x {sell_cents}\u00a2 = {sell_notional:.2f} xp below 1 xp minimum",
-                        )
-                        continue
-                sell_resp = await self.client.place_order(
-                    asset_id=self.state.asset_id,
-                    side="sell",
-                    price=sell_price,
-                    size=size_str,
-                    tif="gtc",
-                )
-
-                if str(sell_resp.get("code", "")) != "0" and "Invalid request parameters" in str(sell_resp.get("message", "")):
-                    safe_units = int(new_fill)
-                    safe_notional = as_decimal(sell_cents) / Decimal("100") * safe_units
-                    if safe_units >= 1 and safe_notional >= Decimal("1") and str(safe_units) != size_str:
-                        self.log(f"Sell {label} 参数失败，降级整数重试: {size_str} -> {safe_units}")
-                        sell_resp = await self.client.place_order(
-                            asset_id=self.state.asset_id,
-                            side="sell",
-                            price=sell_price,
-                            size=str(safe_units),
-                            tif="gtc",
-                        )
-                        if str(sell_resp.get("code", "")) == "0":
-                            filled = prev_processed + safe_units
-                            new_fill = float(safe_units)
-                            size_str = str(safe_units)
-
-                if str(sell_resp.get("code", "")) == "0":
-                    self.state.pending_sells[oid] = filled
-                    self.state.sell_retry_counts.pop(oid, None)
-                    self.state.sell_retry_after.pop(oid, None)
-                    sell_oid = sell_resp.get("data", {}).get("oid", "") or sell_resp.get("data", {}).get("orderId", "")
-                    if sell_oid:
-                        self.state.posted_sells.add(sell_oid)
-                    self.state.total_sells_posted += 1
-                    self.state.consecutive_failures = 0
-                    changed = True
-                    if self.auto_rebalance:
-                        buy_cents = (
-                            price_to_cents(o["price"])
-                            if o.get("price")
-                            else as_decimal(self.state.price_a)
-                        )
-                        self.auto_rebalance.add_to_layer(
-                            self.state.asset_id,
-                            buy_cents,
-                            new_fill,
-                            market_id=self.state.market_id,
-                        )
-                    self.log(f"挂 Sell {label} @{sell_price} x{size_str}")
-                    if self.notifier:
-                        asyncio.create_task(self.notifier.send(f"[{self.account_name}] ✅ Buy {label} 成交 x{size_str} → 挂 Sell @{sell_price}"))
-                else:
-                    msg = str(sell_resp.get("message") or sell_resp.get("msg") or "unknown error")
-                    if "Insufficient" in msg or "Minimum" in msg:
-                        self._defer_failed_sell(oid, label, msg)
-                    else:
-                        self._record_failure(f"Sell {label} 失败: {msg}")
-                        if self.notifier:
-                            asyncio.create_task(self.notifier.send(f"[{self.account_name}] ⚠️ Sell {label} 失败: {msg}\n裸仓风险!"))
-
+                update_owned_record(record, observation)
+                self._record_entry_cost_layer(record)
+                changed = True
+            for entry in list(self.state.owned_orders.values()):
+                if entry.get("role") == "entry_buy":
+                    await self._ensure_protection_for_entry(entry)
             if changed:
-                self._save_pending_sells()
-
+                self._persist_state()
         except Exception as e:
             self._record_failure(f"检查成交异常: {e}")
 
 
     async def _check_sell_fills(self, order_list=None):
-        """Check if our sell orders have been filled -> profit realized.
-        Scans ALL sell orders for current asset (no posted_sells dependency, survives restart).
-        """
+        """Reconcile exact owned protective SELL orders and release remainder."""
         try:
             if order_list is None:
-                _closed = []
-                _open = []
-                try:
-                    r1 = await self.client.get_orders(status="closed")
-                    if str(r1.get("code", "")) == "0":
-                        _closed = r1.get("data", {}).get("list", [])
-                except:
-                    pass
-                try:
-                    r2 = await self.client.get_orders(status="open")
-                    if str(r2.get("code", "")) == "0":
-                        _open = r2.get("data", {}).get("list", [])
-                except:
-                    pass
-                order_list = _closed + _open
-
-            if not hasattr(self.state, '_sell_fills_tracked'):
-                self.state._sell_fills_tracked = {}
-
+                order_list = []
+                for query_status in ("closed", "open"):
+                    response = await self.client.get_orders(status=query_status)
+                    if str(response.get("code", "")) != "0":
+                        return
+                    order_list.extend((response.get("data") or {}).get("list", []))
+            changed = False
             for o in order_list:
-                oid = o.get("id", o.get("oid", ""))
-                if not oid:
+                record, observation = self._owned_record_for_order(
+                    o, "protective_sell"
+                )
+                if record is None:
                     continue
-                side = o.get("side", "").upper()
-                if side != "SELL":
-                    continue
-                # Only track sells for current asset
-                if o.get("assetId", "") != self.state.asset_id:
-                    continue
-                status = o.get("status", "").upper()
-                if status not in ("FILLED", "PARTIALLY_FILLED", "ACTIVE"):
-                    continue
-                filled = float(o.get("filledSize", o.get("size", "0")) or "0")
-                price = o.get("price", "?")
-                if filled < 0.01:
-                    continue
-                # Incremental: only notify new fill amount
-                prev_sell_filled = self.state._sell_fills_tracked.get(oid, 0.0)
-                new_sell_fill = filled - prev_sell_filled
-                if new_sell_fill < 0.5:
-                    continue
-                self.state._sell_fills_tracked[oid] = filled
-                self.state.posted_sells.add(oid)
-                profit = new_sell_fill * 0.01
-                self.state.total_profit += profit
-                # Remove from cost layers (sell filled = position closed)
-                if self.auto_rebalance:
-                    self.auto_rebalance.remove_from_highest_layer(
-                        self.state.asset_id,
-                        new_sell_fill,
-                        market_id=self.state.market_id,
-                    )
-                if status == "FILLED":
-                    self.state.posted_sells.discard(oid)
-                label = "Yes" if self.state.side == "yes" else "No"
-                self.log(f"\U0001f4b0 Sell {label} \u6210\u4ea4 x{normalize_size_str(new_sell_fill)} @{price} | +{profit:.2f} xp")
-                if self.notifier:
-                    import asyncio
-                    asyncio.create_task(self.notifier.send(
-                        f"[{self.account_name}] \U0001f4b0 Sell {label} \u6210\u4ea4 x{normalize_size_str(new_sell_fill)} @{price} | +{profit:.2f} xp"
-                    ))
+                previous_status = normalise_order_status(record.get("status"))
+                update_owned_record(record, observation)
+                status = normalise_order_status(record.get("status"))
+                self._account_protective_fill(record)
+                order_key = str(record.get("order_id") or record.get("client_order_id") or "")
+                if status == "ACTIVE":
+                    self.state.posted_sells.add(order_key)
+                elif status in TERMINAL_ORDER_STATUSES:
+                    self.state.posted_sells.discard(order_key)
+                    if status in {"PARTIALLY_FILLED", "FAILED", "CANCELLED", "EXPIRED"}:
+                        parent = str(record.get("parent_buy_cloid") or "")
+                        self.state.sell_retry_after.pop(parent, None)
+                        if previous_status != status:
+                            self.log(
+                                f"Protective Sell {record.get('outcome', '')} reached {status}; "
+                                "unprotected remainder returned to retry queue",
+                                "WARN",
+                            )
+                changed = True
+            for entry in self.state.owned_orders.values():
+                if entry.get("role") == "entry_buy":
+                    self._sync_pending_marker(entry)
+            if changed:
+                self._persist_state()
         except Exception as e:
             self.log(f"\u68c0\u67e5sell\u6210\u4ea4\u5f02\u5e38: {e}", "WARN")
 
@@ -575,6 +946,10 @@ class ManualStrategyS:
 
     async def _deploy_balance(self):
         try:
+            if not self._entry_release_event.is_set():
+                return
+            if self.state.deployment_blocked:
+                return
 
             balance = await self.client.get_balance()
             available = self._parse_available(balance)
@@ -582,14 +957,17 @@ class ManualStrategyS:
             locked_in_buys = Decimal("0")
             try:
                 resp_open = await self.client.get_orders(status="open")
-                if str(resp_open.get("code", "")) == "0":
-                    for o in resp_open.get("data", {}).get("list", []):
-                        if o.get("side", "").upper() == "BUY" and o.get("assetId", "") == self.state.asset_id:
-                            sz = as_decimal(o.get("size", "0") or "0") - as_decimal(o.get("filledSize", "0") or "0")
-                            px = as_decimal(o.get("price", "0") or "0")
-                            locked_in_buys += sz * px
-            except Exception:
-                pass
+                if str(resp_open.get("code", "")) != "0":
+                    self.log("Open-order budget snapshot failed; deployment skipped", "WARN")
+                    return
+                for o in resp_open.get("data", {}).get("list", []):
+                    if o.get("side", "").upper() == "BUY" and o.get("assetId", "") == self.state.asset_id:
+                        sz = as_decimal(o.get("size", "0") or "0") - as_decimal(o.get("filledSize", "0") or "0")
+                        px = as_decimal(o.get("price", "0") or "0")
+                        locked_in_buys += sz * px
+            except Exception as exc:
+                self.log(f"Open-order budget snapshot failed: {exc}", "WARN")
+                return
 
             total_capital = available + locked_in_buys
             max_deploy = total_capital * self.state.position_pct / Decimal("100")
@@ -610,26 +988,39 @@ class ManualStrategyS:
             price_str = self._cents_to_price_str(self.state.price_a, "buy")
             label = "Yes" if self.state.side == "yes" else "No"
 
-            resp = await self.client.place_order(
+            entry, confirmation = await self._place_owned_order(
+                role="entry_buy",
                 asset_id=self.state.asset_id,
-                side="buy",
+                side="BUY",
                 price=price_str,
-                size=str(units),
-                tif="gtc",
+                size=units,
+                outcome=label,
+                exit_price=self._cents_to_price_str(self.state.sell_price, "sell"),
             )
-
-            if str(resp.get("code", "")) == "0":
+            if entry is None or confirmation is None:
+                return
+            await self._ensure_protection_for_entry(entry)
+            status = normalise_order_status(entry.get("status"))
+            if status in {"ACTIVE", "FILLED"}:
                 self.state.consecutive_failures = 0
-                self.log(f"挂 Buy {label} @{self.state.price_a}¢ x{units}")
+                self.log(f"挂 Buy {label} @{self.state.price_a}¢ x{units} ({status})")
+                self.cycles += 1
             else:
-                msg = resp.get("message", "")
+                msg = str(entry.get("error") or status or "unknown error")
                 if "Minimum" in msg or "Insufficient" in msg:
                     return
-                self._record_failure(f"Buy {label} 失败: {msg}")
+                if status == "PARTIALLY_FILLED" or as_decimal(
+                    entry.get("filled_size", "0") or "0"
+                ) > 0:
+                    self.log(
+                        f"Buy {label} 部分成交后终止；成交部分已进入保护流程",
+                        "WARN",
+                    )
+                else:
+                    self._record_failure(f"Buy {label} 失败: {msg}")
                 if self.notifier:
                     asyncio.create_task(self.notifier.send(f"[{self.account_name}] ⚠️ Buy {label} 失败: {msg}"))
-
-            self.cycles += 1
+            self._persist_state()
 
         except Exception as e:
             self._record_failure(f"Deploy 异常: {e}")
@@ -647,12 +1038,14 @@ class ManualStrategyS:
         if self.notifier:
             asyncio.create_task(self.notifier.send(f"[{self.account_name}] ⚠️ {warning}"))
 
-    async def _is_full_available_position(self, asset_id: str, quantity) -> bool:
+    async def _is_full_available_position(
+        self, asset_id: str, quantity, market_id: str = ""
+    ) -> bool:
         """Confirm the order would sell the asset's entire unfrozen position."""
         try:
             response = await self.client.get_positions(
                 status="open",
-                market_id=self.state.market_id or None,
+                market_id=market_id or self.state.market_id or None,
             )
             if str(response.get("code", "")) != "0":
                 raise RuntimeError(
@@ -689,6 +1082,16 @@ class ManualStrategyS:
             self.log(f"Sell-all position check failed: {exc}", "WARN")
             return False
 
+    def _block_new_deployments(self, message: str, *, persist: bool = True):
+        self.state.deployment_blocked = True
+        self.state.block_reason = str(message)
+        warning = f"新部署已锁定: {message}；现有成交仍继续管理"
+        self.log(warning, "ERROR")
+        if persist:
+            self._persist_state()
+        if self.notifier:
+            asyncio.create_task(self.notifier.send(f"[{self.account_name}] 🚨 {warning}"))
+
     # ─── Failure tracking ───
 
     def _record_failure(self, msg: str):
@@ -709,31 +1112,6 @@ class ManualStrategyS:
         await self.stop()
 
     # ─── Helpers ───
-
-    async def _heartbeat_loop(self):
-        try:
-            while self.state.running:
-                try:
-                    result = await self.client.heartbeat()
-                    if str(result.get("code", "")) != "0":
-                        self.log(
-                            "Heartbeat failed: "
-                            + str(result.get("message") or result.get("msg") or result.get("code")),
-                            "WARN",
-                        )
-                    else:
-                        audit_event(
-                            "strategy.heartbeat_ok",
-                            account_id=self.account_id,
-                            strategy="manual-s",
-                            run_id=self._run_id,
-                            mode=self.state.mode,
-                        )
-                except Exception as e:
-                    self.log(f"心跳异常: {e}", "WARN")
-                await asyncio.sleep(120)
-        except asyncio.CancelledError:
-            pass
 
     def _parse_available(self, balance_resp: dict) -> Decimal:
         if str(balance_resp.get("code", "")) != "0":
@@ -764,5 +1142,10 @@ class ManualStrategyS:
             "total_sells": self.state.total_sells_posted,
             "total_profit": self.state.total_profit,
             "consecutive_failures": self.state.consecutive_failures,
+            "deployment_blocked": self.state.deployment_blocked,
+            "block_reason": self.state.block_reason,
+            "owned_order_count": len(self.state.owned_orders),
+            "archived_order_group_count": len(self.state.order_archive),
+            "entry_deferred": not self._entry_release_event.is_set(),
             "logs": self.state.logs[-20:],
         }

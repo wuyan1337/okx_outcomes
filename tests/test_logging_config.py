@@ -324,6 +324,47 @@ class DetailedLoggingTests(unittest.TestCase):
         self.assertEqual(handler._unreported_drops, 0)
         handler.close()
 
+    def test_full_audit_queue_uses_synchronous_fallback_without_loss(self):
+        class CollectingHandler(logging.Handler):
+            def __init__(self):
+                super().__init__(logging.DEBUG)
+                self.records = []
+
+            def emit(self, record):
+                self.records.append(record)
+
+        record_queue = queue.Queue(maxsize=1)
+        record_queue.put_nowait(object())
+        fallback = CollectingHandler()
+        handler = logging_config._NonBlockingQueueHandler(
+            record_queue,
+            "audit",
+            (fallback,),
+        )
+        logger = logging.getLogger("tests.audit-fallback")
+        record = logger.makeRecord(
+            logger.name,
+            logging.INFO,
+            __file__,
+            1,
+            "order lifecycle",
+            (),
+            None,
+            extra={"structured_payload": {"event": "order.lifecycle"}},
+        )
+
+        handler.handle(record)
+
+        self.assertEqual(handler.dropped_records, 0)
+        self.assertEqual(handler.synchronous_fallback_records, 1)
+        self.assertEqual(handler.synchronous_fallback_failures, 0)
+        self.assertEqual(len(fallback.records), 1)
+        self.assertEqual(
+            fallback.records[0].structured_payload["queue_delivery"],
+            "synchronous_fallback",
+        )
+        handler.close()
+
     def test_shutdown_drains_and_restores_logger_state(self):
         root = logging.getLogger()
         previous_handlers = tuple(root.handlers)

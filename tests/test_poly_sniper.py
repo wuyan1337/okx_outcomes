@@ -194,6 +194,29 @@ class TimeoutRecoveredEntryClient:
         return {"code": "0", "data": {"list": rows}}
 
 
+class InvalidResponseRecoveredEntryClient(TimeoutRecoveredEntryClient):
+    def generate_client_order_id(self):
+        return "entry-invalid-response"
+
+    async def place_order(self, **kwargs):
+        return {
+            "code": "INVALID_RESPONSE",
+            "_clientOrderId": kwargs["client_order_id"],
+        }
+
+    async def get_orders(self, status="open", market_id=None):
+        rows = []
+        if status == "closed":
+            rows.append({
+                "clientOrderId": "entry-invalid-response",
+                "assetId": "yes-a",
+                "side": "BUY",
+                "filledSize": "2",
+                "filledAmount": "0.4",
+            })
+        return {"code": "0", "data": {"list": rows}}
+
+
 class RestoreOrderClient:
     def __init__(self, open_client_order_ids=(), position_size="0"):
         self.open_client_order_ids = list(open_client_order_ids)
@@ -252,6 +275,18 @@ class ExitTimeoutClient:
     async def place_order(self, **kwargs):
         self.place_count += 1
         raise asyncio.TimeoutError("unknown exit result")
+
+
+class ExitInvalidResponseClient(ExitTimeoutClient):
+    def generate_client_order_id(self):
+        return "exit-invalid-response"
+
+    async def place_order(self, **kwargs):
+        self.place_count += 1
+        return {
+            "code": "INVALID_RESPONSE",
+            "_clientOrderId": kwargs["client_order_id"],
+        }
 
 
 class ClosedSellClient:
@@ -969,6 +1004,27 @@ class PolySniperTests(unittest.IsolatedAsyncioTestCase):
             "client_order_id": "entry-timeout",
         }])
 
+    async def test_invalid_response_entry_recovers_fill_by_client_order_id(self):
+        client = InvalidResponseRecoveredEntryClient()
+        sniper = PolySniper(client)
+        selected = target()
+        sniper.targets = [selected]
+        sniper.state = SniperState(status="triggered", locked=True, active_target_id="a")
+
+        result = await sniper._execute_entry(
+            selected,
+            [(Decimal("0.20"), Decimal("10"))],
+            Decimal("0.10"),
+            Decimal("0.30"),
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(sniper.state.buy_size, Decimal("2"))
+        self.assertEqual(client.cancelled, [{
+            "asset_id": "yes-a",
+            "client_order_id": "entry-invalid-response",
+        }])
+
     async def test_locked_stopped_state_rejects_start(self):
         sniper = PolySniper(NoopClient())
         sniper.state = SniperState(status="stopped", locked=True, active_target_id="a")
@@ -1174,6 +1230,31 @@ class PolySniperTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client.place_count, 1)
         self.assertEqual(sniper.state.exit_client_order_ids, ["exit-timeout"])
+        self.assertEqual(sniper.state.exit_resolved_client_order_ids, [])
+        self.assertEqual(sniper.state.status, "stopped")
+        self.assertTrue(sniper.state.locked)
+        self.assertFalse(sniper.running)
+
+    async def test_exit_invalid_response_is_reconciled_and_remains_locked_when_unknown(self):
+        client = ExitInvalidResponseClient()
+        sniper = ExitTimeoutSniper(client, final=False)
+        selected = target()
+        sniper.targets = [selected]
+        sniper.state = SniperState(
+            status="holding",
+            locked=True,
+            active_target_id="a",
+            buy_size=Decimal("5"),
+        )
+        sniper._running = True
+
+        await sniper._exit_position("test-invalid-response")
+
+        self.assertEqual(client.place_count, 1)
+        self.assertEqual(
+            sniper.state.exit_client_order_ids,
+            ["exit-invalid-response"],
+        )
         self.assertEqual(sniper.state.exit_resolved_client_order_ids, [])
         self.assertEqual(sniper.state.status, "stopped")
         self.assertTrue(sniper.state.locked)

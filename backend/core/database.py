@@ -86,6 +86,15 @@ def init_db():
             updated_at TEXT DEFAULT (datetime('now')),
             FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS sniper_old_state (
+            account_id TEXT PRIMARY KEY,
+            config_json TEXT NOT NULL DEFAULT '{}',
+            runtime_json TEXT NOT NULL DEFAULT '{}',
+            running INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+        );
     """)
     conn.commit()
     conn.close()
@@ -172,6 +181,8 @@ def update_account(account_id: str, **kwargs) -> bool:
     for k in kwargs:
         if k not in ALLOWED_COLS:
             raise ValueError(f"Invalid column: {k}")
+    if "proxy_node" in kwargs and kwargs["proxy_node"] not in PROXY_NODES:
+        raise ValueError(f"Invalid proxy node: {kwargs['proxy_node']}")
     conn = get_db()
     sets = []
     values = []
@@ -287,3 +298,91 @@ def save_sniper_state(account_id: str, config_data: dict, runtime_data: dict,
         conn.commit()
     finally:
         conn.close()
+
+
+def get_sniper_old_state(account_id: str) -> Optional[dict]:
+    """Return PolySniperOld's durable configuration and trade ledger."""
+    conn = get_db()
+    try:
+        _ensure_sniper_old_table(conn)
+        row = conn.execute(
+            "SELECT config_json, runtime_json, running, updated_at "
+            "FROM sniper_old_state WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+
+    corrupt_fields = []
+
+    def _load_object(field_name: str) -> dict:
+        raw_value = row[field_name]
+        if not raw_value:
+            corrupt_fields.append(field_name)
+            return {}
+        try:
+            value = json.loads(raw_value)
+        except (TypeError, json.JSONDecodeError):
+            corrupt_fields.append(field_name)
+            return {}
+        if not isinstance(value, dict):
+            corrupt_fields.append(field_name)
+            return {}
+        return value
+
+    return {
+        "config": _load_object("config_json"),
+        "runtime": _load_object("runtime_json"),
+        "running": bool(row["running"]),
+        "updated_at": row["updated_at"],
+        "corrupt": bool(corrupt_fields),
+        "corrupt_fields": corrupt_fields,
+    }
+
+
+def save_sniper_old_state(account_id: str, config_data: dict, runtime_data: dict,
+                          running: bool) -> None:
+    """Atomically save PolySniperOld before or after an exchange write."""
+    config_json = json.dumps(
+        config_data or {}, ensure_ascii=False, separators=(",", ":")
+    )
+    runtime_json = json.dumps(
+        runtime_data or {}, ensure_ascii=False, separators=(",", ":")
+    )
+    conn = get_db()
+    try:
+        _ensure_sniper_old_table(conn)
+        conn.execute(
+            """
+            INSERT INTO sniper_old_state
+                (account_id, config_json, runtime_json, running, updated_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(account_id) DO UPDATE SET
+                config_json = excluded.config_json,
+                runtime_json = excluded.runtime_json,
+                running = excluded.running,
+                updated_at = datetime('now')
+            """,
+            (account_id, config_json, runtime_json, 1 if running else 0),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _ensure_sniper_old_table(conn: sqlite3.Connection) -> None:
+    """Apply the additive table migration for databases opened before init_db."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sniper_old_state (
+            account_id TEXT PRIMARY KEY,
+            config_json TEXT NOT NULL DEFAULT '{}',
+            runtime_json TEXT NOT NULL DEFAULT '{}',
+            running INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+        )
+        """
+    )
