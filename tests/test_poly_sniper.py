@@ -722,6 +722,118 @@ class PolySniperTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sniper.state.locked)
         self.assertEqual(sniper.state.active_target_id, sniper.entries[0])
 
+    async def test_locked_holding_state_observes_other_candidate_without_triggering(self):
+        sniper = PolySniper(NoopClient())
+        active = target("a", "poly-a")
+        other = target("b", "poly-b")
+        preserved_window = [(123.0, Decimal("0.10"))]
+        sniper.targets = [active, other]
+        sniper._runtime = {
+            active.id: TargetRuntime(last_bid=Decimal("0.20"), calibrated=True),
+            other.id: TargetRuntime(
+                last_bid=Decimal("0.10"),
+                calibrated=True,
+                baseline=Decimal("0.10"),
+                price_window=list(preserved_window),
+            ),
+        }
+        sniper._token_targets = {
+            active.poly_token_id: [active.id],
+            other.poly_token_id: [other.id],
+        }
+        sniper.state = SniperState(
+            status="holding",
+            locked=True,
+            active_target_id=active.id,
+        )
+        sniper._running = True
+        sniper.config.threshold_cents = Decimal("1")
+        sniper._try_trigger = AsyncMock()
+
+        await sniper._process_bid(other.poly_token_id, Decimal("0.50"))
+
+        sniper._try_trigger.assert_not_awaited()
+        self.assertEqual(sniper._trigger_tasks, set())
+        self.assertEqual(sniper._runtime[other.id].last_bid, Decimal("0.50"))
+        self.assertEqual(sniper._runtime[other.id].price_window, preserved_window)
+
+    async def test_holding_timeout_starts_exit(self):
+        sniper = PolySniper(NoopClient())
+        selected = target("a", "poly-a")
+        sniper.targets = [selected]
+        sniper.state = SniperState(
+            status="holding",
+            locked=True,
+            active_target_id=selected.id,
+            hold_start=100.0,
+        )
+        sniper._running = True
+        sniper.config.timeout_secs = Decimal("0.05")
+        sniper._exit_position = AsyncMock()
+
+        with patch(
+            "backend.services.poly_sniper.time.monotonic",
+            return_value=100.1,
+        ):
+            await sniper._holding_loop()
+
+        sniper._exit_position.assert_awaited_once_with("timeout")
+
+    async def test_successful_exit_resets_all_candidate_windows_to_latest_bids(self):
+        client = NoopClient()
+        client.generate_client_order_id = lambda: "exit-1"
+        client.place_order = AsyncMock(
+            return_value={"code": "0", "_clientOrderId": "exit-1"}
+        )
+        sniper = PolySniper(client)
+        active = target("a", "poly-a")
+        other = target("b", "poly-b")
+        sniper.targets = [active, other]
+        sniper._runtime = {
+            active.id: TargetRuntime(
+                last_bid=Decimal("0.31"),
+                calibrated=True,
+                baseline=Decimal("0.20"),
+                price_window=[(123.0, Decimal("0.20"))],
+            ),
+            other.id: TargetRuntime(
+                last_bid=Decimal("0.72"),
+                calibrated=True,
+                baseline=Decimal("0.60"),
+                price_window=[(123.0, Decimal("0.60"))],
+            ),
+        }
+        sniper.state = SniperState(
+            status="holding",
+            locked=True,
+            active_target_id=active.id,
+            buy_price=Decimal("0.20"),
+            buy_size=Decimal("5"),
+        )
+        sniper._running = True
+        sniper._snapshot_okx_bids = AsyncMock(
+            return_value=[(Decimal("0.19"), Decimal("5"))]
+        )
+        sniper._wait_order_final = AsyncMock(
+            return_value=(Decimal("5"), Decimal("0.95"), True)
+        )
+        sniper._confirm_exit = AsyncMock(return_value=True)
+
+        await sniper._exit_position("timeout")
+
+        self.assertTrue(sniper.running)
+        self.assertEqual(sniper.state.status, "monitoring")
+        self.assertFalse(sniper.state.locked)
+        self.assertEqual(sniper.state.active_target_id, "")
+        for target_id, latest_bid in (
+            (active.id, Decimal("0.31")),
+            (other.id, Decimal("0.72")),
+        ):
+            runtime = sniper._runtime[target_id]
+            self.assertEqual(runtime.price_window, [])
+            self.assertEqual(runtime.baseline, latest_bid)
+            self.assertTrue(runtime.calibrated)
+
     async def test_holding_task_does_not_start_when_snapshot_persistence_fails(self):
         sniper = TriggerSniper()
         selected = target("a", "poly-a")

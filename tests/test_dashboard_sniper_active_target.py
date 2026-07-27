@@ -40,6 +40,8 @@ class DashboardSniperActiveTargetTests(unittest.TestCase):
                 "bindSniperBookTarget",
                 "sniperTargetPrice",
                 "sniperOkxBestPrice",
+                "sniperBoundBookTarget",
+                "sniperBookTargetLabel",
                 "renderOkxOb",
             )
         )
@@ -52,6 +54,7 @@ let _snTargets=[
 ];
 let _snBoundTargetId='',_snBoundPolyToken='',_snBoundYesAsset='',_snBoundSide='';
 let _obNoSide=false,_bookWs=null,_polyToken='',_okxAsset='',_cachedOkxBids=[['0.999','4']],_cachedOkxAsks=[['0.70','5']];
+let _mktMap={{}};
 let calls=[];
 let elements={{'ob-id':{{}},'ob-b':{{}},'ob-a':{{}}}},formatted=[];
 let document={{getElementById:(id)=>elements[id]}};
@@ -68,7 +71,7 @@ assert.deepEqual(calls,[['poly-2','yes-2',true]]);
 assert.equal(_obNoSide,true);
 assert(Math.abs(sniperOkxBestPrice(active)-0.001)<1e-12);
 renderOkxOb();
-assert.equal(elements['ob-id'].textContent,'Live orderbook (NO)');
+assert.equal(elements['ob-id'].textContent,'Live orderbook (NO) · yes-2 NO');
 assert(formatted.some((value)=>Math.abs(value-0.30)<1e-12));
 assert(formatted.some((value)=>Math.abs(value-0.001)<1e-12));
 bindSniperBookTarget(active);
@@ -97,10 +100,17 @@ assert.equal(_obNoSide,false);
         tab_switch = extract_function(self.html, "stab")
         self.assertIn("generation!==_bookGeneration", connect_book)
         self.assertIn("socket!==_bookWs", connect_book)
-        self.assertIn("bindSniperBookTarget(bookTarget)", sync_status)
+        self.assertIn("syncSniperBookBinding(bookTarget)", sync_status)
+        self.assertIn("syncSniperBookView(previousActiveId,active)", sync_status)
+        self.assertIn("var bookTarget=_snActiveTargetId?", sync_status)
         self.assertIn("sniperTargetPrice(d,displayed)", sync_status)
         self.assertIn("requestSeq!==_snStatusRequestSeq", sync_status)
         self.assertIn("state==='error'", sync_status)
+        self.assertGreater(
+            tab_switch.find("syncSniperBookBinding(sniperViewedTarget())"),
+            tab_switch.find("disconnectBook(true)"),
+        )
+        self.assertIn("!MR&&!MSR&&!BSR&&!PR&&!SOR", tab_switch)
         self.assertNotIn("document.getElementById('pi').value=''", tab_switch)
         self.assertNotIn("d.last_poly_price", sync_status)
 
@@ -242,6 +252,10 @@ function deferred(){{let resolve;let promise=new Promise((done)=>{{resolve=done;
         render = extract_function(self.html, "renderSniperTargets")
         self.assertIn("var okxItems=_mkts.slice()", render)
         self.assertIn("yes_asset_id:t.yes_asset_id", render)
+        self.assertIn('data-view="', render)
+        self.assertIn("viewing?'Viewing':'View Book'", render)
+        self.assertIn("viewDisabled?' disabled'", render)
+        self.assertNotIn("sn-target-view sn-config", render)
 
         if not shutil.which("node"):
             self.skipTest("Node.js is not installed")
@@ -249,7 +263,7 @@ function deferred(){{let resolve;let promise=new Promise((done)=>{{resolve=done;
 const assert=require('assert');
 let box={{innerHTML:'',querySelectorAll:()=>[]}};
 let document={{getElementById:(id)=>id==='sn-targets'?box:null}};
-let _snPolyOptions=[],_mkts=[],_snActiveTargetId='',PR=false,_snLocked=false;
+let _snPolyOptions=[],_mkts=[],_snActiveTargetId='',_snViewedTargetId='target-1',PR=false,_snLocked=false;
 let _snTargets=[{{id:'target-1',poly_token_id:'poly-1',poly_outcome:'Argentina',yes_asset_id:'yes-1',okx_market:'Argentina market',okx_side:'YES'}}];
 function esc(value){{return String(value);}}
 function setSniperLocked(){{}}
@@ -260,6 +274,179 @@ assert(box.innerHTML.includes('value="yes-1" selected>Argentina market</option>'
 _snTargets[0].yes_asset_id='yes-2';_snTargets[0].okx_market='';
 renderSniperTargets();
 assert(box.innerHTML.includes('value="yes-2" selected>yes-2</option>'));
+"""
+        result = subprocess.run(
+            ["node", "-e", script],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_candidate_book_view_is_explicit_and_restored_after_active_target(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        self.assertIn(
+            "if(PR){syncSniperBookBinding(sniperPinnedBookTarget());return;}",
+            extract_function(self.html, "sob"),
+        )
+        self.assertIn(
+            "if(PR){syncSniperBookBinding(sniperPinnedBookTarget());return;}",
+            extract_function(self.html, "startPolyOb"),
+        )
+        helpers = "\n".join(
+            extract_function(self.html, name)
+            for name in (
+                "sniperViewedTarget",
+                "updateSniperTarget",
+                "viewSniperTarget",
+                "syncSniperBookView",
+                "sniperTargetHasBook",
+                "clearSniperBookBinding",
+                "releaseSniperBookBinding",
+                "syncSniperBookBinding",
+            )
+        )
+        script = f"""
+const assert=require('assert');
+let _snTargets=[
+  {{id:'first',poly_token_id:'poly-1',yes_asset_id:'yes-1',okx_side:'YES'}},
+  {{id:'second',poly_token_id:'poly-2',yes_asset_id:'yes-2',okx_side:'NO'}}
+];
+let _snPolyOptions=[];
+let _snViewedTargetId='first',_snViewReturnTargetId='',_snActiveTargetId='';
+let _snBoundTargetId='',_snBoundPolyToken='',_snBoundYesAsset='',_snBoundSide='';
+let PR=false,MR=false,MSR=false,BSR=false,SOR=false,_activeTab=2;
+let binds=[],renders=0,disconnects=[],manualRestores=0;
+function bindSniperBookTarget(target){{binds.push(target.id);}}
+function renderSniperTargets(){{renders+=1;}}
+function disconnectBook(clear){{disconnects.push(clear);}}
+function mtShowRunningBook(){{manualRestores+=1;return true;}}
+{helpers}
+
+// Editing another candidate must not steal the displayed order book.
+updateSniperTarget('second','yes_asset_id','yes-2b');
+assert.deepEqual(binds,[]);
+updateSniperTarget('first','yes_asset_id','yes-1b');
+assert.deepEqual(binds,['first']);
+
+// View is an explicit display-only selection.
+binds=[];
+viewSniperTarget('second');
+assert.equal(_snViewedTargetId,'second');
+assert.deepEqual(binds,['second']);
+
+// A new trigger pins the active target, then the previous view returns.
+let active=_snTargets[0];
+syncSniperBookView('',active);
+assert.equal(_snViewedTargetId,'first');
+assert.equal(_snViewReturnTargetId,'second');
+_snActiveTargetId='first';
+let before=binds.length;
+viewSniperTarget('second');
+assert.equal(_snViewedTargetId,'first');
+assert.equal(binds.length,before);
+_snViewedTargetId='second';
+syncSniperBookView('first',active);
+assert.equal(_snViewedTargetId,'first');
+_snActiveTargetId='';
+syncSniperBookView('first',null);
+assert.equal(_snViewedTargetId,'second');
+assert.equal(_snViewReturnTargetId,'');
+
+// Stopped Sniper cannot steal the shared book outside the Poly tab.
+_snActiveTargetId='';_snBoundTargetId='second';_activeTab=3;
+syncSniperBookBinding(_snTargets[1]);
+assert.equal(binds.length,before);
+assert.deepEqual(disconnects,[true]);
+_activeTab=2;
+syncSniperBookBinding(_snTargets[1]);
+assert.equal(binds[binds.length-1],'second');
+PR=true;_activeTab=3;
+syncSniperBookBinding(_snTargets[0]);
+assert.equal(binds[binds.length-1],'first');
+PR=false;MR=true;_activeTab=2;_snBoundTargetId='first';before=binds.length;
+syncSniperBookBinding(_snTargets[1]);
+assert.equal(binds.length,before);
+assert.equal(manualRestores,1);
+"""
+        result = subprocess.run(
+            ["node", "-e", script],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_running_sniper_rejects_non_sniper_book_takeover(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        sob = extract_function(self.html, "sob")
+        start_poly = extract_function(self.html, "startPolyOb")
+        script = f"""
+const assert=require('assert');
+let PR=true,calls=[];
+function sniperPinnedBookTarget(){{return {{id:'active'}};}}
+function syncSniperBookBinding(target){{calls.push(target.id);}}
+function clearSniperBookBinding(){{throw new Error('must not clear Sniper ownership');}}
+function connectBook(){{throw new Error('must not connect a non-Sniper pair');}}
+{sob}
+{start_poly}
+sob('manual-market');
+startPolyOb('sniper-old-token');
+assert.deepEqual(calls,['active','active']);
+"""
+        result = subprocess.run(
+            ["node", "-e", script],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_candidate_add_remove_and_url_reset_clean_book_binding(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        add_target = extract_function(self.html, "addSniperTarget")
+        remove_target = extract_function(self.html, "removeSniperTarget")
+        viewed_target = extract_function(self.html, "sniperViewedTarget")
+        reset_url = extract_function(self.html, "onPolyInput")
+        self.assertIn("hadSniperBook", reset_url)
+        self.assertIn("disconnectBook(true)", reset_url)
+        reset_state = extract_function(self.html, "resetSniperViewState")
+        self.assertIn("_snViewedTargetId=''", reset_state)
+        self.assertIn("_snViewReturnTargetId=''", reset_state)
+
+        script = f"""
+const assert=require('assert');
+let PR=false;
+let _snTargets=[],_snViewedTargetId='',_snViewReturnTargetId='',seq=0;
+let renders=0,syncs=[];
+function snTargetId(){{seq+=1;return 'generated-'+seq;}}
+function renderSniperTargets(){{renders+=1;}}
+function syncSniperBookBinding(target){{syncs.push(target?target.id:null);}}
+{viewed_target}
+{add_target}
+{remove_target}
+
+addSniperTarget({{id:'first',poly_token_id:'',yes_asset_id:''}});
+addSniperTarget({{id:'second',poly_token_id:'poly-2',yes_asset_id:'yes-2'}});
+assert.equal(_snViewedTargetId,'first');
+assert.deepEqual(syncs,[]);
+
+removeSniperTarget('second');
+assert.equal(_snViewedTargetId,'first');
+assert.deepEqual(syncs,[]);
+addSniperTarget({{id:'second',poly_token_id:'poly-2',yes_asset_id:'yes-2'}});
+removeSniperTarget('first');
+assert.equal(_snViewedTargetId,'second');
+assert.deepEqual(syncs,['second']);
+removeSniperTarget('second');
+assert.equal(_snViewedTargetId,'');
+assert.deepEqual(syncs,['second',null]);
 """
         result = subprocess.run(
             ["node", "-e", script],
