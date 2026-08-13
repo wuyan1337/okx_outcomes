@@ -1,8 +1,9 @@
 """SQLite database for multi-account management."""
 import sqlite3
 import json
+import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 from cryptography.fernet import Fernet
 
 from .proxy_nodes import PROXY_NODES
@@ -12,6 +13,63 @@ DB_PATH = Path(__file__).parent.parent.parent / "data" / "accounts.db"
 # The generated key is stored beside the database; this is local at-rest
 # protection, not a replacement for host-level access control.
 _KEY_FILE = Path(__file__).parent.parent.parent / "data" / ".key"
+
+_ACCOUNT_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+_ACCOUNT_STATE_FILE_TEMPLATES = (
+    "pending_sells_d_{account_id}.json",
+    "pending_sells_s_{account_id}.json",
+    "cost_layers_{account_id}.json",
+)
+
+
+def validate_account_id(account_id: str) -> str:
+    """Reject account IDs that could escape exact database/file targets."""
+    if (
+        not isinstance(account_id, str)
+        or _ACCOUNT_ID_PATTERN.fullmatch(account_id) is None
+    ):
+        raise ValueError("Invalid account ID")
+    return account_id
+
+
+def cleanup_account_state_files(
+    account_id: str,
+    *,
+    data_dir: Optional[Union[str, Path]] = None,
+) -> dict:
+    """Remove only the three account-scoped JSON files, reporting each one."""
+    validated_id = validate_account_id(account_id)
+    root = Path(data_dir) if data_dir is not None else DB_PATH.parent
+    files = []
+
+    for template in _ACCOUNT_STATE_FILE_TEMPLATES:
+        name = template.format(account_id=validated_id)
+        path = root / name
+        entry = {"name": name, "status": "missing"}
+        try:
+            path.unlink()
+            entry["status"] = "deleted"
+        except FileNotFoundError:
+            # Missing is a successful, idempotent terminal state.
+            pass
+        except OSError as exc:
+            entry["status"] = "error"
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+        files.append(entry)
+
+    errors = [entry for entry in files if entry["status"] == "error"]
+    return {
+        "account_id": validated_id,
+        "complete": not errors,
+        "files": files,
+        "deleted": [
+            entry["name"] for entry in files if entry["status"] == "deleted"
+        ],
+        "missing": [
+            entry["name"] for entry in files if entry["status"] == "missing"
+        ],
+        "errors": errors,
+    }
 
 
 def _get_cipher():
@@ -205,11 +263,22 @@ def update_account(account_id: str, **kwargs) -> bool:
 
 
 def delete_account(account_id: str) -> bool:
+    """Atomically delete credentials, cascaded state, and exact legacy Poly state."""
+    validated_id = validate_account_id(account_id)
     conn = get_db()
-    conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
-    conn.commit()
-    conn.close()
-    return True
+    try:
+        with conn:
+            cursor = conn.execute(
+                "DELETE FROM accounts WHERE id = ?", (validated_id,)
+            )
+            if cursor.rowcount > 0:
+                conn.execute(
+                    "DELETE FROM global_config WHERE key = ?",
+                    (f"poly_state_{validated_id}",),
+                )
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
 
 
 # ─── Global Config ───

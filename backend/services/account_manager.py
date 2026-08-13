@@ -10,7 +10,8 @@ from ..core.logging_config import audit_event as _emit_audit_event, log_context
 from ..core.price_utils import align_okx_price, as_decimal, price_to_cents
 from ..core.database import (
     get_accounts, get_account_decrypted, create_account, update_account,
-    delete_account, get_available_proxies, get_used_proxies, PROXY_NODES,
+    delete_account, cleanup_account_state_files, get_available_proxies,
+    get_used_proxies, PROXY_NODES,
     get_global_config, set_global_config, get_sniper_state, save_sniper_state,
     get_sniper_old_state, save_sniper_old_state
 )
@@ -1790,9 +1791,10 @@ class AccountManager:
             )
             raise
 
-    async def remove_account(self, account_id: str) -> bool:
-        """Stop strategies, close client, remove from DB."""
+    async def remove_account(self, account_id: str) -> dict:
+        """Stop all writers, commit the DB deletion, then remove exact state files."""
         started_ns = time.perf_counter_ns()
+        closed_instance = False
         audit_event(
             "account.remove_started",
             account_id=account_id,
@@ -1803,14 +1805,138 @@ class AccountManager:
             # empty. Do not spend another account-level cancelAll allowance or
             # install a fresh destructive write after that proof.
             await self.instances[account_id].close(cancel_orders=False)
-            del self.instances[account_id]
-        delete_account(account_id)
+            # A closed client/strategy graph must never remain discoverable as
+            # a live account. If the database write fails below, recovery can
+            # only register a newly constructed instance.
+            self.instances.pop(account_id, None)
+            closed_instance = True
+        try:
+            deleted = delete_account(account_id)
+        except Exception as exc:
+            await self._recover_failed_account_removal(
+                account_id,
+                closed_instance=closed_instance,
+                failure="database_exception",
+                cause=exc,
+                started_ns=started_ns,
+            )
+            raise
+        if not deleted:
+            error = RuntimeError("Account database row was not deleted")
+            await self._recover_failed_account_removal(
+                account_id,
+                closed_instance=closed_instance,
+                failure="database_miss",
+                cause=error,
+                started_ns=started_ns,
+            )
+            raise error
+        state_cleanup = cleanup_account_state_files(account_id)
+        result = {
+            "deleted": bool(deleted),
+            "cleanup_complete": bool(state_cleanup["complete"]),
+            "state_cleanup": state_cleanup,
+        }
         audit_event(
             "account.remove_completed",
+            level=(
+                logging.INFO
+                if result["deleted"] and result["cleanup_complete"]
+                else logging.ERROR
+            ),
             account_id=account_id,
+            deleted=result["deleted"],
+            cleanup_complete=result["cleanup_complete"],
+            cleanup_errors=state_cleanup["errors"],
             elapsed_ms=_elapsed_ms(started_ns),
         )
-        return True
+        return result
+
+    async def _recover_failed_account_removal(
+        self,
+        account_id: str,
+        *,
+        closed_instance: bool,
+        failure: str,
+        cause: BaseException,
+        started_ns: int,
+    ) -> Optional[AccountInstance]:
+        """Reload a fresh live graph after a failed post-close DB deletion."""
+        if not closed_instance:
+            audit_event(
+                "account.remove_failed",
+                level=logging.ERROR,
+                account_id=account_id,
+                failure=failure,
+                instance_recovery="not_required",
+                error=cause,
+                elapsed_ms=_elapsed_ms(started_ns),
+            )
+            return self.instances.get(account_id)
+
+        # Be explicit even if a future refactor calls this after registering a
+        # partial object: never expose anything derived from the closed graph.
+        self.instances.pop(account_id, None)
+        try:
+            replacement = await self._load_account(account_id)
+        except asyncio.CancelledError:
+            audit_event(
+                "account.remove_failed_recovery_cancelled",
+                level=logging.ERROR,
+                account_id=account_id,
+                failure=failure,
+                error=cause,
+                elapsed_ms=_elapsed_ms(started_ns),
+            )
+            raise
+        except Exception as recovery_exc:
+            partial = self.instances.pop(account_id, None)
+            if partial is not None:
+                try:
+                    await partial.close(cancel_orders=False)
+                except Exception:
+                    logger.exception(
+                        "Failed to close partial removal recovery for %s",
+                        account_id,
+                    )
+            audit_event(
+                "account.remove_failed_recovery_failed",
+                level=logging.CRITICAL,
+                account_id=account_id,
+                failure=failure,
+                error=cause,
+                recovery_error=recovery_exc,
+                elapsed_ms=_elapsed_ms(started_ns),
+            )
+            raise RuntimeError(
+                "Account deletion failed and a fresh live instance could not be restored"
+            ) from recovery_exc
+
+        if replacement is None:
+            # A database miss can mean another writer already removed the row.
+            # The old object remains closed and absent; no state files are
+            # touched because this process did not prove its own DB deletion.
+            self.instances.pop(account_id, None)
+            audit_event(
+                "account.remove_failed_recovery_not_found",
+                level=logging.ERROR,
+                account_id=account_id,
+                failure=failure,
+                error=cause,
+                elapsed_ms=_elapsed_ms(started_ns),
+            )
+            return None
+
+        audit_event(
+            "account.remove_failed_recovered",
+            level=logging.ERROR,
+            account_id=account_id,
+            failure=failure,
+            instance_recovery="fresh_instance_loaded",
+            error=cause,
+            elapsed_ms=_elapsed_ms(started_ns),
+        )
+        return replacement
 
     async def update_account_credentials(self, account_id: str, **kwargs):
         """Update credentials and reload client."""

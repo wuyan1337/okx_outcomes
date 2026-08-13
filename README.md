@@ -148,7 +148,7 @@ SQLite + Fernet key + JSON runtime files
 | `ss.txt` | 本地 OKX Outcome API 文档副本，不是程序运行依赖，当前也不应作为凭据示例。 |
 | `scripts/bootstrap-egress-node.sh` | 在新 Ubuntu 出口 VPS 创建受限 SSH forwarding 用户；只允许 Bot 单 IP、key auth 和 OKX 目标，不启动公网 SOCKS。失败会恢复原 SSH 配置/authorized key。 |
 | `scripts/install-egress-tunnel.sh` | 在 Bot Ubuntu 主机核验 host key，安装 `127.0.0.1` dynamic SOCKS systemd 服务并做 Region 连通检查。 |
-| `scripts/proxy_nodes.py` | 原子管理本机 node registry、列出 backend 实际节点并执行统一延迟 benchmark。 |
+| `scripts/proxy_nodes.py` | 原子新增、替换或移除本机自定义 node registry 条目，列出 backend 实际节点并执行统一延迟 benchmark；内置节点不能被 `remove` 删除。 |
 | `data/` | 本地运行数据，Git 已忽略；包含数据库、密钥和策略状态，不能随意清空。 |
 
 ### 4.2 Backend
@@ -202,7 +202,7 @@ SQLite + Fernet key + JSON runtime files
 | `tests/test_app_config_safety.py` | 凭据/region 变更前的本地状态、交易所敞口、agent key 和 client 原子切换。 |
 | `tests/test_poly_monitor_empty_book.py` | Monitor 对 REST/WS 空 bid 的风控、初始空簿拒绝和异常响应忽略。 |
 | `tests/test_latency_probe.py` | Region/真实 endpoint、冷/热采样、统计、失败分类、Poly shared route 和并发隔离。 |
-| `tests/test_proxy_nodes.py` | 稳定节点 ID、canonical 名称、本地 registry、重复名和 tunnel loopback 约束。 |
+| `tests/test_proxy_nodes.py` | 稳定/退役节点 ID、canonical 名称、本地 registry、原子 add/remove、内置节点删除保护、重复名和 tunnel loopback 约束。 |
 | `tests/test_dashboard_latency_ui.py` | Health/Add Account 延迟展示、Region、请求取消、旧响应隔离和 Sniper 真实埋点展示。 |
 | `tests/test_app_latency_api.py` | latency API 参数传递、节点 assignment metadata、账户真实 health code 和零余额。 |
 
@@ -291,7 +291,7 @@ http://127.0.0.1:8899/
 
 Telegram token/chat 配置是全局共享的；各账户策略引用同一个 notifier，但通知正文会带账户上下文。
 
-同一个 proxy node 当前只允许分配给一个账户。删除账户不是直接删数据库：服务端会先执行完整 Flash Close，确认交易所开放订单、开放仓位以及 Manual/两套 Sniper 的本地收尾都安全。Flash 任一步失败会返回 409 并保留账户、实例和凭据；全部通过后才关闭实例并删除 SQLite 账户行及其 Sniper 状态。后续数据库删除本身异常时返回 500，不能显示成删除成功。
+同一个 proxy node 当前只允许分配给一个账户。删除账户不是直接删数据库：服务端会先执行完整 Flash Close，确认交易所开放订单、开放仓位以及 Manual/两套 Sniper 的本地收尾都安全。Flash 任一步失败会返回 409 并保留账户、实例和凭据；全部通过后才关闭实例并删除 SQLite 账户行、对应 Sniper 状态和精确的旧 `poly_state_{account_id}`。数据库提交后再删除该账户的 `pending_sells_d_*`、`pending_sells_s_*` 与 `cost_layers_*` 三个精确文件；不会动其他账户、Telegram、节点 registry、Poly 映射或日志。文件清理失败时响应会明确给出 `deleted=true`、`cleanup_complete=false` 并写审计日志，不能把已经删除的凭据误报成“账户仍在”。
 
 ### 6.2 Order Book
 
@@ -743,23 +743,54 @@ Sniper 面板显示最后一次各分段、`Trigger→Ack`，以及最近窗口�
 
 数据库和 API 内部继续使用已有稳定 ID，避免破坏已保存账户；所有用户界面统一显示 `国家-城市-序号 | 城市 | 路由`：
 
-| 稳定 ID | 统一显示名 |
+| 当前内置稳定 ID | 统一显示名 |
 | --- | --- |
-| `JP1`…`JP3` | `JP-TYO-01`…`JP-TYO-03` |
+| `JP1` / `JP2` | `JP-TYO-01` / `JP-TYO-02` |
 | `OSAKA` | `JP-OSA-01` |
-| `SG1` | `SG-SIN-01` |
-| `K1` | `KR-SEL-01` |
 | `SYD1` / `SYD2` | `AU-SYD-01` / `AU-SYD-02` |
 
-新节点名必须使用 `CC-CITY-NN`，例如 `JP-TYO-06`。`direct`、旧式 `socks5` 和新式 `tunnel` 是路由类型，不再混进节点名。仍在使用的稳定 ID 保留以兼容现有账户；已失效的 `JP4`/`JP5` 已退役，自定义 registry 不能重新注册它们，旧数据库若仍绑定这些 ID 会拒绝加载而不会静默改走 Direct。新节点只允许 Direct 或绑定 `127.0.0.1` 的 SSH tunnel，不允许通过注册工具新增公网裸 SOCKS5。
+新节点名必须使用 `CC-CITY-NN`，例如 `JP-TYO-06`。`direct`、旧式 `socks5` 和新式 `tunnel` 是路由类型，不再混进节点名。`JP3`、`JP4`、`JP5`、`SG1`、`K1` 已永久退役：它们不在内置可选节点中，自定义 registry 不能重新注册或覆盖，旧数据库若仍绑定这些 ID 会拒绝加载而不会静默改走 Direct。新节点必须使用一个未用过的新 ID，不能复用退役 ID。新节点只允许 Direct 或绑定 `127.0.0.1` 的 SSH tunnel，不允许通过注册工具新增公网裸 SOCKS5。
 
 本机扩展写入 `data/proxy_nodes.json`，升级代码时不要覆盖它。服务在启动时读取 registry，所以注册或替换节点后必须重启这一套单进程 FastAPI 服务。先检查有效配置：
 
 ```bash
-python3 scripts/proxy_nodes.py list
+cd /opt/okx-outcomes-bot
+
+okx_bot_python() {
+  local load_state service_user
+  load_state="$(systemctl show --property=LoadState --value okx-bot.service)" || {
+    echo "cannot inspect okx-bot.service" >&2
+    return 1
+  }
+  if [[ -z "$load_state" || "$load_state" == "not-found" ]]; then
+    echo "okx-bot.service was not found; use the real Bot unit name" >&2
+    return 1
+  fi
+  service_user="$(systemctl show --property=User --value okx-bot.service)" || {
+    echo "cannot read okx-bot.service User=" >&2
+    return 1
+  }
+  sudo -u "${service_user:-root}" -- /opt/okx-bot-venv/bin/python "$@"
+}
+
+okx_bot_python scripts/proxy_nodes.py list
 ```
 
-registry 损坏时 CLI 会拒绝覆盖；后端则记录错误并保留可用内置节点。canonical 名称、Direct route 和本机 tunnel port 都不能重复。
+registry CLI 必须与 `okx-bot.service` 使用同一个 OS 用户，因为工具会把 `data/proxy_nodes.json` 原子写成 `0600`。上面的 helper 读取 unit 的实际 `User=`；空值按 systemd 语义使用 root。如果 unit 名不是 `okx-bot.service`，应先替换函数中的 unit 名。不要无条件使用 `sudo python`，否则非 root Bot 重启后可能读不到 root 拥有的 registry。每次重新登录 shell 后需要重新定义 helper。
+
+若旧命令曾留下错误属主的 `data/proxy_nodes.json` 或 `data/proxy_nodes.json.lock`，按 [NODE_INSTALL_GUIDE.md](NODE_INSTALL_GUIDE.md) 的精确文件修复步骤处理；不要递归修改整个 `data/`，也不要碰账户数据库、`.key` 或策略状态。
+
+registry 损坏或还含退役 ID 时 CLI 会明确报错且不会改写文件；后端则记录错误、忽略退役条目并保留可用内置节点。canonical 名称、Direct route 和本机 tunnel port 都不能重复。退役只保留 ID 防复活，不代表 CLI 会自动删除旧 tunnel、密钥或 systemd unit；这些系统资源必须在确认目标后单独清理。
+
+移除一个不再使用的本地自定义节点时，先确认没有账户仍绑定该 ID，再以同一个 service user 执行：
+
+```bash
+okx_bot_python scripts/proxy_nodes.py remove --id JP-TYO-06
+okx_bot_python scripts/proxy_nodes.py list
+sudo systemctl restart okx-bot
+```
+
+`remove` 只原子删除 `data/proxy_nodes.json` 中指定的自定义条目；没有 override 的纯内置节点和未知 ID 会被拒绝，其他自定义条目不会变化。如果删除的是内置 ID 的本地 override，内置定义会自动恢复，内置节点本身不会被删除。它不会删除账户、停止 tunnel unit、删除 SSH key 或清理 `/etc/okx-egress/`。仍被账户引用的纯自定义 ID 一旦移除，服务重启时该账户会因 unknown node 拒绝加载，所以必须先迁移或删除对应账户。
 
 ### 15.3 新 Ubuntu 出口 VPS 的统一安装流程
 
@@ -798,12 +829,12 @@ registry 损坏时 CLI 会拒绝覆盖；后端则记录错误并保留可用内
 5. tunnel 通过对应 Region 的 OKX 连通检查后，在 Bot 项目目录注册并重启 Bot 服务：
 
    ```bash
-   python3 scripts/proxy_nodes.py add \
+   okx_bot_python scripts/proxy_nodes.py add \
      --id JP-TYO-06 \
      --location Tokyo \
      --port 9116
 
-   python3 scripts/proxy_nodes.py list
+   okx_bot_python scripts/proxy_nodes.py list
    ```
 
 脚本只让 SOCKS 监听 `127.0.0.1`，远端账户只允许 key auth 和指定的 OKX 443/8443 转发。云安全组还应把 SSH 入站限制到 Bot IP。不要开放公网 `9111`，也不要把专用私钥复制进项目、ZIP 或 Git。
@@ -823,7 +854,7 @@ registry 损坏时 CLI 会拒绝覆盖；后端则记录错误并保留可用内
 命令行可先做同条件比较：
 
 ```bash
-python3 scripts/proxy_nodes.py benchmark \
+okx_bot_python scripts/proxy_nodes.py benchmark \
   --region AU \
   --samples 5 \
   --yes-asset-id REAL_OKX_YES_ASSET_ID \
@@ -1289,7 +1320,45 @@ Cancel All 只撤单，不会撤销已经发生的 fill。Auto-Rebalance 会尝�
 
 ### `scripts/`
 
-`scripts/` 现在包含出口 VPS bootstrap、Bot 主机 SSH tunnel 安装和节点 registry/benchmark 工具；应用不会自动执行它们，但新节点接入和生产排障需要保留，使用方法见第 15 章。
+`scripts/` 现在包含出口 VPS bootstrap、Bot 主机 SSH tunnel 安装、节点 registry/benchmark 工具，以及生产 Caddy 自动恢复 drop-in 模板；应用不会自动执行它们，但新节点接入和生产排障需要保留，使用方法见第 15 章。
+
+生产站若使用 systemd 管理的 Caddy，可把 `scripts/caddy-restart.conf` 安装为自动恢复 drop-in；使用 Nginx 时不要安装。这不会修改 Caddyfile、域名或根路径，也不应新增 `/okx` alias。准确步骤如下：
+
+```bash
+cd /opt/okx-outcomes-bot
+sudo systemctl status caddy.service --no-pager
+sudo systemctl cat caddy.service
+
+sudo install -d -o root -g root -m 0755 \
+  /etc/systemd/system/caddy.service.d
+
+if sudo test -e /etc/systemd/system/caddy.service.d/10-restart.conf; then
+  backup="/etc/systemd/system/caddy.service.d/10-restart.conf.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  sudo cp -a /etc/systemd/system/caddy.service.d/10-restart.conf "$backup"
+  echo "backup: $backup"
+fi
+
+sudo install -o root -g root -m 0644 \
+  scripts/caddy-restart.conf \
+  /etc/systemd/system/caddy.service.d/10-restart.conf
+sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo systemctl daemon-reload
+sudo systemd-analyze verify caddy.service
+sudo systemctl restart caddy.service
+
+sudo systemctl show caddy.service \
+  --property=Restart --property=RestartUSec
+sudo systemctl is-active caddy.service
+curl --silent --show-error --fail --max-time 10 \
+  --resolve YOUR_PRODUCTION_DOMAIN:443:127.0.0.1 \
+  https://YOUR_PRODUCTION_DOMAIN/
+curl --silent --show-error --fail --max-time 10 \
+  https://YOUR_PRODUCTION_DOMAIN/
+```
+
+如果 `systemctl cat caddy.service` 显示的配置文件不是 `/etc/caddy/Caddyfile`，`caddy validate` 必须改用 unit 中的真实路径和实际 adapter；校验失败时不要重启。第一条 curl 强制直连本机 Caddy，第二条验证正常公网 DNS/CDN 路径。预期是 `Restart=on-failure`、`RestartUSec=5s`、服务 `active` 且两条 HTTPS 都成功。`systemctl stop caddy` 属于人工停止，`on-failure` 不会自动拉起，这是正常语义。不要在实盘期间 kill Caddy 做故障演练。出口节点指南 [NODE_INSTALL_GUIDE.md](NODE_INSTALL_GUIDE.md) 也保留了同一套完整步骤。
+
+如果重启失败，先运行 `sudo journalctl -u caddy.service -n 100 --no-pager`。回滚时删除新装的 `10-restart.conf`；若安装前存在备份，则恢复安装步骤打印的精确备份文件；然后执行 `systemctl daemon-reload`、重启 Caddy 并重新验证 HTTPS。不要用通配符猜测备份目标。
 
 ### `auto-push.sh`
 
@@ -1303,6 +1372,7 @@ Cancel All 只撤单，不会撤销已经发生的 fill。Auto-Rebalance 会尝�
 
 - [ ] 使用独立、小资金 OKX Outcomes 账户；
 - [ ] 修改默认 Web 登录密码并启用 HTTPS；
+- [ ] 确认 Caddy/Nginx 正常监听 80/443；若使用 Caddy，已通过 `systemctl show` 确认 `Restart=on-failure` 与 `RestartUSec=5s`；
 - [ ] 确认只有一个 bot 进程，Uvicorn 没有启用多 worker，也没有第二实例共享 `data/`；
 - [ ] 确认服务器时间同步；
 - [ ] 验证每个账户的代理和只读 open orders/positions 安全探测；

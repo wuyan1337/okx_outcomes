@@ -18,6 +18,7 @@ except ModuleNotFoundError:
         "create_account",
         "update_account",
         "delete_account",
+        "cleanup_account_state_files",
         "get_available_proxies",
         "get_used_proxies",
         "get_global_config",
@@ -308,13 +309,167 @@ class AccountManagerSniperShutdownTests(unittest.IsolatedAsyncioTestCase):
         manager = account_manager.AccountManager()
         instance = SimpleNamespace(close=AsyncMock())
         manager.instances["account-a"] = instance
+        cleanup = {
+            "account_id": "account-a",
+            "complete": True,
+            "files": [],
+            "deleted": [],
+            "missing": [],
+            "errors": [],
+        }
 
-        with patch.object(account_manager, "delete_account") as delete:
+        with (
+            patch.object(account_manager, "delete_account", return_value=True) as delete,
+            patch.object(
+                account_manager,
+                "cleanup_account_state_files",
+                return_value=cleanup,
+            ) as clean_files,
+        ):
             result = await manager.remove_account("account-a")
 
-        self.assertTrue(result)
+        self.assertEqual(
+            result,
+            {
+                "deleted": True,
+                "cleanup_complete": True,
+                "state_cleanup": cleanup,
+            },
+        )
         instance.close.assert_awaited_once_with(cancel_orders=False)
         delete.assert_called_once_with("account-a")
+        clean_files.assert_called_once_with("account-a")
+        self.assertNotIn("account-a", manager.instances)
+
+    async def test_remove_account_cleans_files_only_after_database_commit(self):
+        manager = account_manager.AccountManager()
+        events = []
+
+        async def close(*, cancel_orders):
+            self.assertFalse(cancel_orders)
+            events.append("writers_closed")
+
+        def delete(_account_id):
+            events.append("database_committed")
+            return True
+
+        def cleanup(_account_id):
+            events.append("files_cleaned")
+            return {
+                "account_id": "account-a",
+                "complete": False,
+                "files": [],
+                "deleted": [],
+                "missing": [],
+                "errors": [{"name": "cost_layers_account-a.json", "status": "error"}],
+            }
+
+        manager.instances["account-a"] = SimpleNamespace(close=close)
+        with (
+            patch.object(account_manager, "delete_account", side_effect=delete),
+            patch.object(
+                account_manager,
+                "cleanup_account_state_files",
+                side_effect=cleanup,
+            ),
+        ):
+            result = await manager.remove_account("account-a")
+
+        self.assertEqual(
+            events, ["writers_closed", "database_committed", "files_cleaned"]
+        )
+        self.assertTrue(result["deleted"])
+        self.assertFalse(result["cleanup_complete"])
+
+    async def test_remove_account_database_miss_drops_closed_instance_and_does_not_clean_files(self):
+        manager = account_manager.AccountManager()
+        closed_instance = SimpleNamespace(close=AsyncMock())
+        manager.instances["account-a"] = closed_instance
+
+        with (
+            patch.object(account_manager, "delete_account", return_value=False),
+            patch.object(account_manager, "cleanup_account_state_files") as cleanup,
+            patch.object(
+                manager,
+                "_load_account",
+                AsyncMock(return_value=None),
+            ) as reload_account,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "database row was not deleted"):
+                await manager.remove_account("account-a")
+
+        closed_instance.close.assert_awaited_once_with(cancel_orders=False)
+        reload_account.assert_awaited_once_with("account-a")
+        cleanup.assert_not_called()
+        self.assertNotIn("account-a", manager.instances)
+
+    async def test_remove_account_database_exception_reloads_fresh_instance(self):
+        manager = account_manager.AccountManager()
+        closed_instance = SimpleNamespace(close=AsyncMock())
+        fresh_instance = SimpleNamespace(close=AsyncMock())
+        manager.instances["account-a"] = closed_instance
+
+        async def reload_account(account_id):
+            self.assertEqual(account_id, "account-a")
+            self.assertNotIn(account_id, manager.instances)
+            manager.instances[account_id] = fresh_instance
+            return fresh_instance
+
+        with (
+            patch.object(
+                account_manager,
+                "delete_account",
+                side_effect=RuntimeError("database locked"),
+            ),
+            patch.object(account_manager, "cleanup_account_state_files") as cleanup,
+            patch.object(
+                manager,
+                "_load_account",
+                AsyncMock(side_effect=reload_account),
+            ) as reload_mock,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "database locked"):
+                await manager.remove_account("account-a")
+
+        closed_instance.close.assert_awaited_once_with(cancel_orders=False)
+        fresh_instance.close.assert_not_awaited()
+        reload_mock.assert_awaited_once_with("account-a")
+        cleanup.assert_not_called()
+        self.assertIs(manager.instances["account-a"], fresh_instance)
+        self.assertIsNot(manager.instances["account-a"], closed_instance)
+
+    async def test_remove_account_failed_reload_closes_partial_and_leaves_no_instance(self):
+        manager = account_manager.AccountManager()
+        closed_instance = SimpleNamespace(close=AsyncMock())
+        partial_instance = SimpleNamespace(close=AsyncMock())
+        manager.instances["account-a"] = closed_instance
+
+        async def failed_reload(account_id):
+            manager.instances[account_id] = partial_instance
+            raise RuntimeError("reload failed")
+
+        with (
+            patch.object(
+                account_manager,
+                "delete_account",
+                side_effect=RuntimeError("database locked"),
+            ),
+            patch.object(account_manager, "cleanup_account_state_files") as cleanup,
+            patch.object(
+                manager,
+                "_load_account",
+                AsyncMock(side_effect=failed_reload),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "fresh live instance could not be restored",
+            ):
+                await manager.remove_account("account-a")
+
+        closed_instance.close.assert_awaited_once_with(cancel_orders=False)
+        partial_instance.close.assert_awaited_once_with(cancel_orders=False)
+        cleanup.assert_not_called()
         self.assertNotIn("account-a", manager.instances)
 
 

@@ -938,14 +938,26 @@ async def remove_account(account_id: str, user: str = Depends(verify_auth)):
             },
         )
     try:
-        await manager.remove_account(account_id)
+        removal = await manager.remove_account(account_id)
     except Exception as exc:
         logger.error("Account removal failed for %s: %s", account_id, exc)
         return JSONResponse(
             status_code=500,
             content={"ok": False, "error": str(exc), "close": close_result},
         )
-    return {"ok": True, "close": close_result}
+    payload = {
+        "ok": bool(removal["deleted"]),
+        "deleted": bool(removal["deleted"]),
+        "cleanup_complete": bool(removal["cleanup_complete"]),
+        "state_cleanup": removal["state_cleanup"],
+        "close": close_result,
+    }
+    if payload["deleted"] and not payload["cleanup_complete"]:
+        payload["warning"] = (
+            "Account credentials were deleted, but one or more local state "
+            "files could not be removed; check the audit log"
+        )
+    return payload
 
 
 # ─── Per-Account APIs ───

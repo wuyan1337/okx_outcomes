@@ -293,5 +293,20 @@ printf 'Installed %s on 127.0.0.1:%s (region check: %s).\n' \
 printf 'Host key verified: %s\n' "$ACTUAL_FINGERPRINT"
 printf 'Systemd unit: %s\n' "$UNIT_NAME"
 printf '%s\n' 'No public SOCKS port was opened.'
-printf 'Register it with: python3 scripts/proxy_nodes.py add --id %s --location CITY --port %s\n' \
-  "$NODE_ID" "$LOCAL_PORT"
+printf '%s\n' 'Register the node from the Bot project with scripts/proxy_nodes.py.'
+if systemctl cat okx-bot.service >/dev/null 2>&1; then
+  BOT_SERVICE_USER="$(systemctl show --property=User --value okx-bot.service)"
+  BOT_SERVICE_USER="${BOT_SERVICE_USER:-root}"
+  printf 'IMPORTANT: You MUST run that CLI as okx-bot.service User=%s.\n' \
+    "$BOT_SERVICE_USER"
+  printf '%s\n' 'Running it as arbitrary root can create a root:root 0600 registry that a non-root Bot cannot read.'
+  printf '  cd /opt/okx-outcomes-bot && sudo -u %q -- /opt/okx-bot-venv/bin/python scripts/proxy_nodes.py add --id %q --location CITY --port %q\n' \
+    "$BOT_SERVICE_USER" "$NODE_ID" "$LOCAL_PORT"
+else
+  printf '%s\n' \
+    'WARNING: okx-bot.service was not found, so its registry owner cannot be determined.' \
+    'Do not run the registry CLI until the Bot service is installed and its effective User= is known.'
+  printf 'Required arguments later: add --id %s --location CITY --port %s\n' \
+    "$NODE_ID" "$LOCAL_PORT"
+fi
+printf '%s\n' 'See NODE_INSTALL_GUIDE.md for the okx_bot_python helper and verification steps.'

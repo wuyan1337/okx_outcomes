@@ -78,12 +78,18 @@ def _backend_registry_api():
     try:
         from backend.core.proxy_nodes import (
             BUILTIN_PROXY_NODES,
+            RETIRED_PROXY_NODE_IDS,
             load_proxy_nodes,
             normalise_proxy_node,
         )
     except ImportError as exc:
         raise RegistryError(f"backend proxy-node registry is unavailable: {exc}") from exc
-    return BUILTIN_PROXY_NODES, load_proxy_nodes, normalise_proxy_node
+    return (
+        BUILTIN_PROXY_NODES,
+        RETIRED_PROXY_NODE_IDS,
+        load_proxy_nodes,
+        normalise_proxy_node,
+    )
 
 
 def _empty_registry() -> dict[str, Any]:
@@ -278,7 +284,7 @@ def _account_id(value: str) -> str:
 
 
 def _effective_nodes(path: Path) -> dict[str, dict[str, Any]]:
-    _builtins, load_proxy_nodes, _normalise = _backend_registry_api()
+    _builtins, _retired, load_proxy_nodes, _normalise = _backend_registry_api()
     nodes = load_proxy_nodes(path)
     if not isinstance(nodes, dict):
         raise RegistryError("backend proxy-node loader returned an invalid result")
@@ -286,7 +292,13 @@ def _effective_nodes(path: Path) -> dict[str, dict[str, Any]]:
 
 
 def _validate_effective(candidate: dict[str, Any]) -> None:
-    builtins, _loader, normalise_proxy_node = _backend_registry_api()
+    builtins, retired, _loader, normalise_proxy_node = _backend_registry_api()
+    retired_overrides = sorted(set(candidate["nodes"]) & set(retired))
+    if retired_overrides:
+        raise RegistryError(
+            "retired node id(s) cannot be registered: "
+            + ", ".join(retired_overrides)
+        )
     merged: dict[str, Mapping[str, Any]] = dict(builtins)
     merged.update(candidate["nodes"])
     names: dict[str, str] = {}
@@ -343,7 +355,9 @@ def command_add(args: argparse.Namespace) -> int:
         },
     )
 
-    builtins, _loader, _normalise = _backend_registry_api()
+    builtins, retired, _loader, _normalise = _backend_registry_api()
+    if node_id in retired:
+        raise RegistryError(f"node {node_id} is retired and cannot be registered")
     with RegistryLock(path):
         payload = load_registry(path)
         if (node_id in payload["nodes"] or node_id in builtins) and not args.replace:
@@ -361,9 +375,66 @@ def command_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_remove(args: argparse.Namespace) -> int:
+    """Atomically remove one local-only node without touching builtins."""
+    path = _absolute_path(args.file)
+    node_id: str = args.id
+    builtins, retired, _loader, _normalise = _backend_registry_api()
+
+    with RegistryLock(path):
+        payload = load_registry(path)
+        if node_id not in payload["nodes"]:
+            if node_id in builtins:
+                raise RegistryError(
+                    f"node {node_id} is builtin and has no custom override to remove"
+                )
+            status = "retired" if node_id in retired else "unknown"
+            raise RegistryError(
+                f"node {node_id} is {status} and is not a custom registry entry"
+            )
+        candidate = json.loads(json.dumps(payload))
+        removed = candidate["nodes"].pop(node_id)
+        candidate = validate_registry(candidate)
+
+        # Explicit remove is also the safe repair path for a legacy registry
+        # containing retired IDs.  Ignore any *other* retired entries only for
+        # this removal validation; list/add/benchmark remain strict and will
+        # continue to report them until the operator removes each one.
+        remaining_retired = {
+            retired_id: candidate["nodes"].pop(retired_id)
+            for retired_id in sorted(set(candidate["nodes"]) & set(retired))
+        }
+        try:
+            _validate_effective(candidate)
+        finally:
+            candidate["nodes"].update(remaining_retired)
+        save_registry(path, candidate)
+        saved = load_registry(path)
+        if node_id in saved["nodes"]:
+            raise RegistryError("registry still contains the removed node")
+
+    effective = _effective_nodes(path)
+    if node_id in builtins:
+        if node_id not in effective:
+            raise RegistryError("removing the override also removed its builtin node")
+        result = "custom override; builtin node remains active"
+    else:
+        if node_id in effective:
+            raise RegistryError("backend still exposes the removed custom node")
+        result = "custom node"
+    print(f"removed {result} {node_id} ({removed['name']}) from {path}")
+    return 0
+
+
 def _snapshot(path: Path) -> dict[str, Any]:
     with RegistryLock(path):
-        return load_registry(path)
+        payload = load_registry(path)
+    # The backend deliberately ignores invalid local entries and keeps its
+    # safe builtins alive.  The administration CLI is stricter: surface stale
+    # retired overrides so an operator cannot mistake an ignored entry for an
+    # active route.
+    _validate_effective(payload)
+    return payload
 
 
 def command_list(args: argparse.Namespace) -> int:
@@ -503,6 +574,13 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--port", type=_port, help="127.0.0.1 SOCKS port for a tunnel")
     add.add_argument("--replace", action="store_true")
     add.set_defaults(func=command_add)
+
+    remove = commands.add_parser(
+        "remove",
+        help="atomically remove a custom registry node (builtins are protected)",
+    )
+    remove.add_argument("--id", required=True, type=_stable_id)
+    remove.set_defaults(func=command_remove)
 
     list_command = commands.add_parser("list", help="validate and list effective nodes")
     list_command.add_argument("--json", action="store_true")

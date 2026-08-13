@@ -49,8 +49,48 @@
 编号必须是尚未使用的新编号。先在 Bot 项目目录检查：
 
 ```bash
-python3 scripts/proxy_nodes.py list
+cd /opt/okx-outcomes-bot
+
+okx_bot_python() {
+  local load_state service_user
+  load_state="$(systemctl show --property=LoadState --value okx-bot.service)" || {
+    echo "cannot inspect okx-bot.service" >&2
+    return 1
+  }
+  if [[ -z "$load_state" || "$load_state" == "not-found" ]]; then
+    echo "okx-bot.service was not found; use the real Bot unit name" >&2
+    return 1
+  fi
+  service_user="$(systemctl show --property=User --value okx-bot.service)" || {
+    echo "cannot read okx-bot.service User=" >&2
+    return 1
+  }
+  sudo -u "${service_user:-root}" -- /opt/okx-bot-venv/bin/python "$@"
+}
+
+okx_bot_python scripts/proxy_nodes.py list
 ```
+
+`data/proxy_nodes.json` 必须由运行 `okx-bot.service` 的同一个 OS 用户读写。上面的 helper 每次执行都会读取 unit 的 `User=`；如果 `User=` 为空，systemd 的实际用户就是 `root`，helper 会使用 root。不要无条件用 `sudo python`，否则非 root Bot 可能无法读取 CLI 写成 `root:root 0600` 的 registry。每次重新登录 shell 后，先重新定义这个 helper；如果生产 unit 名不是 `okx-bot.service`，把函数中的名称替换为真实 unit。
+
+如果旧命令曾以错误用户生成 registry 或 lock，helper 会明确报 `Permission denied`。只修复这两个精确文件，不要递归 `chown data/`：
+
+```bash
+service_user="$(systemctl show --property=User --value okx-bot.service)"
+service_user="${service_user:-root}"
+service_group="$(id -gn "$service_user")"
+
+for path in data/proxy_nodes.json data/proxy_nodes.json.lock; do
+  if sudo test -e "$path"; then
+    sudo chown "$service_user:$service_group" "$path"
+    sudo chmod 0600 "$path"
+  fi
+done
+```
+
+这段修复仅适用于已经核实 `okx-bot.service` 存在的主机；不要把账户数据库、`.key` 或策略状态顺手改属主。
+
+当前内置可用 ID 是 `JP1`、`JP2`、`OSAKA`、`SYD1`、`SYD2`。`JP3`、`JP4`、`JP5`、`SG1`、`K1` 是永久退役 ID，不能通过本地 registry 或 `--replace` 复活。新增节点必须使用新的 `CC-CITY-NN` ID，例如 `JP-TYO-06`。
 
 检查本地端口是否空闲：
 
@@ -67,6 +107,8 @@ Bot 项目需要包含以下三个工具：
 - `scripts/bootstrap-egress-node.sh`
 - `scripts/install-egress-tunnel.sh`
 - `scripts/proxy_nodes.py`
+
+如果同一台主机使用 Caddy，文末可选步骤还需要 `scripts/caddy-restart.conf`。
 
 如果尚未部署新版升级包，先停止 Bot，备份服务器原有的 `config.yaml` 和整个 `data/`，然后将升级包覆盖到现有项目目录。
 
@@ -291,7 +333,8 @@ curl --silent --show-error --fail --noproxy '' \
 在 Bot 项目目录执行：
 
 ```bash
-python3 scripts/proxy_nodes.py add \
+cd /opt/okx-outcomes-bot
+okx_bot_python scripts/proxy_nodes.py add \
   --id JP-TYO-06 \
   --location Tokyo \
   --port 9116
@@ -300,7 +343,7 @@ python3 scripts/proxy_nodes.py add \
 检查实际 registry：
 
 ```bash
-python3 scripts/proxy_nodes.py list
+okx_bot_python scripts/proxy_nodes.py list
 ```
 
 预期包含类似：
@@ -317,7 +360,18 @@ data/proxy_nodes.json
 
 它是服务器本地配置，后续升级不能用开发机文件覆盖。
 
-如果 ID 已存在，CLI 会拒绝覆盖。只有明确检查旧配置并确实要替换时，才使用 `--replace`。
+如果 ID 已存在，CLI 会拒绝覆盖。只有明确检查仍在使用的旧配置并确实要替换时，才使用 `--replace`。退役 ID 即使加 `--replace` 也会被拒绝；CLI 在遇到旧 registry 中的退役条目时会报错且不会自动改写文件，防止误删其他本地节点配置。
+
+### 11.1 移除自定义节点
+
+先确认没有账户仍绑定该 ID，再以 `okx-bot.service` 的同一 OS 用户执行：
+
+```bash
+okx_bot_python scripts/proxy_nodes.py remove --id JP-TYO-06
+okx_bot_python scripts/proxy_nodes.py list
+```
+
+`remove` 只原子删除 registry 中指定的自定义节点。它拒绝没有 override 的纯内置 ID 或未知 ID，不会改动其他自定义节点；若目标是内置 ID 的 override，只移除 override 并恢复原内置节点。它也不会停止 tunnel、删除 systemd unit、SSH key、账户或交易状态。旧 registry 如果还含退役 ID，可以用相同命令逐个明确清理。仍被账户绑定的纯自定义节点不能直接移除，否则 Bot 重启后会拒绝加载该账户；应先停止策略、完成订单和仓位对账，再迁移或删除账户。
 
 ## 12. 重启 Bot
 
@@ -339,7 +393,7 @@ sudo systemctl status okx-bot
 不需要账户，只验证网络路径：
 
 ```bash
-python3 scripts/proxy_nodes.py benchmark \
+okx_bot_python scripts/proxy_nodes.py benchmark \
   --region AU \
   --samples 5 \
   --node JP-TYO-06
@@ -352,7 +406,7 @@ python3 scripts/proxy_nodes.py benchmark \
 OKX `pm-books` 需要本地账户签名：
 
 ```bash
-python3 scripts/proxy_nodes.py benchmark \
+okx_bot_python scripts/proxy_nodes.py benchmark \
   --region AU \
   --samples 5 \
   --node JP-TYO-06 \
@@ -380,7 +434,23 @@ python3 scripts/proxy_nodes.py benchmark \
 
 如果 Bot 主机在 Tokyo，可以先用 `JP-TYO-02` Direct 作为基线，再比较新的 Tokyo tunnel。
 
-## 14. 在网页中使用
+## 14. 谁来新增节点
+
+你可以完全按本指南自行新增，也可以把以下信息交给维护者代办：新 VPS IP、Ubuntu SSH 用户与私钥路径、Bot 主机允许访问 VPS 的公网 IP、节点城市、账户 OKX Region，以及准备使用的本地端口。维护者仍必须通过 VPS 控制台核验 SSH host key；不要只在聊天中盲信首次网络连接返回的指纹。
+
+新增顺序固定为：
+
+1. 在 Bot 主机生成节点专用 key；
+2. 在新 VPS 安装受限 forwarding 用户；
+3. 从 VPS 控制台核验 host key；
+4. 在 Bot 主机安装 loopback tunnel；
+5. 使用生产虚拟环境的 Python 注册节点；
+6. 重启 `okx-bot`；
+7. 分别做 connectivity、真实 market read 和一段时间的实战延迟观察。
+
+不要只把 VPS IP 直接写入 Python 内置列表，也不要开放公网 SOCKS 端口。
+
+## 15. 在网页中使用
 
 重启 Bot 后：
 
@@ -393,9 +463,9 @@ python3 scripts/proxy_nodes.py benchmark \
 
 当前账户设置页面没有现有账户的节点切换入口。不要在 Bot 运行时直接修改 `accounts.db`。现有账户迁移节点前，应停止并对账所有策略、订单和仓位，再通过安全迁移流程修改。
 
-## 15. 常见故障
+## 16. 常见故障
 
-### 15.1 bootstrap 提示 bot CIDR 无效
+### 16.1 bootstrap 提示 bot CIDR 无效
 
 IPv4 必须写成单地址 `/32`：
 
@@ -405,7 +475,7 @@ IPv4 必须写成单地址 `/32`：
 
 IPv6 单地址必须使用 `/128`。
 
-### 15.2 Bot 无法连接新 VPS
+### 16.2 Bot 无法连接新 VPS
 
 检查：
 
@@ -415,7 +485,7 @@ IPv6 单地址必须使用 `/128`。
 - `--host` 和 `--ssh-port` 是否正确；
 - dedicated private key 是否正确。
 
-### 15.3 host key fingerprint mismatch
+### 16.3 host key fingerprint mismatch
 
 停止安装，不要跳过验证。重新从 VPS 控制台读取：
 
@@ -426,7 +496,7 @@ sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256
 
 确认 VPS 没有被重装或替换后，再更新 Bot 主机上的 host-key 文件。
 
-### 15.4 systemd 服务启动失败
+### 16.4 systemd 服务启动失败
 
 查看日志：
 
@@ -440,7 +510,7 @@ sudo journalctl -u okx-egress-jp-tyo-06.service -n 100 --no-pager
 ss -ltn 'sport = :9116'
 ```
 
-### 15.5 tunnel 启动但 OKX 测试失败
+### 16.5 tunnel 启动但 OKX 测试失败
 
 检查：
 
@@ -450,18 +520,18 @@ ss -ltn 'sport = :9116'
 - VPS IP 是否被 OKX 或云提供商区域策略限制；
 - systemd tunnel 是否持续运行。
 
-### 15.6 CLI 注册成功但网页没有节点
+### 16.6 CLI 注册成功但网页没有节点
 
 节点 registry 只在 Bot 启动时读取。重启 Bot 服务并强制刷新浏览器。
 
-### 15.7 节点显示 failed 或 degraded
+### 16.7 节点显示 failed 或 degraded
 
 - `failed`：本轮 route 不可用，不参与最低 RTT；
 - `degraded`：部分 warm 样本失败，不应作为首选；
 - `Connectivity only`：只验证连通，不代表真实行情或订单速度；
 - `Market read`：使用真实 asset/token，其中 OKX book 请求由本地账户签名。
 
-## 16. 重要安全检查清单
+## 17. 重要安全检查清单
 
 - [ ] 新 VPS 没有开放公网 9111/9116；
 - [ ] SSH 22 只允许 Bot 公网 IP；
@@ -475,7 +545,7 @@ ss -ltn 'sport = :9116'
 - [ ] 最终选择参考真实 Sniper `Trigger→Ack`；
 - [ ] 没有为了速度删除 positions、balance、订单对账或持久化风控。
 
-## 17. 如果新服务器是新的 Bot 主机
+## 18. 如果新服务器是新的 Bot 主机
 
 如果你要迁移的是整套 Bot，而不是增加出口 VPS，不要执行本文流程。整机迁移还需要：
 
@@ -484,7 +554,81 @@ ss -ltn 'sport = :9116'
 - 迁移 WAL/SHM 或在停服务后做一致性备份；
 - 迁移 pending sells、cost layers、Poly asset map 和 node registry；
 - 迁移 `/etc/okx-egress/` 与 tunnel systemd units；
-- 迁移 Bot systemd、Nginx/Caddy、HTTPS 和 `/okx` base path 配置；
+- 迁移 Bot systemd、Nginx/Caddy、HTTPS 和实际使用的根路径/base path 配置；
 - 确保新旧主机不会同时运行并共享同一账户状态。
 
 整机迁移应使用单独的部署迁移步骤。
+
+## 19. 安装 Caddy 自动恢复 drop-in
+
+本节只在 **Bot 主机确实使用 systemd 管理的 Caddy** 时执行；使用 Nginx 的主机不要安装。drop-in 只改变 Caddy 异常退出后的 systemd 重启策略，不会修改 Caddyfile、域名、根路径或 Bot 服务。
+
+先确认 unit 和当前合并配置：
+
+```bash
+cd /opt/okx-outcomes-bot
+sudo systemctl status caddy.service --no-pager
+sudo systemctl cat caddy.service
+```
+
+确认仓库模板内容只有 `[Service]`、`Restart=on-failure` 和 `RestartSec=5s`，然后安装到固定目标。若目标已存在，先留下带 UTC 时间戳的备份：
+
+```bash
+sudo install -d -o root -g root -m 0755 \
+  /etc/systemd/system/caddy.service.d
+
+if sudo test -e /etc/systemd/system/caddy.service.d/10-restart.conf; then
+  backup="/etc/systemd/system/caddy.service.d/10-restart.conf.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  sudo cp -a /etc/systemd/system/caddy.service.d/10-restart.conf "$backup"
+  echo "backup: $backup"
+fi
+
+sudo install -o root -g root -m 0644 \
+  scripts/caddy-restart.conf \
+  /etc/systemd/system/caddy.service.d/10-restart.conf
+```
+
+让 systemd 读取新配置，先做 unit 静态校验，再重启 Caddy：
+
+```bash
+sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo systemctl daemon-reload
+sudo systemd-analyze verify caddy.service
+sudo systemctl restart caddy.service
+```
+
+如果 `systemctl cat caddy.service` 显示的 `--config` 不是 `/etc/caddy/Caddyfile`，校验命令必须改用 unit 中的真实路径和实际 adapter；配置校验失败时不要重启。
+
+最后必须同时验证 unit 属性、进程状态、本机 HTTPS 和公网域名。把域名替换成实际生产域名；当前生产使用根路径，不要因为安装此 drop-in 新增 `/okx` alias：
+
+```bash
+sudo systemctl show caddy.service \
+  --property=Restart --property=RestartUSec
+sudo systemctl is-active caddy.service
+sudo systemctl status caddy.service --no-pager
+curl --silent --show-error --fail --max-time 10 \
+  --resolve YOUR_PRODUCTION_DOMAIN:443:127.0.0.1 \
+  https://YOUR_PRODUCTION_DOMAIN/
+curl --silent --show-error --fail --max-time 10 \
+  https://YOUR_PRODUCTION_DOMAIN/
+```
+
+第一条 curl 强制直连本机 Caddy，第二条走正常公网 DNS/CDN 路径；两条都要成功。预期 `Restart=on-failure`、`RestartUSec=5s`、状态为 `active`，且 HTTPS 返回成功。`systemctl stop caddy` 是人工停止，`on-failure` 不会把它自动拉起，这是正常语义。不要在实盘期间通过 kill Caddy 来测试异常恢复；如需故障演练，应安排维护窗口并同时观察 `journalctl -u caddy.service`。
+
+如果重启或 HTTPS 验证失败，先查看日志：
+
+```bash
+sudo journalctl -u caddy.service -n 100 --no-pager
+```
+
+drop-in 本身需要回滚时，移走新文件；如果安装步骤打印过备份路径，把该备份复制回原目标，否则保持目标不存在。随后重新加载并启动：
+
+```bash
+sudo rm /etc/systemd/system/caddy.service.d/10-restart.conf
+# 仅当安装前确实存在备份时执行下一行，并替换实际时间戳：
+# sudo cp -a /etc/systemd/system/caddy.service.d/10-restart.conf.bak.UTC_TIMESTAMP \
+#   /etc/systemd/system/caddy.service.d/10-restart.conf
+sudo systemctl daemon-reload
+sudo systemctl restart caddy.service
+sudo systemctl status caddy.service --no-pager
+```

@@ -106,6 +106,103 @@ class SniperPersistenceTests(unittest.TestCase):
 
         self.assertIsNone(database.get_sniper_state("account-a"))
 
+    def test_deleting_account_removes_only_its_exact_legacy_poly_state(self):
+        database.set_global_config("poly_state_account-a", "owned")
+        database.set_global_config("poly_state_account-a-copy", "keep")
+        database.set_global_config("tg_chats", "keep-global")
+
+        deleted = database.delete_account("account-a")
+
+        self.assertTrue(deleted)
+        self.assertEqual(database.get_global_config("poly_state_account-a", "missing"), "missing")
+        self.assertEqual(database.get_global_config("poly_state_account-a-copy"), "keep")
+        self.assertEqual(database.get_global_config("tg_chats"), "keep-global")
+
+    def test_missing_account_does_not_delete_matching_legacy_poly_state(self):
+        database.set_global_config("poly_state_missing-account", "keep")
+
+        deleted = database.delete_account("missing-account")
+
+        self.assertFalse(deleted)
+        self.assertEqual(
+            database.get_global_config("poly_state_missing-account"), "keep"
+        )
+
+    def test_account_state_file_cleanup_is_exact_and_idempotent(self):
+        root = Path(self.temp_dir.name) / "state"
+        root.mkdir()
+        expected = {
+            "pending_sells_d_account-a.json",
+            "pending_sells_s_account-a.json",
+            "cost_layers_account-a.json",
+        }
+        for name in expected:
+            (root / name).write_text("{}", encoding="utf-8")
+        preserved = {
+            "pending_sells_d_account-a-copy.json",
+            "cost_layers_account-a.json.bak",
+            "unrelated.json",
+        }
+        for name in preserved:
+            (root / name).write_text("{}", encoding="utf-8")
+
+        first = database.cleanup_account_state_files("account-a", data_dir=root)
+        second = database.cleanup_account_state_files("account-a", data_dir=root)
+
+        self.assertTrue(first["complete"])
+        self.assertEqual(set(first["deleted"]), expected)
+        self.assertEqual(first["missing"], [])
+        self.assertTrue(second["complete"])
+        self.assertEqual(set(second["missing"]), expected)
+        self.assertEqual(second["deleted"], [])
+        self.assertEqual({path.name for path in root.iterdir()}, preserved)
+
+    def test_account_state_file_cleanup_rejects_unsafe_account_id(self):
+        root = Path(self.temp_dir.name) / "state"
+        root.mkdir()
+        sentinel = root / "sentinel.json"
+        sentinel.write_text("keep", encoding="utf-8")
+
+        for account_id in ("", "../account-a", "account/a", "account.a", " account-a"):
+            with self.subTest(account_id=account_id):
+                with self.assertRaisesRegex(ValueError, "Invalid account ID"):
+                    database.cleanup_account_state_files(account_id, data_dir=root)
+
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+
+    def test_account_state_file_cleanup_continues_after_one_file_error(self):
+        root = Path(self.temp_dir.name) / "state"
+        root.mkdir()
+        (root / "pending_sells_d_account-a.json").write_text("{}", encoding="utf-8")
+        (root / "pending_sells_s_account-a.json").write_text("{}", encoding="utf-8")
+        blocked = root / "cost_layers_account-a.json"
+        blocked.mkdir()
+
+        result = database.cleanup_account_state_files("account-a", data_dir=root)
+
+        self.assertFalse(result["complete"])
+        self.assertEqual(
+            set(result["deleted"]),
+            {
+                "pending_sells_d_account-a.json",
+                "pending_sells_s_account-a.json",
+            },
+        )
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["errors"][0]["name"], "cost_layers_account-a.json")
+        self.assertEqual(result["errors"][0]["status"], "error")
+        self.assertIn("error", result["errors"][0])
+        self.assertTrue(blocked.is_dir())
+
+    def test_delete_account_rejects_unsafe_account_id_before_database_write(self):
+        database.set_global_config("tg_chats", "keep-global")
+
+        with self.assertRaisesRegex(ValueError, "Invalid account ID"):
+            database.delete_account("../account-a")
+
+        self.assertIsNotNone(database.get_account("account-a"))
+        self.assertEqual(database.get_global_config("tg_chats"), "keep-global")
+
     def test_corrupt_snapshot_is_reported_without_rewriting_the_row(self):
         connection = database.get_db()
         connection.execute(

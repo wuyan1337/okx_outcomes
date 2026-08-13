@@ -737,7 +737,19 @@ class CancelAllSafetyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_delete_removes_account_only_after_verified_flat(self):
         instance = _idle_instance(object())
-        remove = mock.AsyncMock(return_value=True)
+        removal = {
+            "deleted": True,
+            "cleanup_complete": True,
+            "state_cleanup": {
+                "account_id": "account-a",
+                "complete": True,
+                "files": [],
+                "deleted": [],
+                "missing": [],
+                "errors": [],
+            },
+        }
+        remove = mock.AsyncMock(return_value=removal)
         manager = SimpleNamespace(
             get_instance=lambda _account_id: instance,
             remove_account=remove,
@@ -757,7 +769,57 @@ class CancelAllSafetyTests(unittest.IsolatedAsyncioTestCase):
             result = await app_module.remove_account("account-a", user="test")
 
         self.assertTrue(result["ok"])
+        self.assertTrue(result["deleted"])
+        self.assertTrue(result["cleanup_complete"])
+        self.assertEqual(result["state_cleanup"], removal["state_cleanup"])
         remove.assert_awaited_once_with("account-a")
+
+    async def test_delete_reports_partial_state_file_cleanup_after_database_delete(self):
+        instance = _idle_instance(object())
+        removal = {
+            "deleted": True,
+            "cleanup_complete": False,
+            "state_cleanup": {
+                "account_id": "account-a",
+                "complete": False,
+                "files": [
+                    {
+                        "name": "cost_layers_account-a.json",
+                        "status": "error",
+                        "error": "PermissionError: denied",
+                    }
+                ],
+                "deleted": [],
+                "missing": [],
+                "errors": [
+                    {
+                        "name": "cost_layers_account-a.json",
+                        "status": "error",
+                        "error": "PermissionError: denied",
+                    }
+                ],
+            },
+        }
+        manager = SimpleNamespace(
+            get_instance=lambda _account_id: instance,
+            remove_account=mock.AsyncMock(return_value=removal),
+        )
+        close_result = {"ok": True, "result": {"remaining": 0}}
+        with (
+            mock.patch.object(app_module, "manager", manager),
+            mock.patch.object(
+                app_module,
+                "_flash_close_account",
+                new=mock.AsyncMock(return_value=close_result),
+            ),
+        ):
+            payload = await app_module.remove_account("account-a", user="test")
+
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["deleted"])
+        self.assertFalse(payload["cleanup_complete"])
+        self.assertEqual(payload["state_cleanup"], removal["state_cleanup"])
+        self.assertIn("credentials were deleted", payload["warning"])
 
     async def test_flash_reconciles_a_stopped_sniper_lock_after_exchange_is_flat(self):
         class Client:

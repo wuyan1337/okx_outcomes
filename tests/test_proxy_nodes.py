@@ -51,6 +51,10 @@ class ProxyNodeNormalisationTests(unittest.TestCase):
     def test_builtin_ids_stay_stable_while_labels_are_canonical(self):
         nodes = proxy_nodes.load_proxy_nodes(Path("missing-proxy-registry.json"))
 
+        self.assertEqual(
+            set(nodes),
+            {"JP1", "JP2", "OSAKA", "SYD1", "SYD2"},
+        )
         self.assertIn("JP1", nodes)
         self.assertEqual(nodes["JP1"]["name"], "JP-TYO-01")
         self.assertEqual(
@@ -59,23 +63,37 @@ class ProxyNodeNormalisationTests(unittest.TestCase):
         )
         self.assertEqual(nodes["JP2"]["route"], "direct")
         self.assertIsNone(nodes["JP2"]["host"])
-        self.assertNotIn("JP4", nodes)
-        self.assertNotIn("JP5", nodes)
+        self.assertTrue(
+            {"JP3", "JP4", "JP5", "SG1", "K1"}.isdisjoint(nodes)
+        )
 
     def test_retired_nodes_cannot_be_resolved_or_registered(self):
-        with self.assertRaisesRegex(ValueError, "retired"):
-            proxy_nodes.require_proxy_node("JP4")
-        with self.assertRaisesRegex(ValueError, "retired"):
-            proxy_nodes.normalise_proxy_node(
-                "JP5",
-                {
-                    "name": "JP-TYO-05",
-                    "location": "Tokyo",
-                    "route": "tunnel",
-                    "host": "127.0.0.1",
-                    "port": 9115,
-                },
-            )
+        retired_names = {
+            "JP3": "JP-TYO-03",
+            "JP4": "JP-TYO-04",
+            "JP5": "JP-TYO-05",
+            "SG1": "SG-SIN-01",
+            "K1": "KR-SEL-01",
+        }
+        self.assertEqual(
+            proxy_nodes.RETIRED_PROXY_NODE_IDS,
+            frozenset(retired_names),
+        )
+        for node_id, name in retired_names.items():
+            with self.subTest(node_id=node_id):
+                with self.assertRaisesRegex(ValueError, "retired"):
+                    proxy_nodes.require_proxy_node(node_id)
+                with self.assertRaisesRegex(ValueError, "retired"):
+                    proxy_nodes.normalise_proxy_node(
+                        node_id,
+                        {
+                            "name": name,
+                            "location": "Retired",
+                            "route": "tunnel",
+                            "host": "127.0.0.1",
+                            "port": 9115,
+                        },
+                    )
 
     def test_direct_route_requires_null_proxy_coordinates(self):
         with self.assertRaisesRegex(ValueError, "null host and port"):
@@ -207,24 +225,119 @@ class ProxyNodeRegistryTests(unittest.TestCase):
 
         self.assertEqual(set(nodes), set(proxy_nodes.BUILTIN_PROXY_NODES))
 
-    def test_local_registry_cannot_revive_a_retired_node(self):
+    def test_local_registry_cannot_revive_retired_nodes(self):
+        retired_names = {
+            "JP3": "JP-TYO-03",
+            "JP4": "JP-TYO-04",
+            "JP5": "JP-TYO-05",
+            "SG1": "SG-SIN-01",
+            "K1": "KR-SEL-01",
+        }
         with tempfile.TemporaryDirectory() as directory:
             path = self._write_registry(directory, {
                 "version": 1,
                 "nodes": {
-                    "JP4": {
-                        "name": "JP-TYO-04",
-                        "location": "Tokyo",
+                    node_id: {
+                        "name": name,
+                        "location": "Retired",
                         "route": "tunnel",
                         "host": "127.0.0.1",
-                        "port": 9114,
-                    },
+                        "port": 9200 + index,
+                    }
+                    for index, (node_id, name) in enumerate(retired_names.items())
                 },
             })
 
             nodes = proxy_nodes.load_proxy_nodes(path)
 
-        self.assertNotIn("JP4", nodes)
+        self.assertTrue(set(retired_names).isdisjoint(nodes))
+
+    def test_registration_cli_rejects_retired_id_without_writing_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_registry(directory, {
+                "version": 1,
+                "nodes": {
+                    "JP1": {
+                        "name": "JP-TYO-01",
+                        "location": "Tokyo",
+                        "route": "tunnel",
+                        "host": "127.0.0.1",
+                        "port": 9211,
+                    },
+                    "JP-TYO-06": {
+                        "name": "JP-TYO-06",
+                        "location": "Tokyo",
+                        "route": "tunnel",
+                        "host": "127.0.0.1",
+                        "port": 9216,
+                    },
+                },
+            })
+            before = path.read_bytes()
+            command = [
+                sys.executable,
+                str(ROOT / "scripts" / "proxy_nodes.py"),
+                "--file",
+                str(path),
+                "add",
+                "--id",
+                "SG1",
+                "--name",
+                "SG-SIN-01",
+                "--location",
+                "Singapore",
+                "--port",
+                "9216",
+                "--replace",
+            ]
+
+            rejected = subprocess.run(
+                command,
+                cwd=ROOT,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("retired", rejected.stderr)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_cli_list_rejects_legacy_retired_override_without_rewriting_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_registry(directory, {
+                "version": 1,
+                "nodes": {
+                    "JP3": {
+                        "name": "JP-TYO-03",
+                        "location": "Tokyo",
+                        "route": "tunnel",
+                        "host": "127.0.0.1",
+                        "port": 9213,
+                    },
+                },
+            })
+            before = path.read_bytes()
+
+            listed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "proxy_nodes.py"),
+                    "--file",
+                    str(path),
+                    "list",
+                ],
+                cwd=ROOT,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(listed.returncode, 0)
+            self.assertIn("retired", listed.stderr)
+            self.assertEqual(path.read_bytes(), before)
 
     def test_registration_cli_writes_the_backend_schema_atomically(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -274,6 +387,185 @@ class ProxyNodeRegistryTests(unittest.TestCase):
         )
         self.assertEqual(loaded["JP-TYO-06"]["route"], "tunnel")
         self.assertEqual(loaded["JP-TYO-06"]["host"], "127.0.0.1")
+
+    def test_remove_cli_atomically_removes_only_selected_custom_node(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_registry(directory, {
+                "version": 1,
+                "nodes": {
+                    "JP-TYO-06": {
+                        "name": "JP-TYO-06",
+                        "location": "Tokyo",
+                        "route": "tunnel",
+                        "host": "127.0.0.1",
+                        "port": 9216,
+                    },
+                    "SG-SIN-02": {
+                        "name": "SG-SIN-02",
+                        "location": "Singapore",
+                        "route": "tunnel",
+                        "host": "127.0.0.1",
+                        "port": 9217,
+                    },
+                },
+            })
+
+            removed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "proxy_nodes.py"),
+                    "--file",
+                    str(path),
+                    "remove",
+                    "--id",
+                    "JP-TYO-06",
+                ],
+                cwd=ROOT,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            effective = proxy_nodes.load_proxy_nodes(path)
+
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertIn("removed custom node JP-TYO-06", removed.stdout)
+        self.assertNotIn("JP-TYO-06", payload["nodes"])
+        self.assertNotIn("JP-TYO-06", effective)
+        self.assertIn("SG-SIN-02", payload["nodes"])
+        self.assertIn("SG-SIN-02", effective)
+
+    def test_remove_cli_refuses_builtin_and_unknown_without_registry_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_registry(directory, {
+                "version": 1,
+                "nodes": {
+                    "JP-TYO-06": {
+                        "name": "JP-TYO-06",
+                        "location": "Tokyo",
+                        "route": "tunnel",
+                        "host": "127.0.0.1",
+                        "port": 9216,
+                    },
+                },
+            })
+            before = path.read_bytes()
+            base = [
+                sys.executable,
+                str(ROOT / "scripts" / "proxy_nodes.py"),
+                "--file",
+                str(path),
+                "remove",
+                "--id",
+            ]
+
+            builtin = subprocess.run(
+                [*base, "JP1"], cwd=ROOT, text=True, encoding="utf-8",
+                capture_output=True, check=False,
+            )
+            unknown = subprocess.run(
+                [*base, "UNKNOWN"], cwd=ROOT, text=True, encoding="utf-8",
+                capture_output=True, check=False,
+            )
+
+            self.assertNotEqual(builtin.returncode, 0)
+            self.assertIn("builtin", builtin.stderr)
+            self.assertNotEqual(unknown.returncode, 0)
+            self.assertIn("unknown", unknown.stderr)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_remove_cli_removes_only_builtin_override_and_restores_builtin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_registry(directory, {
+                "version": 1,
+                "nodes": {
+                    "JP1": {
+                        "name": "JP-TYO-01",
+                        "location": "Tokyo",
+                        "route": "tunnel",
+                        "host": "127.0.0.1",
+                        "port": 9211,
+                    },
+                    "JP-TYO-06": {
+                        "name": "JP-TYO-06",
+                        "location": "Tokyo",
+                        "route": "tunnel",
+                        "host": "127.0.0.1",
+                        "port": 9216,
+                    },
+                },
+            })
+
+            removed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "proxy_nodes.py"),
+                    "--file",
+                    str(path),
+                    "remove",
+                    "--id",
+                    "JP1",
+                ],
+                cwd=ROOT,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            effective = proxy_nodes.load_proxy_nodes(path)
+
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertIn("builtin node remains active", removed.stdout)
+        self.assertNotIn("JP1", payload["nodes"])
+        self.assertEqual(effective["JP1"]["route"], "socks5")
+        self.assertEqual(effective["JP1"]["host"], "168.138.196.214")
+        self.assertIn("JP-TYO-06", payload["nodes"])
+
+    def test_remove_cli_can_safely_purge_one_legacy_retired_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_registry(directory, {
+                "version": 1,
+                "nodes": {
+                    "JP3": {
+                        "name": "JP-TYO-03",
+                        "location": "Tokyo",
+                        "route": "tunnel",
+                        "host": "127.0.0.1",
+                        "port": 9213,
+                    },
+                    "SG1": {
+                        "name": "SG-SIN-01",
+                        "location": "Singapore",
+                        "route": "tunnel",
+                        "host": "127.0.0.1",
+                        "port": 9214,
+                    },
+                },
+            })
+
+            removed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "proxy_nodes.py"),
+                    "--file",
+                    str(path),
+                    "remove",
+                    "--id",
+                    "JP3",
+                ],
+                cwd=ROOT,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertNotIn("JP3", payload["nodes"])
+        self.assertIn("SG1", payload["nodes"])
 
 
 class ProxyNodeBenchmarkCliTests(unittest.IsolatedAsyncioTestCase):
