@@ -749,7 +749,7 @@ Sniper 面板显示最后一次各分段、`Trigger→Ack`，以及最近窗口�
 | `OSAKA` | `JP-OSA-01` |
 | `SYD1` / `SYD2` | `AU-SYD-01` / `AU-SYD-02` |
 
-新节点名必须使用 `CC-CITY-NN`，例如 `JP-TYO-06`。`direct`、旧式 `socks5` 和新式 `tunnel` 是路由类型，不再混进节点名。`JP3`、`JP4`、`JP5`、`SG1`、`K1` 已永久退役：它们不在内置可选节点中，自定义 registry 不能重新注册或覆盖，旧数据库若仍绑定这些 ID 会拒绝加载而不会静默改走 Direct。新节点必须使用一个未用过的新 ID，不能复用退役 ID。新节点只允许 Direct 或绑定 `127.0.0.1` 的 SSH tunnel，不允许通过注册工具新增公网裸 SOCKS5。
+新节点名必须使用 `CC-CITY-NN`，例如 `JP-TYO-06`。`direct`、`socks5` 和 `tunnel` 是路由类型，不再混进节点名。`JP3`、`JP4`、`JP5`、`SG1`、`K1` 已永久退役：它们不在内置可选节点中，自定义 registry 不能重新注册或覆盖，旧数据库若仍绑定这些 ID 会拒绝加载而不会静默改走 Direct。新节点必须使用一个未用过的新 ID，不能复用退役 ID。自定义节点只允许 Direct、绑定 `127.0.0.1` 的 SSH tunnel，或绑定 `127.0.0.1` 的 Local SOCKS；注册工具仍拒绝新增公网裸 SOCKS5。Local SOCKS 适用于由 Mihomo 等本机协议客户端提供的受控入口，客户端配置和凭据保存在项目外的受限系统目录。
 
 本机扩展写入 `data/proxy_nodes.json`，升级代码时不要覆盖它。服务在启动时读取 registry，所以注册或替换节点后必须重启这一套单进程 FastAPI 服务。先检查有效配置：
 
@@ -780,7 +780,7 @@ registry CLI 必须与 `okx-bot.service` 使用同一个 OS 用户，因为工�
 
 若旧命令曾留下错误属主的 `data/proxy_nodes.json` 或 `data/proxy_nodes.json.lock`，按 [NODE_INSTALL_GUIDE.md](NODE_INSTALL_GUIDE.md) 的精确文件修复步骤处理；不要递归修改整个 `data/`，也不要碰账户数据库、`.key` 或策略状态。
 
-registry 损坏或还含退役 ID 时 CLI 会明确报错且不会改写文件；后端则记录错误、忽略退役条目并保留可用内置节点。canonical 名称、Direct route 和本机 tunnel port 都不能重复。退役只保留 ID 防复活，不代表 CLI 会自动删除旧 tunnel、密钥或 systemd unit；这些系统资源必须在确认目标后单独清理。
+registry 损坏或还含退役 ID 时 CLI 会明确报错且不会改写文件；后端则记录错误、忽略退役条目并保留可用内置节点。canonical 名称、Direct route 和本机 loopback proxy port 都不能重复。退役只保留 ID 防复活，不代表 CLI 会自动删除旧 tunnel、Local SOCKS 服务、密钥或 systemd unit；这些系统资源必须在确认目标后单独清理。
 
 移除一个不再使用的本地自定义节点时，先确认没有账户仍绑定该 ID，再以同一个 service user 执行：
 

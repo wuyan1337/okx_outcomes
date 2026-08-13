@@ -145,6 +145,49 @@ class ProxyNodeNormalisationTests(unittest.TestCase):
                 },
             )
 
+    def test_loopback_socks_has_an_explicit_local_label(self):
+        node = proxy_nodes.normalise_proxy_node(
+            "HK1",
+            {
+                "name": "HK-HKG-01",
+                "location": "Hong Kong",
+                "route": "socks5",
+                "host": "127.0.0.1",
+                "port": 9221,
+            },
+        )
+
+        self.assertEqual(node["label"], "HK-HKG-01 | Hong Kong | Local SOCKS")
+
+    def test_port_must_be_a_real_integer_without_coercion(self):
+        for invalid_port in ("9221", 9221.9, True):
+            with self.subTest(port=invalid_port), self.assertRaisesRegex(
+                ValueError, "integer"
+            ):
+                proxy_nodes.normalise_proxy_node(
+                    "HK1",
+                    {
+                        "name": "HK-HKG-01",
+                        "location": "Hong Kong",
+                        "route": "socks5",
+                        "host": "127.0.0.1",
+                        "port": invalid_port,
+                    },
+                )
+
+    def test_location_must_be_a_real_string_without_coercion(self):
+        with self.assertRaisesRegex(ValueError, "string"):
+            proxy_nodes.normalise_proxy_node(
+                "HK1",
+                {
+                    "name": "HK-HKG-01",
+                    "location": 123,
+                    "route": "socks5",
+                    "host": "127.0.0.1",
+                    "port": 9221,
+                },
+            )
+
 
 class ProxyNodeRegistryTests(unittest.TestCase):
     def _write_registry(self, directory: str, payload) -> Path:
@@ -179,6 +222,61 @@ class ProxyNodeRegistryTests(unittest.TestCase):
         self.assertEqual(nodes["JP1"]["port"], 9211)
         self.assertEqual(nodes["JP1"]["route"], "tunnel")
         self.assertEqual(nodes["JP-TYO-06"]["name"], "JP-TYO-06")
+
+    def test_registry_accepts_only_loopback_custom_socks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_registry(directory, {
+                "version": 1,
+                "nodes": {
+                    "HK1": {
+                        "name": "HK-HKG-01",
+                        "location": "Hong Kong",
+                        "route": "socks5",
+                        "host": "127.0.0.1",
+                        "port": 9221,
+                    },
+                    "PUBLIC": {
+                        "name": "HK-HKG-02",
+                        "location": "Hong Kong",
+                        "route": "socks5",
+                        "host": "203.0.113.20",
+                        "port": 9222,
+                    },
+                },
+            })
+
+            nodes = proxy_nodes.load_proxy_nodes(path)
+
+        self.assertIn("HK1", nodes)
+        self.assertEqual(nodes["HK1"]["label"], "HK-HKG-01 | Hong Kong | Local SOCKS")
+        self.assertNotIn("PUBLIC", nodes)
+
+    def test_local_socks_and_tunnel_cannot_share_a_loopback_port(self):
+        original = proxy_nodes.load_proxy_nodes(Path("missing-proxy-registry.json"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_registry(directory, {
+                "version": 1,
+                "nodes": {
+                    "HK1": {
+                        "name": "HK-HKG-01",
+                        "location": "Hong Kong",
+                        "route": "socks5",
+                        "host": "127.0.0.1",
+                        "port": 9221,
+                    },
+                    "HK2": {
+                        "name": "HK-HKG-02",
+                        "location": "Hong Kong",
+                        "route": "tunnel",
+                        "host": "127.0.0.1",
+                        "port": 9221,
+                    },
+                },
+            })
+
+            nodes = proxy_nodes.load_proxy_nodes(path)
+
+        self.assertEqual(nodes, original)
 
     def test_bad_custom_entries_do_not_replace_builtins_or_duplicate_names(self):
         original = proxy_nodes.load_proxy_nodes(Path("missing-proxy-registry.json"))
@@ -387,6 +485,98 @@ class ProxyNodeRegistryTests(unittest.TestCase):
         )
         self.assertEqual(loaded["JP-TYO-06"]["route"], "tunnel")
         self.assertEqual(loaded["JP-TYO-06"]["host"], "127.0.0.1")
+
+    def test_registration_cli_writes_loopback_socks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "proxy_nodes.json"
+            added = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "proxy_nodes.py"),
+                    "--file",
+                    str(path),
+                    "add",
+                    "--id",
+                    "HK1",
+                    "--name",
+                    "HK-HKG-01",
+                    "--location",
+                    "Hong Kong",
+                    "--route",
+                    "socks5",
+                    "--port",
+                    "9221",
+                ],
+                cwd=ROOT,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            loaded = proxy_nodes.load_proxy_nodes(path)
+
+        self.assertEqual(added.returncode, 0, added.stderr)
+        self.assertEqual(payload["nodes"]["HK1"]["route"], "socks5")
+        self.assertEqual(payload["nodes"]["HK1"]["host"], "127.0.0.1")
+        self.assertEqual(loaded["HK1"]["label"], "HK-HKG-01 | Hong Kong | Local SOCKS")
+
+    def test_cli_validation_rejects_public_custom_socks(self):
+        with self.assertRaisesRegex(proxy_nodes_cli.RegistryError, "127.0.0.1"):
+            proxy_nodes_cli._normalise_custom_node(
+                "HK1",
+                {
+                    "name": "HK-HKG-01",
+                    "location": "Hong Kong",
+                    "route": "socks5",
+                    "host": "203.0.113.20",
+                    "port": 9221,
+                },
+            )
+
+    def test_cli_refuses_cross_route_loopback_port_collision_without_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_registry(directory, {
+                "version": 1,
+                "nodes": {
+                    "JPX1": {
+                        "name": "JP-TYO-06",
+                        "location": "Tokyo",
+                        "route": "tunnel",
+                        "host": "127.0.0.1",
+                        "port": 9221,
+                    },
+                },
+            })
+            before = path.read_bytes()
+            added = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "proxy_nodes.py"),
+                    "--file",
+                    str(path),
+                    "add",
+                    "--id",
+                    "HK1",
+                    "--name",
+                    "HK-HKG-01",
+                    "--location",
+                    "Hong Kong",
+                    "--route",
+                    "socks5",
+                    "--port",
+                    "9221",
+                ],
+                cwd=ROOT,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(added.returncode, 0)
+            self.assertIn("loopback port", added.stderr)
+            self.assertEqual(path.read_bytes(), before)
 
     def test_remove_cli_atomically_removes_only_selected_custom_node(self):
         with tempfile.TemporaryDirectory() as directory:

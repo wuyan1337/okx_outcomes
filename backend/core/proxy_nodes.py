@@ -38,7 +38,10 @@ def canonical_proxy_label(node_id: str, node: Mapping) -> str:
     route = str(node.get("route") or "socks5").lower()
     location = str(node.get("location") or "Unknown").strip() or "Unknown"
     name = str(node.get("name") or node_id).strip().upper()
-    return f"{name} | {location} | {ROUTE_LABELS.get(route, route.upper())}"
+    route_label = ROUTE_LABELS.get(route, route.upper())
+    if route == "socks5" and node.get("host") == "127.0.0.1":
+        route_label = "Local SOCKS"
+    return f"{name} | {location} | {route_label}"
 
 
 def normalise_proxy_node(node_id: str, raw: Mapping) -> dict:
@@ -61,7 +64,10 @@ def normalise_proxy_node(node_id: str, raw: Mapping) -> dict:
     if not CANONICAL_NAME_PATTERN.fullmatch(name):
         raise ValueError("name must use the canonical CC-CITY-NN format")
 
-    location = str(raw.get("location") or "").strip()
+    raw_location = raw.get("location")
+    if not isinstance(raw_location, str):
+        raise ValueError("location must be a string")
+    location = raw_location.strip()
     if not location or len(location) > 64:
         raise ValueError("location must be 1-64 characters")
     route = str(raw.get("route") or "").strip().lower()
@@ -83,10 +89,9 @@ def normalise_proxy_node(node_id: str, raw: Mapping) -> dict:
             or not HOST_PATTERN.fullmatch(host)
         ):
             raise ValueError("host must be a hostname or IP address without a URL scheme")
-        try:
-            port = int(raw.get("port"))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("port must be an integer") from exc
+        port = raw.get("port")
+        if type(port) is not int:
+            raise ValueError("port must be an integer")
         if not 1024 <= port <= 65535:
             raise ValueError("port must be between 1024 and 65535")
         if route == "tunnel" and host != "127.0.0.1":
@@ -148,9 +153,12 @@ def load_proxy_nodes(path: Path | str = PROXY_NODES_FILE) -> dict:
                 if node_id != canonical_id:
                     raise ValueError("node id must already be uppercase and trimmed")
                 candidate = normalise_proxy_node(canonical_id, raw)
-                if candidate["route"] == "socks5":
+                if (
+                    candidate["route"] == "socks5"
+                    and candidate["host"] != "127.0.0.1"
+                ):
                     raise ValueError(
-                        "custom public SOCKS5 nodes are not allowed; use a loopback SSH tunnel"
+                        "custom public SOCKS5 nodes are not allowed; use a loopback proxy"
                     )
                 overrides[canonical_id] = candidate
             except ValueError as exc:
@@ -165,7 +173,7 @@ def load_proxy_nodes(path: Path | str = PROXY_NODES_FILE) -> dict:
 
 def _validate_effective_nodes(nodes: Mapping[str, Mapping]) -> None:
     canonical_names = {}
-    tunnel_endpoints = {}
+    loopback_endpoints = {}
     direct_owner = None
     for node_id, node in nodes.items():
         name = node["name"]
@@ -181,15 +189,15 @@ def _validate_effective_nodes(nodes: Mapping[str, Mapping]) -> None:
                     f"direct route is shared by {direct_owner} and {node_id}"
                 )
             direct_owner = node_id
-        elif route == "tunnel":
+        elif node["host"] == "127.0.0.1":
             endpoint = (node["host"], node["port"])
-            owner = tunnel_endpoints.get(endpoint)
+            owner = loopback_endpoints.get(endpoint)
             if owner is not None:
                 raise ValueError(
-                    f"tunnel endpoint {node['host']}:{node['port']} is shared by "
+                    f"loopback endpoint {node['host']}:{node['port']} is shared by "
                     f"{owner} and {node_id}"
                 )
-            tunnel_endpoints[endpoint] = node_id
+            loopback_endpoints[endpoint] = node_id
 
 
 PROXY_NODES = load_proxy_nodes()

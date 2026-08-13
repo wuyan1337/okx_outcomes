@@ -122,9 +122,9 @@ def _normalise_custom_node(node_id: str, raw: Any) -> dict[str, Any]:
         raise RegistryError(f"{node_id}.name must use CC-CCC-NN")
     location = _text(raw.get("location"), f"{node_id}.location", 64)
     route = str(raw.get("route") or "").strip().lower()
-    if route not in {"direct", "tunnel"}:
+    if route not in {"direct", "tunnel", "socks5"}:
         raise RegistryError(
-            f"{node_id}.route must be direct or tunnel; new public SOCKS nodes are forbidden"
+            f"{node_id}.route must be direct, tunnel or loopback socks5"
         )
 
     if route == "direct":
@@ -135,7 +135,7 @@ def _normalise_custom_node(node_id: str, raw: Any) -> dict[str, Any]:
     else:
         host = raw.get("host")
         if host != "127.0.0.1":
-            raise RegistryError(f"{node_id} tunnel must bind exactly to 127.0.0.1")
+            raise RegistryError(f"{node_id} proxy must bind exactly to 127.0.0.1")
         port = raw.get("port")
         if type(port) is not int or not 1024 <= port <= 65535:
             raise RegistryError(f"{node_id}.port must be an integer from 1024 to 65535")
@@ -317,12 +317,12 @@ def _validate_effective(candidate: dict[str, Any]) -> None:
             if direct_owner is not None:
                 raise RegistryError(f"effective direct route is shared by {direct_owner} and {node_id}")
             direct_owner = node_id
-        if node["route"] == "tunnel":
+        if node["host"] == "127.0.0.1":
             endpoint = (node["host"], node["port"])
             owner = local_endpoints.get(endpoint)
             if owner is not None:
                 raise RegistryError(
-                    f"effective tunnel endpoint {node['host']}:{node['port']} "
+                    f"effective loopback endpoint {node['host']}:{node['port']} "
                     f"is shared by {owner} and {node_id}"
                 )
             local_endpoints[endpoint] = node_id
@@ -341,7 +341,7 @@ def command_add(args: argparse.Namespace) -> int:
         port = None
     else:
         if args.port is None:
-            raise RegistryError("tunnel route requires --port")
+            raise RegistryError("proxy route requires --port")
         host = "127.0.0.1"
         port = args.port
     node = _normalise_custom_node(
@@ -570,8 +570,10 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--id", required=True, type=_stable_id, help="stable database id")
     add.add_argument("--name", type=_canonical_name, help="canonical display name; defaults to id")
     add.add_argument("--location", required=True, help="human-readable location")
-    add.add_argument("--route", choices=("direct", "tunnel"), default="tunnel")
-    add.add_argument("--port", type=_port, help="127.0.0.1 SOCKS port for a tunnel")
+    add.add_argument(
+        "--route", choices=("direct", "tunnel", "socks5"), default="tunnel"
+    )
+    add.add_argument("--port", type=_port, help="127.0.0.1 SOCKS port")
     add.add_argument("--replace", action="store_true")
     add.set_defaults(func=command_add)
 
