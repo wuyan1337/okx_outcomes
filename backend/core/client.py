@@ -276,16 +276,24 @@ class OKXOutcomesClient:
                 # Partial pagination is not a successful snapshot.  Callers
                 # such as risk-control cancellation must fail closed.
                 return resp
-            data = resp.get("data", {})
-            if (
-                not isinstance(data, dict)
-                or "list" not in data
-                or not isinstance(data.get("list"), list)
-            ):
+            data = resp.get("data")
+            # OKX has returned successful empty prediction-order snapshots as
+            # either {} or [].  Normalize those forms before pagination: an
+            # empty, acknowledged snapshot is safe; a non-empty unknown shape
+            # is not.
+            if data in (None, {}, []):
+                page = []
+                has_next = False
+            elif isinstance(data, list):
+                page = data
+                has_next = False
+            elif isinstance(data, dict) and isinstance(data.get("list"), list):
+                page = data["list"]
+                has_next = bool(data.get("hasNext"))
+            else:
                 return {"code": "INVALID_RESPONSE", "msg": "Invalid orders response"}
-            page = data["list"]
             all_orders.extend(page)
-            if not data.get("hasNext"):
+            if not has_next:
                 return {"code": "0", "data": {"list": all_orders}}
             next_cursor = str(data.get("nextCursor", "") or "")
             if not next_cursor or next_cursor == cursor:
