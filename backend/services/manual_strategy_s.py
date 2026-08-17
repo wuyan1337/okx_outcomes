@@ -494,7 +494,6 @@ class ManualStrategyS:
                 if not snapshot_ok:
                     continue
                 _all_orders = _closed_orders + _open_orders
-                await self._notify_all_fills(_all_orders)
                 await self._check_sell_fills(_all_orders)
                 await self._check_fills_post_sells(_all_orders)
                 if self._entry_release_event.is_set():

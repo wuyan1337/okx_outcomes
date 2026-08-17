@@ -544,9 +544,6 @@ class ManualStrategyD:
                     continue
                 _all_orders = _closed_orders + _open_orders
 
-                # Step 0: Notify all fills
-                await self._notify_all_fills(_all_orders)
-
                 # Release cancelled/failed protection before calculating gaps.
                 await self._check_sell_fills(_all_orders)
 
