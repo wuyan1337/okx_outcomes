@@ -313,10 +313,6 @@ class StrategyBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 409)
         payload = json.loads(response.body)
         self.assertFalse(payload["ok"])
-        self.assertTrue(instance.recovery_locked)
-        self.assertEqual(
-            instance.recovery_reason, "sniper_old_stop_reconciliation_incomplete"
-        )
 
     async def test_generic_stop_reports_sniper_reconciliation_failure(self):
         class AutoRebalance:
@@ -354,7 +350,6 @@ class StrategyBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 409)
         payload = json.loads(response.body)
         self.assertFalse(payload["ok"])
-        self.assertTrue(instance.recovery_locked)
         self.assertTrue(payload["results"]["sniper"]["needs_reconciliation"])
 
     async def test_manual_d_monitor_uses_the_executable_buy_tick(self):
@@ -437,8 +432,6 @@ class StrategyBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 409)
         payload = json.loads(response.body)
         self.assertFalse(payload["ok"])
-        self.assertTrue(instance.recovery_locked)
-        self.assertEqual(instance.recovery_reason, "monitor_start_rollback_incomplete")
 
 
 class AskSellBoundaryTests(unittest.IsolatedAsyncioTestCase):
@@ -586,8 +579,6 @@ class AskSellBoundaryTests(unittest.IsolatedAsyncioTestCase):
             result = await app_module.account_ask_sell("account-a", user="test")
 
         self.assertFalse(result["ok"])
-        self.assertTrue(instance.recovery_locked)
-        self.assertEqual(instance.recovery_reason, "ask_sell_protection_failed")
 
     async def test_ask_sell_restores_old_protection_when_replacement_is_rejected(self):
         client = SimpleNamespace()

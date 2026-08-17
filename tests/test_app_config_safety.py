@@ -72,51 +72,12 @@ def idle_instance(client):
 
 
 class AccountConfigSafetyTests(unittest.IsolatedAsyncioTestCase):
-    async def test_account_reconcile_repairs_rebalance_journal_first(self):
-        class RecoverableRebalance:
-            def __init__(self):
-                self.recovery_required = True
-                self._rebalancing = False
-                self.called = 0
-
-            async def recover(self):
-                self.called += 1
-                self.recovery_required = False
-                return {"ok": True, "recovery_required": False}
-
-        instance = idle_instance(FlatClient())
-        instance.auto_rebalance = RecoverableRebalance()
-        instance.recovery_locked = True
-        instance.recovery_reason = "auto_rebalance_recovery_required"
-        instance.recovery_details = {}
-        instance.recovery_status = lambda: {
-            "locked": instance.recovery_locked,
-            "reason": instance.recovery_reason,
-            "details": {},
-        }
-
-        async def reconcile():
-            instance.recovery_locked = False
-            instance.recovery_reason = ""
-            return {"ok": True, "locked": False, "reason": "", "details": {}}
-
-        instance.reconcile_account_safety = reconcile
-        manager = SimpleNamespace(get_instance=lambda _account_id: instance)
-        with mock.patch.object(app_module, "manager", manager):
-            response = await app_module.account_recovery_reconcile(
-                "account-a", user="test"
-            )
-
-        self.assertTrue(response["ok"])
-        self.assertEqual(instance.auto_rebalance.called, 1)
-        self.assertTrue(response["rebalance_recovery"]["ok"])
-
-    async def test_recovery_lock_blocks_monitor_and_rebalance_enable(self):
+    async def test_recovery_marker_does_not_block_monitor_or_rebalance_enable(self):
         instance = idle_instance(FlatClient())
         instance.recovery_locked = True
         instance.recovery_reason = "unmanaged_exchange_state"
         instance.recovery_details = {}
-        instance.poly_monitor.start = mock.AsyncMock()
+        instance.poly_monitor.start = mock.AsyncMock(return_value={"ok": True})
         instance.auto_rebalance = SimpleNamespace(
             enabled=False,
             _rebalancing=False,
@@ -132,10 +93,10 @@ class AccountConfigSafetyTests(unittest.IsolatedAsyncioTestCase):
                 "account-a", Request({"enabled": True}), user="test"
             )
 
-        self.assertEqual(monitor.status_code, 409)
-        self.assertEqual(rebalance.status_code, 409)
-        instance.poly_monitor.start.assert_not_awaited()
-        instance.auto_rebalance.set_enabled.assert_not_called()
+        self.assertTrue(monitor["ok"])
+        self.assertTrue(rebalance["ok"])
+        instance.poly_monitor.start.assert_awaited_once()
+        instance.auto_rebalance.set_enabled.assert_called_once_with(True)
 
     async def test_recovery_lock_still_allows_rebalance_disable(self):
         instance = idle_instance(FlatClient())

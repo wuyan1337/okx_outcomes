@@ -161,10 +161,6 @@ class CancelAllSafetyTests(unittest.IsolatedAsyncioTestCase):
             result = await app_module.account_cancel_all("account-a", user="test")
 
         self.assertFalse(result["ok"])
-        self.assertEqual(
-            instance.recovery_reason,
-            "cancel_all_strategy_stop_incomplete",
-        )
         self.assertFalse(result["stop"]["manual_d_safe"])
 
     async def test_missing_position_list_is_not_treated_as_verified_flat(self):

@@ -329,7 +329,7 @@ OKX WS 必须先收到 `snapshot` 才接受 `update`。如果 update 早于 snap
 2. 任何自动策略或风险控制任务正在运行时拒绝 Manual。账户、新版 Sniper 或 Sniper Old 仍 locked 时禁止 BUY；经过仓位校验的 reduce-only SELL 仍可减仓。
 3. 服务端把 cent 转为 `0..1` 并再次按 BUY 向下、SELL 向上对齐；`0.1¢` 会提交为 `0.001`。BUY 名义额必须至少 `1 xp`。
 4. SELL 先查询真实 position，不能超过最新 `availableSize`，并固定 `reduceOnly=true`；低于 `1 xp` 只有卖完整个可用仓位且没有 frozen size 才允许。
-5. 每单生成唯一 `clientOrderId` 并查询订单状态。提交未知时先撤自己的订单并核对终态；仍无法确认则返回 409 并激活 recovery lock。
+5. 每单生成唯一 `clientOrderId` 并查询订单状态。提交未知时先撤自己的订单并核对终态；仍无法确认则返回 409，并保留已确认的订单进度供人工处理。
 6. IOC 必须进入明确终态；GTC 只有 `ACTIVE` 或有成交才成功。Manual Trade 不自动补保护 SELL，也不运行后续循环。
 
 不要在任一 Sniper holding 期间从其他页面、脚本或另一套服务修改同一 asset 的仓位；这会破坏本地成交 ledger 与真实 position 的对应关系。
@@ -339,11 +339,11 @@ OKX WS 必须先收到 `snapshot` 才接受 `update`。如果 update 早于 snap
 1. Ask Sell 只在没有自动策略继续写订单时运行；它是减风险动作，但不会绕过真实订单和仓位核验。
 2. 对每个 open position，根据 `marketId/tokenIndex` 得到真实 OKX YES/NO asset，再从 `poly_asset_map.json` 找到对应 Poly token；缺映射、Poly book 失败、asks 为空时该 asset 直接失败，不猜价。
 3. Poly ask1 按 OKX SELL tick 向上对齐。程序只撤该 asset 的旧 SELL，并按 order/cloid 确认它们已终结。
-4. 撤单确认后重新查询 position 和最新 `availableSize`；仓位已关闭则记录 `position_closed`，仓位仍在但没有可卖数量则激活 recovery lock。
+4. 撤单确认后重新查询 position 和最新 `availableSize`；仓位已关闭则记录 `position_closed`，仓位仍在但没有可卖数量则返回未完成结果。
 5. 新保护单使用唯一 `clientOrderId`、reduce-only GTC；只有确认 `ACTIVE/FILLED` 才算成功。新单失败且状态可证明安全时，会尝试按旧保护单恢复 SELL；状态未知时不会报告恢复完成。
 6. 返回逐 asset 的 placed/skipped/failed。任一仓位未保护时整体 `ok=false`，并保留 recovery 状态供继续对账。
 
-API 凭据或 KYC region 会替换账户 client。只要有实际运行的策略、Monitor 或 Auto-Rebalance，服务端会拒绝保存这类变更；Recovery Lock 本身、交易所旧挂单/仓位或失效的旧 API Key 不阻止更新，因此可以直接修正失效凭据。新 agent private key 会在写库前解析验证；准备好新 client 后才执行数据库更新和内存切换。更新凭据不会撤单或平仓。
+API 凭据或 KYC region 会替换账户 client。只要有实际运行的策略、Monitor 或 Auto-Rebalance，服务端会拒绝保存这类变更；交易所旧挂单/仓位或失效的旧 API Key 不阻止更新，因此可以直接修正失效凭据。新 agent private key 会在写库前解析验证；准备好新 client 后才执行数据库更新和内存切换。更新凭据不会撤单或平仓。
 
 ## 7. Manual-D
 
@@ -659,7 +659,7 @@ Sniper Old 使用独立的 SQLite `sniper_old_state`，保存配置、running �
 
 1. 启动先读取 `sniper_old_state`。JSON 损坏或对象结构非法时保留原行、标记 `error/locked` 并阻止自动覆盖。
 2. 第一阶段调用 `restore(..., resume=False)`：加载 ledger，逐个观察或撤销未决 entry/exit cloid，累计已确认成交，并查询真实 matching position；这一阶段绝不启动 Poly 监听或新 BUY。修正后的 ledger 会先写回 SQLite，并保留旧 snapshot 的 running 标记；写盘失败立即锁定，不能进入第二阶段。
-3. 随后执行账户级 open orders/positions 安全对账。订单、仓位或 market/token 映射无法证明归属时进入 recovery lock。
+3. 随后执行账户级 open orders/positions 状态探测。订单、仓位或 market/token 映射无法证明归属时记录观察结果，但不会锁住账户。
 4. 只有安全对账通过、旧 snapshot 的 running 标记为真、且同账户没有新版 Sniper 恢复请求时，才执行第二阶段 `restore(..., resume=True)`。
 5. 第二阶段若仍有仓位，恢复 holding/timeout 退出管理；若已空仓，恢复 monitoring。恢复后的状态再次写回 SQLite，写盘失败继续保持 locked。
 
@@ -669,8 +669,8 @@ Sniper Old 使用独立的 SQLite `sniper_old_state`，保存配置、running �
 
 1. 每个已加载账户默认每 `120s` 执行一次只读探测，查询完整 open orders 和 open positions。
 2. 每轮最多尝试 3 次，失败重试间隔约 `2s`；成功时更新 `last_heartbeat_ok`，并把订单数、仓位数和耗时写入审计日志。
-3. 探测失败会激活 recovery lock，并停止所有可能新增敞口的本地策略活动；未知状态不会被当成空仓。position 没有显式 `assetId` 时，只有 `tokenIndex=1/tokenName=YES` 或 `2/NO` 的完整一致组合才能派生 asset；缺失、未知或冲突 outcome 会进入 `invalid_positions` 并保持锁定。
-4. 探测恢复后执行完整账户安全对账，只有能够证明安全时才解除 entry lock。普通 Manual Stop 不关闭这个后台任务。
+3. 探测失败会写入日志，但不会停止本地策略或锁住账户；未知状态不会被当成空仓。position 没有显式 `assetId` 时，只有 `tokenIndex=1/tokenName=YES` 或 `2/NO` 的完整一致组合才能派生 asset；缺失、未知或冲突 outcome 会进入 `invalid_positions`。
+4. 探测恢复后执行完整账户安全对账并更新观察结果；它不创建 entry lock。普通 Manual Stop 不关闭这个后台任务。
 5. 当前运行链路不会调用 `backend/core/client.py::heartbeat()`，也不会安装 OKX 的 5 分钟 dead-man Cancel All，因为到期会撤掉包括保护 SELL 在内的全部订单。
 
 从曾经启用 dead-man 的旧版本升级时，旧进程最后提交的签名仍可能在约 5 分钟内到期并撤单。首次升级必须先确认账户空仓且无挂单，停止旧服务，并等待最后一份旧签名失效后再启动新版。

@@ -36,6 +36,10 @@ class DashboardStopHandlingTests(unittest.TestCase):
         self.assertIn("Delete this local account", self.source)
         self.assertIn("will not cancel OKX orders or close OKX positions", self.source)
 
+    def test_dashboard_has_no_account_recovery_lock_ui(self):
+        self.assertNotIn("RECOVERY LOCK", self.source)
+        self.assertNotIn("recovery-banner", self.source)
+
 
 if __name__ == "__main__":
     unittest.main()

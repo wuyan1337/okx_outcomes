@@ -141,7 +141,6 @@ def _account_trading_busy(instance) -> bool:
         or instance.poly_monitor.running
         or monitor_enabled
         or rebalancing
-        or getattr(instance, "recovery_locked", False)
     )
 
 
@@ -172,18 +171,11 @@ def _automated_trading_active(instance) -> bool:
 
 
 def _recovery_status(instance) -> dict:
-    provider = getattr(instance, "recovery_status", None)
-    if callable(provider):
-        try:
-            status = provider()
-            if isinstance(status, dict):
-                return status
-        except Exception:
-            logger.exception("Failed to read account recovery status")
+    """Compatibility response after Recovery Lock was retired."""
     return {
-        "locked": bool(getattr(instance, "recovery_locked", False)),
-        "reason": str(getattr(instance, "recovery_reason", "") or ""),
-        "details": getattr(instance, "recovery_details", {}) or {},
+        "locked": False,
+        "reason": "",
+        "details": {},
     }
 
 
@@ -197,39 +189,18 @@ async def _refresh_entry_safety(instance) -> dict:
                 return result
         except Exception as exc:
             logger.exception("Account safety reconciliation failed")
-            if hasattr(instance, "recovery_locked"):
-                instance.recovery_locked = True
-                instance.recovery_reason = f"Account safety reconciliation failed: {exc}"
     return _recovery_status(instance)
 
 
 async def _entry_safety_response(instance):
-    status = await _refresh_entry_safety(instance)
-    if not status.get("locked"):
-        return None
-    reason = str(status.get("reason") or "Unmanaged orders or positions require reconciliation")
-    return JSONResponse(
-        status_code=409,
-        content={
-            "ok": False,
-            "error": reason,
-            "recovery": status,
-        },
-    )
+    return None
 
 
 def _activate_account_recovery(instance, reason: str, details: dict) -> None:
-    """Fail closed after an exchange write whose final state is unknown."""
-    activate = getattr(instance, "_activate_recovery_lock", None)
-    if callable(activate):
-        activate(reason, details)
-    else:
-        instance.recovery_locked = True
-        instance.recovery_reason = reason
-        instance.recovery_details = dict(details)
+    """Record an unresolved exchange observation without locking the account."""
     audit_event(
-        "account.write_state_unresolved",
-        level=logging.ERROR,
+        "account.write_state_observed",
+        level=logging.WARNING,
         account_id=getattr(instance, "account_id", ""),
         reason=reason,
         details=details,
@@ -716,8 +687,6 @@ async def get_status(user: str = Depends(verify_auth)):
             running_strategy = "Auto-Rebalance"
         elif inst.poly_monitor.running or getattr(inst.poly_monitor.state, "enabled", False):
             running_strategy = "Poly Monitor"
-        elif getattr(inst, "recovery_locked", False):
-            running_strategy = "Recovery Lock"
         # Get per-account stats for cards
         acct_orders = 0
         acct_positions = 0
@@ -801,8 +770,6 @@ async def list_accounts(user: str = Depends(verify_auth)):
                 strategy = "Auto-Rebalance"
             elif inst.poly_monitor.running or getattr(inst.poly_monitor.state, "enabled", False):
                 strategy = "Poly Monitor"
-            elif getattr(inst, "recovery_locked", False):
-                strategy = "Recovery Lock"
         result.append({
             "id": acc["id"],
             "name": acc["name"],
@@ -1149,8 +1116,6 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         strategy = "auto-rebalance"
     elif inst.poly_monitor.running or getattr(inst.poly_monitor.state, "enabled", False):
         strategy = "poly-monitor"
-    elif getattr(inst, "recovery_locked", False):
-        strategy = "recovery-lock"
     recovery = _recovery_status(inst)
     return {
         "manual_running": inst.strategy_d.running,
@@ -1197,65 +1162,6 @@ async def account_status(account_id: str, user: str = Depends(verify_auth)):
         "recovery": recovery,
         "recovery_locked": bool(recovery.get("locked")),
         "recovery_reason": str(recovery.get("reason") or ""),
-    }
-
-
-@app.get("/api/accounts/{account_id}/recovery/status")
-async def account_recovery_status(account_id: str, user: str = Depends(verify_auth)):
-    inst = manager.get_instance(account_id)
-    if not inst:
-        raise HTTPException(404, "Account not found")
-    return _recovery_status(inst)
-
-
-@app.post("/api/accounts/{account_id}/recovery/reconcile")
-@_serialize_strategy_lifecycle
-async def account_recovery_reconcile(account_id: str, user: str = Depends(verify_auth)):
-    inst = manager.get_instance(account_id)
-    if not inst:
-        raise HTTPException(404, "Account not found")
-    if _automated_trading_active(inst):
-        return JSONResponse(
-            status_code=409,
-            content={
-                "ok": False,
-                "error": "Stop all automated strategies before recovery reconciliation",
-                "recovery": _recovery_status(inst),
-            },
-        )
-    rebalance_result = None
-    rebalance = getattr(inst, "auto_rebalance", None)
-    if bool(getattr(rebalance, "recovery_required", False)):
-        recover = getattr(rebalance, "recover", None)
-        if not callable(recover):
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "ok": False,
-                    "error": "Auto-Rebalance recovery is required but unavailable",
-                    "recovery": _recovery_status(inst),
-                },
-            )
-        rebalance_result = await recover()
-        if not isinstance(rebalance_result, dict) or not rebalance_result.get("ok"):
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "ok": False,
-                    "error": (
-                        rebalance_result.get("error", "Auto-Rebalance recovery failed")
-                        if isinstance(rebalance_result, dict)
-                        else "Auto-Rebalance recovery returned an invalid result"
-                    ),
-                    "rebalance_recovery": rebalance_result,
-                    "recovery": _recovery_status(inst),
-                },
-            )
-    status = await _refresh_entry_safety(inst)
-    return {
-        "ok": not bool(status.get("locked")),
-        "recovery": status,
-        "rebalance_recovery": rebalance_result,
     }
 
 
@@ -3802,15 +3708,6 @@ async def account_monitor_start(account_id: str, request: Request, user: str = D
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
-    if getattr(inst, "recovery_locked", False):
-        return JSONResponse(
-            status_code=409,
-            content={
-                "ok": False,
-                "error": "Recovery lock blocks starting Poly Monitor",
-                "recovery": _recovery_status(inst),
-            },
-        )
     body = await request.json()
     poly_token_id = body.get("poly_token_id", "")
     reference_price = float(body.get("reference_price", 0))
@@ -3848,16 +3745,6 @@ async def account_rebalance_toggle(account_id: str, request: Request, user: str 
                 "ok": False,
                 "enabled": inst.auto_rebalance.enabled,
                 "error": "enabled must be a boolean",
-            },
-        )
-    if enabled and getattr(inst, "recovery_locked", False):
-        return JSONResponse(
-            status_code=409,
-            content={
-                "ok": False,
-                "enabled": inst.auto_rebalance.enabled,
-                "error": "Recovery lock blocks enabling Auto-Rebalance",
-                "recovery": _recovery_status(inst),
             },
         )
     if not inst.auto_rebalance.set_enabled(enabled):

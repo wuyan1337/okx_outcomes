@@ -110,7 +110,7 @@ class AccountInstance:
         return bool(task is not None and not task.done())
 
     def recovery_status(self) -> dict:
-        """Return the account-wide entry gate and reconciliation health."""
+        """Return compatibility status after recovery locking was retired."""
         rebalance = getattr(self, "auto_rebalance", None)
         rebalance_provider = getattr(rebalance, "recovery_status", None)
         try:
@@ -124,9 +124,9 @@ class AccountInstance:
                 "error": str(exc),
             }
         return {
-            "locked": bool(getattr(self, "recovery_locked", False)),
-            "reason": str(getattr(self, "recovery_reason", "") or ""),
-            "details": dict(getattr(self, "recovery_details", {}) or {}),
+            "locked": False,
+            "reason": "",
+            "details": {},
             "heartbeat_running": self.account_heartbeat_running,
             "last_heartbeat_ok": getattr(self, "last_heartbeat_ok", None),
             "last_reconciled_at": getattr(self, "last_reconciled_at", None),
@@ -233,14 +233,6 @@ class AccountInstance:
                     failure = f"{type(exc).__name__}: {exc}"
 
                 if failure:
-                    self._activate_recovery_lock(
-                        "heartbeat_failed",
-                        {
-                            "response_code": response_code,
-                            "message": failure,
-                            "elapsed_ms": self._elapsed_ms(started_ns),
-                        },
-                    )
                     audit_event(
                         "account.heartbeat_failed",
                         level=logging.ERROR,
@@ -248,9 +240,6 @@ class AccountInstance:
                         response_code=response_code,
                         message=failure,
                         elapsed_ms=self._elapsed_ms(started_ns),
-                    )
-                    await self._stop_entry_activity_for_recovery(
-                        "account heartbeat could not be renewed"
                     )
                 else:
                     self.last_heartbeat_ok = time.time()
@@ -262,58 +251,35 @@ class AccountInstance:
                         position_count=response.get("position_count", 0),
                         elapsed_ms=self._elapsed_ms(started_ns),
                     )
-                    if self.recovery_locked:
-                        await self.reconcile_account_safety()
 
                 await asyncio.sleep(self._account_heartbeat_interval)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._activate_recovery_lock(
-                "heartbeat_task_failed",
-                {"message": f"{type(exc).__name__}: {exc}"},
-            )
             audit_event(
                 "account.heartbeat_task_failed",
                 level=logging.ERROR,
                 account_id=self.account_id,
                 error=exc,
             )
-            await self._stop_entry_activity_for_recovery(
-                "account heartbeat task terminated unexpectedly"
-            )
         finally:
             if getattr(self, "_account_heartbeat_task", None) is asyncio.current_task():
                 self._account_heartbeat_task = None
 
     def _activate_recovery_lock(self, reason: str, details: Optional[dict] = None) -> None:
-        previous_reason = str(getattr(self, "recovery_reason", "") or "")
-        was_locked = bool(getattr(self, "recovery_locked", False))
-        self.recovery_locked = True
-        self.recovery_reason = str(reason or "account_safety_unresolved")
-        self.recovery_details = dict(details or {})
+        """Record an observation; account-level Recovery Lock is retired."""
         audit_event(
-            "account.recovery_locked",
-            level=logging.ERROR,
+            "account.safety_observed",
+            level=logging.WARNING,
             account_id=self.account_id,
-            reason=self.recovery_reason,
-            previous_reason=previous_reason,
-            already_locked=was_locked,
-            details=self.recovery_details,
+            reason=str(reason or "account_safety_unresolved"),
+            details=dict(details or {}),
         )
 
     def _clear_recovery_lock(self) -> None:
-        if not getattr(self, "recovery_locked", False):
-            return
-        previous_reason = self.recovery_reason
         self.recovery_locked = False
         self.recovery_reason = ""
         self.recovery_details = {}
-        audit_event(
-            "account.recovery_cleared",
-            account_id=self.account_id,
-            previous_reason=previous_reason,
-        )
 
     async def _stop_entry_activity_for_recovery(self, reason: str) -> None:
         """Stop every local component that could create new exchange exposure."""
@@ -601,129 +567,51 @@ class AccountInstance:
         }
 
     async def reconcile_account_safety(self, *, startup: bool = False) -> dict:
-        """Reconcile account-wide exchange exposure and maintain the entry lock."""
-        lock = getattr(self, "_recovery_lock", None)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._recovery_lock = lock
-        async with lock:
-            started_ns = time.perf_counter_ns()
+        """Observe exchange state without creating an account-level entry lock."""
+        started_ns = time.perf_counter_ns()
+        self.last_reconciled_at = time.time()
+        try:
+            order_response, position_response = await asyncio.gather(
+                self.client.get_orders(status="open"),
+                self.client.get_positions(status="open"),
+            )
+            classification = self._classify_exchange_state(
+                self._verified_response_list(order_response, "open orders"),
+                self._verified_response_list(position_response, "open positions"),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
             audit_event(
-                "account.recovery_reconcile_started",
+                "account.safety_observation_failed",
+                level=logging.WARNING,
                 account_id=self.account_id,
                 startup=startup,
-                locked=bool(self.recovery_locked),
+                error=exc,
+                elapsed_ms=self._elapsed_ms(started_ns),
             )
-            try:
-                order_response, position_response = await asyncio.gather(
-                    self.client.get_orders(status="open"),
-                    self.client.get_positions(status="open"),
-                )
-                open_orders = self._verified_response_list(order_response, "open orders")
-                positions = self._verified_response_list(position_response, "open positions")
-                classification = self._classify_exchange_state(open_orders, positions)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.last_reconciled_at = time.time()
-                reason = "startup_safety_query_failed" if startup else "safety_query_failed"
-                self._activate_recovery_lock(
-                    reason,
-                    {
-                        "message": f"{type(exc).__name__}: {exc}",
-                        "startup": startup,
-                    },
-                )
-                await self._stop_entry_activity_for_recovery(
-                    "account exposure could not be verified"
-                )
-                result = {
-                    **self.recovery_status(),
-                    "ok": False,
-                    "flat": False,
-                    "elapsed_ms": self._elapsed_ms(started_ns),
-                }
-                audit_event(
-                    "account.recovery_reconcile_failed",
-                    level=logging.ERROR,
-                    account_id=self.account_id,
-                    startup=startup,
-                    error=exc,
-                    elapsed_ms=result["elapsed_ms"],
-                )
-                return result
-
-            self.last_reconciled_at = time.time()
-            rebalance_recovery = self.recovery_status().get("auto_rebalance", {})
-            rebalance_recovery_required = bool(
-                isinstance(rebalance_recovery, dict)
-                and rebalance_recovery.get("required")
-            )
-            sniper_old_state = getattr(
-                getattr(self, "sniper_old", None), "state", None
-            )
-            sniper_old_recovery_required = bool(
-                getattr(self, "_sniper_old_snapshot_corrupt", False)
-                or getattr(self, "_sniper_old_snapshot_write_blocked", False)
-                or (
-                    getattr(sniper_old_state, "locked", False)
-                    and str(getattr(sniper_old_state, "status", "")) == "error"
-                )
-            )
-            classification["auto_rebalance_recovery_required"] = (
-                rebalance_recovery_required
-            )
-            classification["sniper_old_recovery_required"] = (
-                sniper_old_recovery_required
-            )
-            if sniper_old_recovery_required:
-                self._activate_recovery_lock(
-                    "sniper_old_recovery_required",
-                    {**classification, "startup": startup},
-                )
-                await self._stop_entry_activity_for_recovery(
-                    "Sniper Old durable ledger requires operator reconciliation"
-                )
-            elif rebalance_recovery_required:
-                self._activate_recovery_lock(
-                    "auto_rebalance_recovery_required",
-                    {
-                        **classification,
-                        "startup": startup,
-                        "auto_rebalance": rebalance_recovery,
-                    },
-                )
-                await self._stop_entry_activity_for_recovery(
-                    "Auto-Rebalance recovery journal requires operator reconciliation"
-                )
-            elif classification["unsafe"]:
-                self._activate_recovery_lock(
-                    "unmanaged_exchange_state",
-                    {**classification, "startup": startup},
-                )
-                await self._stop_entry_activity_for_recovery(
-                    "unmanaged orders or positions require reconciliation"
-                )
-            elif classification["flat"]:
-                self._clear_recovery_lock()
-
-            result = {
+            return {
                 **self.recovery_status(),
-                "ok": not self.recovery_locked,
-                **classification,
+                "ok": True,
+                "flat": False,
+                "observation_error": f"{type(exc).__name__}: {exc}",
                 "elapsed_ms": self._elapsed_ms(started_ns),
             }
-            audit_event(
-                "account.recovery_reconcile_completed",
-                level=logging.INFO if not self.recovery_locked else logging.WARNING,
-                account_id=self.account_id,
-                startup=startup,
-                locked=self.recovery_locked,
-                reason=self.recovery_reason,
-                classification=classification,
-                elapsed_ms=result["elapsed_ms"],
-            )
-            return result
+
+        result = {
+            **self.recovery_status(),
+            "ok": True,
+            **classification,
+            "elapsed_ms": self._elapsed_ms(started_ns),
+        }
+        audit_event(
+            "account.safety_observed",
+            account_id=self.account_id,
+            startup=startup,
+            classification=classification,
+            elapsed_ms=result["elapsed_ms"],
+        )
+        return result
 
     @staticmethod
     def _elapsed_ms(started_ns: int) -> float:

@@ -30,7 +30,7 @@
 
 1. 同一账户的 Start、Stop、Cancel All、Ask Sell、Flash 等关键动作通过账户生命周期锁串行执行，避免两个浏览器请求同时改变状态。
 2. Manual-D、Manual-S/Bid-Sell、新 Sniper、Sniper Old、Monitor/Auto-Rebalance 互斥；已有策略或风险恢复流程未结束时，新策略不能启动。
-3. 账户存在 `recovery_locked`、Sniper 未决锁或 Auto-Rebalance recovery journal 时，所有会增加敞口的入口都拒绝执行。
+3. Sniper 未决锁或 Auto-Rebalance recovery journal 时，相关策略会拒绝不安全的新入口。
 4. 减少风险的动作仍保留：撤单、reduce-only SELL、Flash Close 和明确的 recovery reconcile。
 5. 查询订单、仓位或关键状态写盘失败时，系统按“无法证明安全”处理，不会把未知状态当成成功。
 
@@ -87,8 +87,8 @@
 2. Stop 只处理 Manual-D 自己仍未完成的入场 BUY，并按自己的 `clientOrderId` 撤销、核对；不会执行账户级 Cancel All。
 3. 撤 BUY 后若终态显示新增 fill，Stop 会先补齐缺失的保护 SELL；已经确认的保护 SELL 保留在 OKX，Stop 不主动平仓。
 4. 页面刷新不会改变后端正在运行的任务；但服务进程重启后，Manual-D 不会像新版 Sniper 一样自动续跑。
-5. `pending_sells`、订单归属和已处理成交水位写入账户专属 JSON，重启后作为订单归属与已处理水位证据；它不会自动授权新 entry。交易所仍有订单/仓位时，账户启动安全检查可以继续保持 recovery lock，直到完成对账或减风险处理。
-6. 状态损坏、订单终态未知或写盘失败时保持 `deployment_blocked`。Stop 无法完成安全核验时 API 返回 409，并设置账户 recovery lock。
+5. `pending_sells`、订单归属和已处理成交水位写入账户专属 JSON，重启后作为订单归属与已处理水位证据；它不会自动授权新 entry。交易所状态探测只记录观察结果，不会锁住账户。
+6. 状态损坏、订单终态未知或写盘失败时保持 `deployment_blocked`。Stop 无法完成安全核验时 API 返回 409。
 
 ## 3. Manual-S：只交易一个真实 outcome
 
@@ -124,8 +124,8 @@
 2. 只撤销并确认本策略未完成的入场 BUY；不撤其他策略或人工订单。
 3. 撤 BUY 后若发现新增 fill，会先补齐缺失保护；已确认保护 SELL 保留，Stop 不主动平仓。
 4. `data/pending_sells_s_{account_id}.json` 保存 pending fill、订单归属和处理水位；页面刷新保留后端状态，服务重启不自动恢复 running，也不自动授权新 entry。
-5. 启动安全检查发现交易所仍有订单/仓位时可以继续保持 recovery lock；JSON ledger 是归属证据，不是绕过账户对账的开关。
-6. 状态文件失败、订单结果未知或连续操作失败会阻止新部署，现有已知成交仍优先进入保护处理；Stop 无法完成安全核验时 API 返回 409，并设置账户 recovery lock。
+5. 启动安全检查发现交易所仍有订单/仓位时只记录状态；JSON ledger 是归属证据，不是绕过账户对账的开关。
+6. 状态文件失败、订单结果未知或连续操作失败会阻止新部署，现有已知成交仍优先进入保护处理；Stop 无法完成安全核验时 API 返回 409。
 
 ## 4. Bid-Sell：以 SELL 价为输入的 Manual-S
 
@@ -211,7 +211,7 @@
 8. `_plan_sell_orders()` 为每层计算 `max(该层成本, 新目标 SELL)`，再向上对齐，确保不在记录成本以下卖出。
 9. 小于 `1 xp` 的相邻层会合并；若只剩整仓的小额数量，可使用 reduce-only sell-all 例外。
 10. 每笔 protective SELL 先生成 `clientOrderId`，再发 reduce-only GTC；随后轮询 open/closed orders，只有 `ACTIVE` 或 `FILLED` 才算确认。
-11. 任一保护 SELL 变成 `PARTIALLY_FILLED/FAILED/PLACE_FAILED/CANCELLED/EXPIRED`，或在期限内无法确认，都使本次 Rebalance 失败并保留 recovery lock。
+11. 任一保护 SELL 变成 `PARTIALLY_FILLED/FAILED/PLACE_FAILED/CANCELLED/EXPIRED`，或在期限内无法确认，都使本次 Rebalance 失败并保留失败详情。
 12. 所有持仓有保护后，先重启 Monitor，再重启原 Manual-D、Manual-S 或 Bid-Sell；Manual 重启前后都会检查 `deployment_blocked/block_reason`，只有未锁定、进入 running 且 entry barrier 成功释放才算成功。重启或 journal 失败后的回滚中，Manual stop 明确返回 `False` 也算清理失败，必须记录并保留 recovery，不能写成安全完成。
 13. 最后才清 recovery journal。journal 清除失败时也停止新入场，不能把“交易动作完成但状态没写盘”报告为完成。
 
@@ -221,7 +221,7 @@
 2. 进程崩溃、任务取消、REST 未确认或写盘失败时，`recovery.required` 保留。
 3. `recover()` 先调用严格 stop：Manual stop 必须明确返回 `True`，否则不进入撤单；随后停止 Monitor，再撤单核验、捕获 fills、对账 positions、同步成本层并重挂确认 protective SELL。
 4. 恢复流程只恢复保护，不自动恢复新的 BUY entry，也不自动重启 Manual/Monitor。
-5. 只有保护完成且 journal 清除成功后，Auto-Rebalance 自己的 recovery-required 状态才解除；账户级 entry lock 仍可能因现存仓位或订单继续保留，需再做账户安全对账。
+5. 只有保护完成且 journal 清除成功后，Auto-Rebalance 自己的 recovery-required 状态才解除；账户安全探测只记录观察结果，不会锁住账户。
 6. 主要结构化日志前缀为 `rebalance.*`，同一次流程用 `rebalance_id` 串联。
 
 ## 7. 新版 Poly Sniper：多候选监听、单仓全局锁
@@ -325,11 +325,11 @@
 6. settle 结束后，当前主流程按该 outcome 的 OKX best bid 提交 reduce-only IOC SELL；旧的 `_post_sell_at_price()` 不是当前默认退出路径。
 7. 退出最多尝试 5 次；每次读取真实成交量并累计，只卖尚未退出的剩余数量。最后必须查询交易所 position 并确认该 asset 已归零。
 8. Stop 先停止新信号，再对账未决 entry，撤销只属于本次 Old Sniper 的保护 SELL，然后对剩余仓位执行退出；无法证明订单终结且 position 为 0 时返回失败并保持锁定。
-9. Sniper Old Stop 未完成时，API 返回 HTTP 409，并激活账户 recovery lock，阻止新的自动策略和 Manual BUY；明确的 reduce-only SELL 仍可用于减仓。
+9. Sniper Old Stop 未完成时，API 返回 HTTP 409；明确的 reduce-only SELL 仍可用于减仓。
 10. Sniper Old 的配置、running 标记、holding side、买卖数量、entry/exit `clientOrderId`、订单 ID、累计成交和 hold 起点写入 SQLite `sniper_old_state`；关键写盘失败会停止运行并进入 `error/locked`。
 11. 服务重启采用两阶段恢复：先 `restore(..., resume=False)` 加载 ledger、逐个核对 entry/exit cloid 和真实 position，但不启动信号；第一阶段修正后的 ledger 必须先写回 SQLite，写盘失败立即 `error/locked`；然后才做账户级 open orders/positions 安全对账。
 12. 只有账户安全对账通过、旧 snapshot 的 running 标记为真、且新版 Sniper 不需要恢复时，才执行 `restore(..., resume=True)`；有持仓则恢复 holding/timeout 管理，无持仓则恢复 monitoring。
-13. snapshot JSON 损坏、市场/token 映射不完整、订单终态或 position 无法确认时，保留 SQLite 行并维持 recovery lock，不能先恢复监听再补对账。
+13. snapshot JSON 损坏、市场/token 映射不完整、订单终态或 position 无法确认时，保留 SQLite 行并返回未完成状态，不能先恢复监听再补对账。
 
 ## 9. Manual Trade：一次性人工 BUY/SELL
 
@@ -338,12 +338,12 @@
 实现入口：`backend/app.py` 的 `account_manual_place()`；页面逻辑在 `frontend/dashboard.html`。
 
 1. 自动策略、Monitor/Rebalance、Sniper starting/running 或关键持久化失败时，人工下单被拒绝。
-2. Sniper 或 Sniper Old 已停止但 locked 时禁止人工 BUY；reduce-only SELL 仍可用于减仓。账户 recovery lock 同样只阻止 BUY，不阻止经过仓位校验的 SELL。
+2. Sniper 或 Sniper Old 已停止但 locked 时禁止人工 BUY；reduce-only SELL 仍可用于减仓。
 3. 输入 cent 先转换到 `0..1` 原始价格，再按 BUY 向下、SELL 向上对齐；`0.1¢` 必须变成 `0.001`，不会变成 0。
 4. BUY 必须满足至少 `1 xp` 名义额。
 5. SELL 先查询真实 position，不能超过 `availableSize`，并始终设置 `reduce_only=True`。
 6. SELL 低于 `1 xp` 时，只有卖出全部可用仓位且没有冻结数量才允许使用 sell-all 例外。
-7. 订单使用唯一 `clientOrderId` 发送并按该 ID 查询。提交结果未知时先尝试撤自己的订单并确认终态；仍无法确认时返回 HTTP 409、激活账户 recovery lock，不能盲目重下。
+7. 订单使用唯一 `clientOrderId` 发送并按该 ID 查询。提交结果未知时先尝试撤自己的订单并确认终态；仍无法确认时返回 HTTP 409，不能盲目重下。
 8. IOC 必须进入明确终态；`FILLED` 或终态中 `filledSize > 0` 才算有成交，GTC 只有确认 `ACTIVE` 或成交后才返回成功。
 9. Manual Trade 不自动补保护 SELL、不运行循环策略；用户仍应在 Active/Closed Orders 和 Positions 中检查最终状态。
 
@@ -359,9 +359,9 @@
 4. 没有 Poly 映射、Poly `/book` 失败、asks 为空或 ask1 无效时，该 position 被明确标记 skipped/failed，不猜价格。
 5. 将 Poly ask1 按 SELL 方向对齐到 OKX tick。
 6. 只撤该 asset 的已有 SELL，并重新查询确认这些 SELL 已消失；然后再次查询该 asset 的最新 position/`availableSize`，不能沿用撤单前仍被旧 SELL 冻结的数量。
-7. 无法确认旧 SELL 已消失或无法取得最新可用仓位时不挂新单，并激活 recovery lock；新 protective SELL 使用 reduce-only GTC、唯一 `clientOrderId`，只有确认 `ACTIVE/FILLED` 才算保护成功。
+7. 无法确认旧 SELL 已消失或无法取得最新可用仓位时不挂新单；新 protective SELL 使用 reduce-only GTC、唯一 `clientOrderId`，只有确认 `ACTIVE/FILLED` 才算保护成功。
 8. 新单被拒绝或进入明确非保护终态时，先确认该新单已经安全终结；如果旧 SELL 曾存在，再按旧保护价格和最新 position 尝试恢复保护。新单状态仍未知时不会假装回滚完成。
-9. 返回逐 asset 结果；任一 position skipped/failed 时整体 `ok=false`。Ask Sell 不会因为局部成功自动清除 recovery lock，结束前会重新运行账户安全检查。
+9. 返回逐 asset 结果；任一 position skipped/failed 时整体 `ok=false`，结束前会重新运行账户状态探测。
 
 ## 11. Flash Close：账户级紧急退出
 
@@ -377,7 +377,7 @@
 6. 若某 asset 退出不完整，在最终账户清理前尝试按被撤保护单恢复 confirmed reduce-only GTC SELL；仍有仓位时只撤非保护订单，并返回保护覆盖是否完整。
 7. 只有 positions 已明确为 0，才执行最后的账户开放订单清理；之后最多轮询 10 次 open orders 和 open positions，两者都为 0 才进入本地 ledger 收尾。
 8. 普通 Flash 和删除账户都要求 Manual、新 Sniper、Sniper Old 的本地 stop/reconcile 结果可证明安全；交易所已空但本地锁未解除时仍返回失败。
-9. 任一订单未知、查询失败、仓位残留或保护恢复失败都会激活 recovery lock，并在结果中保留 submitted/cancelled/remaining/failures 等已确认进度。
+9. 任一订单未知、查询失败、仓位残留或保护恢复失败都会返回失败，并在结果中保留 submitted/cancelled/remaining/failures 等已确认进度。
 
 ### 11.1 删除账户
 
@@ -395,27 +395,25 @@
 1. 每个账户完成启动安全对账后，启动一个后台只读探测 task；普通 Manual Stop 不会关闭它。
 2. 默认每 `120s` 查询一次完整 open orders 和 open positions；每轮最多尝试 3 次，失败重试间隔约 `2s`。
 3. 探测成功时更新 `last_heartbeat_ok`，并记录开放订单数、开放仓位数和本轮耗时。
-4. 探测失败时设置账户 recovery lock，并停止 Auto-Rebalance、Manual、Sniper、Sniper Old 和 Monitor 中所有可能新增敞口的活动；未知交易所状态不会被当成空仓。
-5. 后续探测恢复时执行完整账户安全对账；只有订单、仓位、Sniper ledger 和 recovery 状态都可证明安全时才解除 entry lock。
+4. 探测失败时写入日志；未知交易所状态不会被当成空仓。
+5. 后续探测恢复时执行完整账户安全对账并更新观察日志；它不会停止策略、锁定账户或阻止删除账户。
 6. 当前运行链路不会调用 `backend/core/client.py::heartbeat()`，也不会安装“5 分钟后自动 Cancel All”的 OKX dead-man。原因是该签名到期会撤掉包括保护 SELL 在内的全部订单，与持仓保护逻辑冲突。
 7. 从曾经启用 dead-man 的旧版本升级时，旧进程最后发送的签名仍可能在约 5 分钟内到期并撤单。首次升级必须先确认空仓且无挂单，停止旧服务，并等待最后一份旧签名失效后再部署和启动新版。
 
-## 13. 启动恢复锁和人工 Reconcile
+## 13. 启动安全观察与人工 Reconcile
 
 实现入口：`AccountManager._load_account()`、`AccountManager._finalize_account_load()`、`AccountInstance.reconcile_account_safety()`；API 为：
 
-- `GET /api/accounts/{account_id}/recovery/status`
-- `POST /api/accounts/{account_id}/recovery/reconcile`
 
 1. 服务启动先加载账户和解密 client，再读取新版 `sniper_state`；存在 snapshot 时先调用 `restore(..., resume=False)` 恢复配置、订单归属和锁，但暂不恢复信号监听。
 2. 随后读取 `sniper_old_state`；有效 snapshot 同样先调用 `restore(..., resume=False)`，逐个核对旧 Sniper 的 entry/exit cloid 和真实 position，不启动监听或新的 BUY。第一阶段清理后的账本先写回 SQLite，并保留原 running 标记。
 3. 接着查询完整 OKX open orders 与 open positions，并识别哪些状态能由已恢复的新版或旧版 Sniper ledger 解释。
 4. 只有账户安全对账通过，且对应 snapshot 在关闭前确实 running，才执行第二阶段 `resume=True`。同一账户不会同时恢复新版和 Sniper Old；新版恢复请求存在时，Sniper Old resume 被阻止。
 5. 完成上述恢复步骤后，才启动第 12 节的只读账户安全探测。
-6. 查询失败、出现无法归属的开放订单/仓位、任一 Sniper snapshot 损坏，或 Auto-Rebalance journal 未完成时，账户进入 recovery lock。没有显式 `assetId` 的 position 只有 `tokenIndex=1 + tokenName=YES` 或 `2 + NO` 才能派生 outcome；字段缺失、未知或互相冲突一律记入 `invalid_positions`，不能默认成 YES。
-7. recovery lock 只阻止新增敞口，不自动清仓；运营人员可使用撤单、reduce-only SELL、Flash 或专用 recover/reconcile。
+6. 查询失败、出现无法归属的开放订单/仓位、任一 Sniper snapshot 损坏，或 Auto-Rebalance journal 未完成时，账户记录观察/失败状态。没有显式 `assetId` 的 position 只有 `tokenIndex=1 + tokenName=YES` 或 `2 + NO` 的完整一致组合才能派生 outcome；字段缺失、未知或互相冲突一律记入 `invalid_positions`，不能默认成 YES。
+7. 账户不会因该观察状态自动清仓；运营人员可使用撤单、reduce-only SELL、Flash 或专用 recover/reconcile。
 8. 人工 Reconcile 若发现 Auto-Rebalance journal，会先执行保守 `recover()`：停组件、撤单核验、对账并补保护 SELL，但不恢复新 entry；随后再查询真实交易所状态。
-9. Reconcile 不是“点一下强制解锁”。只有 Auto-Rebalance recovery 已完成，并且订单、仓位和策略账本都可证明安全时才清锁。
+9. Reconcile 是对 Auto-Rebalance 自己的恢复 journal 做保守处理，不存在账户级“强制解锁”或 Recovery Lock。
 10. 不要直接删除 `data/accounts.db`、`data/cost_layers_*.json` 或 `data/pending_sells_*.json` 来消除界面警告，这会删除归属证据而不是消除真实订单和仓位。
 
 ## 14. 日志文件与逐毫秒排查方法
