@@ -654,6 +654,13 @@ class ManualStrategyD:
                 or confirmation.response.get("msg")
                 or confirmation.response_code
             )
+        elif confirmation.response_code == "0":
+            # OKX accepted the placement.  Its order-list projection can lag
+            # behind the successful placement response, so keep the quantity
+            # reserved just as the original Manual strategy did instead of
+            # re-submitting another protective sell for the same fill.
+            record["status"] = "PENDING_PLACE"
+            record["error"] = ""
         else:
             record["status"] = "UNKNOWN"
             record["error"] = str(
@@ -667,7 +674,7 @@ class ManualStrategyD:
                 f"{role} result could not be persisted",
                 persist=False,
             )
-        if confirmation.unresolved:
+        if confirmation.unresolved and confirmation.response_code != "0":
             self._block_new_deployments(
                 f"{role} {client_order_id} final placement state is unknown"
             )
@@ -883,6 +890,11 @@ class ManualStrategyD:
                 delay=self._order_confirmation_delay,
             )
             if observation is None:
+                if str(record.get("response_code") or "").upper() == "0":
+                    # A successful place response is sufficient to reserve
+                    # this fill.  Keep polling on later passes, but do not
+                    # turn normal exchange-indexing lag into repeated locks.
+                    continue
                 safe = False
                 self._block_new_deployments(
                     f"protective SELL {record.get('client_order_id', '')} state is unknown"

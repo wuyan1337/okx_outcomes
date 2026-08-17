@@ -3180,14 +3180,6 @@ async def account_manual_place(account_id: str, request: Request, user: str = De
                 "error": "Manual orders are disabled while Sniper is running or starting",
             },
         )
-    if _automated_trading_active(inst):
-        return JSONResponse(
-            status_code=409,
-            content={
-                "ok": False,
-                "error": "Manual orders are disabled while an automated strategy or risk-control task is active",
-            },
-        )
     if side == "BUY":
         safety_response = await _entry_safety_response(inst)
         if safety_response is not None:
