@@ -254,7 +254,7 @@ class ClientPaginationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response["code"], "TIMEOUT")
 
-    async def test_success_code_with_empty_order_snapshot_is_normalized(self):
+    async def test_success_code_without_order_list_is_invalid(self):
         client_module = _load_client_module()
         client = client_module.OKXOutcomesClient.__new__(
             client_module.OKXOutcomesClient
@@ -263,7 +263,7 @@ class ClientPaginationTests(unittest.IsolatedAsyncioTestCase):
 
         response = await client.get_orders()
 
-        self.assertEqual(response, {"code": "0", "data": {"list": []}})
+        self.assertEqual(response["code"], "INVALID_RESPONSE")
 
     async def test_success_code_without_position_list_is_invalid(self):
         client_module = _load_client_module()

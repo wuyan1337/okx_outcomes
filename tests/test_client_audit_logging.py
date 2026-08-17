@@ -114,14 +114,6 @@ class ClientAuditLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("OK-ACCESS-KEY", session.requests[0][2]["headers"])
         self.assertNotIn("api-key-secret", json.dumps(self.events))
 
-    async def test_get_orders_normalizes_acknowledged_empty_snapshot(self):
-        session = FakeSession(get_results=[FakeResponse({"code": "0", "data": {}})])
-        self.client._get_session = mock.AsyncMock(return_value=session)
-
-        result = await self.client.get_orders(status="open")
-
-        self.assertEqual(result, {"code": "0", "data": {"list": []}})
-
     async def test_nonzero_response_is_acknowledged_warning(self):
         session = FakeSession(
             get_results=[FakeResponse({"code": "50001", "msg": "rejected"})]
