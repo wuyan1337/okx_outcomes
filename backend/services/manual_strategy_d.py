@@ -282,6 +282,8 @@ class ManualStrategyD:
         self.state.consecutive_failures = 0
         self.state.pair_retry_count = 0
         self.state.pair_retry_after = 0.0
+        self.state.deployment_blocked = False
+        self.state.block_reason = ""
         if defer_entry:
             self._entry_release_event.clear()
         else:
@@ -313,7 +315,7 @@ class ManualStrategyD:
             strategy="manual-d",
             run_id=self._run_id,
         ):
-            self._main_task = asyncio.create_task(self._seed_then_run())
+            self._main_task = asyncio.create_task(self._main_loop())
 
     def release_entry_barrier(self) -> bool:
         """Allow new BUY deployment after the caller finishes atomic startup."""
