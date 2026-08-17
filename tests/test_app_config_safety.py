@@ -326,7 +326,7 @@ class AccountConfigSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 404)
 
-    async def test_credential_change_is_rejected_when_exchange_has_open_orders(self):
+    async def test_credential_change_is_allowed_with_unmanaged_exchange_state(self):
         class Client(FlatClient):
             async def get_orders(self, status="open"):
                 return {
@@ -335,22 +335,30 @@ class AccountConfigSafetyTests(unittest.IsolatedAsyncioTestCase):
                 }
 
         instance = idle_instance(Client())
+        instance.recovery_locked = True
+        instance.recovery_reason = "unmanaged_exchange_state"
         manager = SimpleNamespace(get_instance=lambda _account_id: instance)
+        calls = []
+
+        def save(_account_id, **kwargs):
+            calls.append(kwargs)
+            return True
+
         with (
             mock.patch.object(app_module, "manager", manager),
             mock.patch.object(
                 app_module, "get_account_decrypted", return_value=stored_account()
             ),
-            mock.patch.object(database, "update_account") as update_account,
+            mock.patch.object(database, "update_account", side_effect=save),
         ):
             response = await app_module.save_account_config_v2(
                 "account-a", Request({"region": "CN"}), user="test"
             )
 
-        self.assertEqual(response.status_code, 409)
-        self.assertIn("Cancel all open orders", json.loads(response.body)["error"])
-        update_account.assert_not_called()
-        self.assertEqual(instance.installed, [])
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["reloaded"])
+        self.assertEqual(calls, [{"base_url": "https://www.okx.com"}])
+        self.assertEqual(len(instance.installed), 1)
 
     async def test_invalid_agent_key_is_rejected_before_database_update(self):
         instance = idle_instance(FlatClient())

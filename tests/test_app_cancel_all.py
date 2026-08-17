@@ -708,34 +708,35 @@ class CancelAllSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.cancel_calls, [])
         self.assertEqual(client.place_calls[0]["tif"], "ioc")
 
-    async def test_delete_keeps_account_when_exchange_cannot_be_flattened(self):
+    async def test_delete_removes_account_without_exchange_flattening(self):
         instance = _idle_instance(object())
-        remove = mock.AsyncMock()
+        removal = {
+            "deleted": True,
+            "cleanup_complete": True,
+            "state_cleanup": {"account_id": "account-a", "complete": True},
+        }
+        remove = mock.AsyncMock(return_value=removal)
         manager = SimpleNamespace(
             get_instance=lambda _account_id: instance,
             remove_account=remove,
         )
-        close_result = {
-            "ok": False,
-            "error": "Flash incomplete: 1 positions remain open",
-            "result": {"remaining": 1},
-        }
         with (
             mock.patch.object(app_module, "manager", manager),
             mock.patch.object(
                 app_module,
                 "_flash_close_account",
-                new=mock.AsyncMock(return_value=close_result),
-            ),
+                new=mock.AsyncMock(),
+            ) as mocked_flash,
         ):
             response = await app_module.remove_account("account-a", user="test")
 
-        payload = json.loads(response.body)
-        self.assertEqual(response.status_code, 409)
-        self.assertFalse(payload["ok"])
-        remove.assert_not_awaited()
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["deleted"])
+        self.assertTrue(response["exchange_state_not_modified"])
+        remove.assert_awaited_once_with("account-a")
+        mocked_flash.assert_not_awaited()
 
-    async def test_delete_removes_account_only_after_verified_flat(self):
+    async def test_delete_reports_local_cleanup_after_local_removal(self):
         instance = _idle_instance(object())
         removal = {
             "deleted": True,
@@ -754,17 +755,13 @@ class CancelAllSafetyTests(unittest.IsolatedAsyncioTestCase):
             get_instance=lambda _account_id: instance,
             remove_account=remove,
         )
-        close_result = {
-            "ok": True,
-            "result": {"remaining": 0, "cancelled": 1, "closed": 1},
-        }
         with (
             mock.patch.object(app_module, "manager", manager),
             mock.patch.object(
                 app_module,
                 "_flash_close_account",
-                new=mock.AsyncMock(return_value=close_result),
-            ),
+                new=mock.AsyncMock(),
+            ) as mocked_flash,
         ):
             result = await app_module.remove_account("account-a", user="test")
 
@@ -772,7 +769,9 @@ class CancelAllSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["deleted"])
         self.assertTrue(result["cleanup_complete"])
         self.assertEqual(result["state_cleanup"], removal["state_cleanup"])
+        self.assertTrue(result["exchange_state_not_modified"])
         remove.assert_awaited_once_with("account-a")
+        mocked_flash.assert_not_awaited()
 
     async def test_delete_reports_partial_state_file_cleanup_after_database_delete(self):
         instance = _idle_instance(object())
@@ -804,14 +803,13 @@ class CancelAllSafetyTests(unittest.IsolatedAsyncioTestCase):
             get_instance=lambda _account_id: instance,
             remove_account=mock.AsyncMock(return_value=removal),
         )
-        close_result = {"ok": True, "result": {"remaining": 0}}
         with (
             mock.patch.object(app_module, "manager", manager),
             mock.patch.object(
                 app_module,
                 "_flash_close_account",
-                new=mock.AsyncMock(return_value=close_result),
-            ),
+                new=mock.AsyncMock(),
+            ) as mocked_flash,
         ):
             payload = await app_module.remove_account("account-a", user="test")
 
@@ -820,6 +818,8 @@ class CancelAllSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["cleanup_complete"])
         self.assertEqual(payload["state_cleanup"], removal["state_cleanup"])
         self.assertIn("credentials were deleted", payload["warning"])
+        self.assertTrue(payload["exchange_state_not_modified"])
+        mocked_flash.assert_not_awaited()
 
     async def test_flash_reconciles_a_stopped_sniper_lock_after_exchange_is_flat(self):
         class Client:

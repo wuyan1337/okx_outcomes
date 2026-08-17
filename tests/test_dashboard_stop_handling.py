@@ -32,9 +32,9 @@ class DashboardStopHandlingTests(unittest.TestCase):
             self.source,
         )
 
-    def test_delete_confirmation_describes_verified_flattening(self):
-        self.assertIn("cancel orders, and close every verified position", self.source)
-        self.assertIn("credentials were kept", self.source)
+    def test_delete_confirmation_describes_local_only_removal(self):
+        self.assertIn("Delete this local account", self.source)
+        self.assertIn("will not cancel OKX orders or close OKX positions", self.source)
 
 
 if __name__ == "__main__":

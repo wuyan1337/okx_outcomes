@@ -909,34 +909,10 @@ async def create_new_account(request: Request, user: str = Depends(verify_auth))
 @app.delete("/api/accounts/{account_id}")
 @_serialize_strategy_lifecycle
 async def remove_account(account_id: str, user: str = Depends(verify_auth)):
-    """Flatten verified exchange state before deleting account credentials."""
+    """Remove the local account without changing its exchange state."""
     inst = manager.get_instance(account_id)
     if not inst:
         raise HTTPException(404, "Account not found")
-
-    close_result = await _flash_close_account(
-        account_id,
-        inst,
-        require_local_reconciliation=True,
-    )
-    if not close_result.get("ok"):
-        audit_event(
-            "account.remove_blocked_exchange_state",
-            level=logging.ERROR,
-            account_id=account_id,
-            result=close_result,
-        )
-        return JSONResponse(
-            status_code=409,
-            content={
-                "ok": False,
-                "error": (
-                    "Account was not deleted because exchange orders or "
-                    "positions could not be safely cleared"
-                ),
-                "close": close_result,
-            },
-        )
     try:
         removal = await manager.remove_account(account_id)
     except Exception as exc:
@@ -950,7 +926,7 @@ async def remove_account(account_id: str, user: str = Depends(verify_auth)):
         "deleted": bool(removal["deleted"]),
         "cleanup_complete": bool(removal["cleanup_complete"]),
         "state_cleanup": removal["state_cleanup"],
-        "close": close_result,
+        "exchange_state_not_modified": True,
     }
     if payload["deleted"] and not payload["cleanup_complete"]:
         payload["warning"] = (
@@ -4441,48 +4417,14 @@ async def save_account_config_v2(account_id: str, request: Request, user: str = 
         replacement = None
         inst = manager.get_instance(account_id)
         if credentials_changed:
-            if inst and _account_trading_busy(inst):
+            if inst and _automated_trading_active(inst):
                 return JSONResponse(
                     status_code=409,
                     content={
                         "ok": False,
-                        "error": "Stop and reconcile all account strategies before changing credentials or region",
+                        "error": "Stop all active account strategies before changing credentials or region",
                     },
                 )
-            verification_client = inst.client if inst else OKXOutcomesClient(
-                api_key=stored_account["api_key"],
-                secret_key=stored_account["secret_key"],
-                passphrase=stored_account["passphrase"],
-                agent_private_key=stored_account["agent_private_key"],
-                base_url=stored_account.get("base_url", "https://us.okx.com"),
-                proxy_node=stored_account.get("proxy_node", "JP2"),
-            )
-            try:
-                open_orders = await _query_open_orders_verified(verification_client)
-                open_positions = await _query_open_positions_verified(verification_client)
-            except Exception as exc:
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "ok": False,
-                        "error": f"Cannot verify account is flat before credential change: {exc}",
-                    },
-                )
-            finally:
-                if inst is None:
-                    await verification_client.close()
-            if open_orders or open_positions:
-                return JSONResponse(
-                    status_code=409,
-                    content={
-                        "ok": False,
-                        "error": (
-                            "Cancel all open orders and close all positions "
-                            "before changing credentials or region"
-                        ),
-                    },
-                )
-
             candidate = dict(stored_account)
             candidate.update(kwargs)
             replacement = OKXOutcomesClient(

@@ -1801,9 +1801,9 @@ class AccountManager:
             loaded=account_id in self.instances,
         )
         if account_id in self.instances:
-            # The API deletion flow has already proved orders and positions are
-            # empty. Do not spend another account-level cancelAll allowance or
-            # install a fresh destructive write after that proof.
+            # Local removal stops writers and closes this client's session. It
+            # deliberately does not place, cancel, or otherwise modify orders
+            # and positions that may still exist on the exchange.
             await self.instances[account_id].close(cancel_orders=False)
             # A closed client/strategy graph must never remain discoverable as
             # a live account. If the database write fails below, recovery can

@@ -291,7 +291,7 @@ http://127.0.0.1:8899/
 
 Telegram token/chat 配置是全局共享的；各账户策略引用同一个 notifier，但通知正文会带账户上下文。
 
-同一个 proxy node 当前只允许分配给一个账户。删除账户不是直接删数据库：服务端会先执行完整 Flash Close，确认交易所开放订单、开放仓位以及 Manual/两套 Sniper 的本地收尾都安全。Flash 任一步失败会返回 409 并保留账户、实例和凭据；全部通过后才关闭实例并删除 SQLite 账户行、对应 Sniper 状态和精确的旧 `poly_state_{account_id}`。数据库提交后再删除该账户的 `pending_sells_d_*`、`pending_sells_s_*` 与 `cost_layers_*` 三个精确文件；不会动其他账户、Telegram、节点 registry、Poly 映射或日志。文件清理失败时响应会明确给出 `deleted=true`、`cleanup_complete=false` 并写审计日志，不能把已经删除的凭据误报成“账户仍在”。
+同一个 proxy node 当前只允许分配给一个账户。删除账户始终是本地操作：服务端停止本地策略和连接、删除 SQLite 账户行及其对应状态文件，但不会撤销 OKX 挂单、平掉 OKX 仓位或验证交易所是否为空。删除前页面会明确提示这一点；如需处理交易所资产，应先在 OKX 或使用 Flash Close 完成。数据库提交后再删除该账户的 `pending_sells_d_*`、`pending_sells_s_*` 与 `cost_layers_*` 三个精确文件；不会动其他账户、Telegram、节点 registry、Poly 映射或日志。文件清理失败时响应会明确给出 `deleted=true`、`cleanup_complete=false` 并写审计日志，不能把已经删除的凭据误报成“账户仍在”。
 
 ### 6.2 Order Book
 
@@ -343,7 +343,7 @@ OKX WS 必须先收到 `snapshot` 才接受 `update`。如果 update 早于 snap
 5. 新保护单使用唯一 `clientOrderId`、reduce-only GTC；只有确认 `ACTIVE/FILLED` 才算成功。新单失败且状态可证明安全时，会尝试按旧保护单恢复 SELL；状态未知时不会报告恢复完成。
 6. 返回逐 asset 的 placed/skipped/failed。任一仓位未保护时整体 `ok=false`，并保留 recovery 状态供继续对账。
 
-API 凭据或 KYC region 会替换账户 client。只要任一策略、Monitor、Auto-Rebalance 或 Sniper 锁仍活动，服务端会拒绝保存这类变更。`Stop` 可能保留交易所挂单，所以本地任务停止还不够：服务端还必须成功查询并确认旧账户 Open Orders 和 Positions 都为 0，否则返回 409/503，不写数据库也不替换 client。新 agent private key 会在写库前解析验证；准备好新 client 后才执行数据库更新和内存切换。
+API 凭据或 KYC region 会替换账户 client。只要有实际运行的策略、Monitor 或 Auto-Rebalance，服务端会拒绝保存这类变更；Recovery Lock 本身、交易所旧挂单/仓位或失效的旧 API Key 不阻止更新，因此可以直接修正失效凭据。新 agent private key 会在写库前解析验证；准备好新 client 后才执行数据库更新和内存切换。更新凭据不会撤单或平仓。
 
 ## 7. Manual-D
 
